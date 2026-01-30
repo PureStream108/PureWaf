@@ -1,12 +1,12 @@
 # PureWaf
-旨在解决CTF中遇到的命令Waf（现在是新建文件夹和画饼阶段）
+Tips：该项目仅用于教育和学习环节（比如说CTF），不得应用于其他任何恶意目的。如果该项目出现任何错误或您有任何建议，欢迎在issues中提出。
 
 ## 前言
 
 CTF中，你是否会因为被像这样：
 
 ```php
-if (!preg_match(               '/wget|dir|nl|nc|cat|tail|more|flag|sh|cut|awk|strings|od|curl|ping|\\*|sort|zip|mod|sl|find|sed|cp|mv|ty|php|tee|txt|grep|base|fd|df|\\\\|more|cc|tac|less|head|\.|\{|\}|uniq|copy|%|file|xxd|date|\[|\]|flag|bash|env|!|\?|ls|\'|\"|id/i',$cmd)) {
+if(!preg_match('/wget|dir|nl|nc|cat|tail|more|flag|sh|cut|awk|strings|od|curl|ping|\\*|sort|zip|mod|sl|find|sed|cp|mv|ty|php|tee|txt|grep|base|fd|df|\\\\|more|cc|tac|less|head|\.|\{|\}|uniq|copy|%|file|xxd|date|\[|\]|flag|bash|env|!|\?|ls|\'|\"|id/i',$cmd)) {
 	echo "你传的参数似乎挺正经的,放你过去吧<br>";
 	system($cmd);
 } else {
@@ -42,3 +42,6 @@ system($cmd);
 ```
 
 的恶心人的WAF所困扰？那么PureWaf就是为了一把梭掉这种Waf而诞生
+
+## 快速开始
+
