@@ -6,9 +6,13 @@ import sys
 import time
 
 from . import bypass
+from . import bypass_data
 from . import utils
 
-version = "1.0-beta_v2"
+version = "1.0-beta_v3"
+
+SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
+SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
 
 
 def banner(version_text):
@@ -54,6 +58,14 @@ def _configure_logger(log_level: str):
         warnings.filterwarnings("ignore")
 
     return logger, show_progress
+
+
+def _emit_special_payload_egs(logger, payload):
+    if payload not in bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS:
+        return
+    logger.info("Egs：")
+    for line in bypass_data.SPECIAL_UPLOAD_POC_EGS.splitlines():
+        logger.info(line)
 
 
 def purewaf(
@@ -180,6 +192,8 @@ def purewaf(
     logger.info(f"[+] Shortest Root Directory Payload : {shortest_root}")
     logger.info(f"[+] Shortest Flag File Payload : {shortest_flag}")
     logger.info("-" * 40)
+    logger.info("")
+    _emit_special_payload_egs(logger, shortest_flag)
     logger.info("")
 
     return shortest_flag
