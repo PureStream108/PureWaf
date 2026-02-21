@@ -1,5 +1,10 @@
 # PureWaf
-Tips：该项目仅用于教育和学习环节（比如说CTF），不得应用于其他任何恶意目的。如果该项目出现任何错误或您有任何建议，欢迎在issues中提出。
+
+![License](https://img.shields.io/badge/license-Apache_2.0-cyan.svg)
+
+该项目仅用于教育和学习环节（比如说CTF），不得应用于其他任何恶意目的。
+
+如果该项目出现任何错误或您有任何建议，欢迎在issues中提出。
 
 ## 前言
 

@@ -64,7 +64,7 @@ def _configure_logger(log_level: str):
 def _emit_special_payload_egs(logger, payload):
     if payload not in bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS:
         return
-    logger.info("Egs：")
+    logger.info("Example: ")
     for line in bypass_data.SPECIAL_UPLOAD_POC_EGS.splitlines():
         logger.info(line)
 
