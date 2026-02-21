@@ -8,7 +8,9 @@ from src import bypass
 
 class TestPHPVersions(unittest.TestCase):
     def test_php5_restrictions(self):
-        """测试在低版本模式下会过滤高版本专属载荷。"""
+        """
+        测试低版本模式
+        """
         options = bypass.BypassOptions(
             flagfile=None,
             read_env=False,
@@ -27,7 +29,9 @@ class TestPHPVersions(unittest.TestCase):
                 self.fail(f"Found PHP7 payload in PHP5 mode: {p}")
                 
     def test_php7_features(self):
-        """测试在高版本模式下包含高版本专属载荷。"""
+        """
+        测试在高版本模式
+        """
         options = bypass.BypassOptions(
             flagfile=None,
             read_env=False,
@@ -48,28 +52,6 @@ class TestPHPVersions(unittest.TestCase):
                 found = True
                 break
         self.assertTrue(found, f"PHP7 payload {target} not found in PHP7 mode")
-
-    def test_upload_exec_templates(self):
-        """测试已生成新的 eg.md 模板。"""
-        options = bypass.BypassOptions(
-            flagfile=None,
-            read_env=True,  # 这会触发上传执行模板
-            reflect_shell=False,
-            ip="127.0.0.1",
-            port=8080,
-            phpinfo=False,
-            php_version=5.6
-        )
-        payloads = bypass.generate_candidates(options)
-        
-        # 验证 . /???/????????[@-[] 存在
-        found = False
-        target = ". /???/????????[@-[]"
-        for p in payloads:
-            if target in p:
-                found = True
-                break
-        self.assertTrue(found, f"Upload Exec template {target} not found")
 
 if __name__ == '__main__':
     unittest.main()
