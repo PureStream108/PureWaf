@@ -125,12 +125,12 @@ class ExampleTests(unittest.TestCase):
         fake_logger = _FakeLogger()
 
         with (
-            patch("src.PureWaf._configure_logger", return_value=(fake_logger, False)),
-            patch("src.PureWaf.time.sleep", return_value=None),
-            patch("src.PureWaf.bypass.generate_candidates", return_value=["seed"]),
-            patch("src.PureWaf.bypass.apply_encodings", side_effect=lambda payloads, _strategies: payloads),
+            patch("PureWaf.PureWaf._configure_logger", return_value=(fake_logger, False)),
+            patch("PureWaf.PureWaf.time.sleep", return_value=None),
+            patch("PureWaf.PureWaf.bypass.generate_candidates", return_value=["seed"]),
+            patch("PureWaf.PureWaf.bypass.apply_encodings", side_effect=lambda payloads, _strategies: payloads),
             patch(
-                "src.PureWaf.bypass.filter_payloads",
+                "PureWaf.PureWaf.bypass.filter_payloads",
                 side_effect=[["root-ok"], [". /???/????????[@-[]"]],
             ),
         ):
