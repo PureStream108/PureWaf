@@ -7,9 +7,9 @@ from unittest.mock import patch
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
-from src import bypass
-from src import utils
-from src.PureWaf import purewaf
+from PureWaf import bypass
+from PureWaf import utils
+from PureWaf.PureWaf import purewaf
 
 
 class _FakeLogger:

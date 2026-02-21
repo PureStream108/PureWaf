@@ -4,8 +4,8 @@ import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src import bypass
-from src import utils
+from PureWaf import bypass
+from PureWaf import utils
 
 class TestNewTechniques(unittest.TestCase):
     

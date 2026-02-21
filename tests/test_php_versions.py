@@ -4,7 +4,7 @@ import unittest
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src import bypass
+from PureWaf import bypass
 
 class TestPHPVersions(unittest.TestCase):
     def test_php5_restrictions(self):
