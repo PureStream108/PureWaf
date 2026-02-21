@@ -1,4 +1,4 @@
-# This file is the main file of the PureWaf package.
+# main package
 
 import logging
 import os
@@ -9,7 +9,7 @@ from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "1.0-beta_v3"
+version = "1.0-beta_v4"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
@@ -27,6 +27,7 @@ def banner(version_text):
     [ Author  :: Pure Stream ]
     [ Version :: {version_text}]
     [ Github  :: https://github.com/PureStream108/PureWaf ]
+
 
 """
 
@@ -87,14 +88,14 @@ def purewaf(
     logger.info(banner(version).rstrip())
     time.sleep(1)
 
-    # Validate phpv
+    # 校验版本
     try:
         phpv = float(phpv)
     except (ValueError, TypeError):
         logger.error(f"[!] Invalid php_version: {phpv}. Using default 7.0")
         phpv = 7.0
 
-    # Print Configuration
+    # 打印配置
     logger.info("")
     logger.info("-" * 40)
     logger.info(f"[*] Configuration:")
@@ -119,7 +120,7 @@ def purewaf(
     waf_regex_obj = utils.parse_waf_regex(waf_regex)
 
     options_root = bypass.BypassOptions(
-        flagfile="/",  # Target root directory
+        flagfile="/",  # 初始默认根目录
         read_env=False,
         reflect_shell=False,
         ip=ip,
@@ -138,7 +139,7 @@ def purewaf(
         php_version=phpv,
     )
 
-    # Generate payloads for Root Directory
+    # 生成 payload
     logger.info("[*] Generating payloads for Root Directory...")
     base_payloads_root = bypass.generate_candidates(options_root)
     if not base_payloads_root:
@@ -164,7 +165,6 @@ def purewaf(
 
     logger.info("")
 
-    # Generate payloads for Flag File
     logger.info("[*] Generating payloads for Flag File...")
     base_payloads_flag = bypass.generate_candidates(options_flag)
     if not base_payloads_flag:
@@ -189,8 +189,8 @@ def purewaf(
 
     logger.info("")
     logger.info("-" * 40)
-    logger.info(f"[+] Shortest Root Directory Payload : {shortest_root}")
-    logger.info(f"[+] Shortest Flag File Payload : {shortest_flag}")
+    logger.info(f"[+] Shortest Root Payload : {shortest_root}")
+    logger.info(f"[+] Shortest Flag Payload : {shortest_flag}")
     logger.info("-" * 40)
     logger.info("")
     _emit_special_payload_egs(logger, shortest_flag)
