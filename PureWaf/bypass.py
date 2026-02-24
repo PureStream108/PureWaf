@@ -172,6 +172,10 @@ def generate_candidates(options: BypassOptions):
             payloads.append(template)
         target_cmd = "phpinfo" 
 
+    # Header 链利用
+    if options.read_env or options.phpinfo:
+        payloads.extend(bypass_data.HEADER_EXEC_TEMPLATES)
+
     # 变量劫持
     if options.reflect_shell or options.phpinfo:
         payloads.extend(bypass_data.VARIABLE_HIJACK_TEMPLATES)
