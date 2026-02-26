@@ -66,26 +66,6 @@ class TestNewTechniques(unittest.TestCase):
                 break
         self.assertTrue(found_eval, "Webshell eval/assert payload not found")
 
-    def test_log_inclusion(self):
-        options = bypass.BypassOptions(
-            flagfile=None,
-            read_env=True,
-            reflect_shell=False,
-            ip="127.0.0.1",
-            port=8080,
-            phpinfo=False,
-            php_version=7.0
-        )
-        payloads = bypass.generate_candidates(options)
-        
-        # 检查是否包含日志路径
-        found_log = False
-        for p in payloads:
-            if "/var/log/nginx/access.log" in p or "/proc/self/environ" in p:
-                found_log = True
-                break
-        self.assertTrue(found_log, "Log inclusion payload not found")
-
     def test_new_commands(self):
         options = bypass.BypassOptions(
             flagfile="/flag",
@@ -108,8 +88,8 @@ class TestNewTechniques(unittest.TestCase):
 
     def test_directory_enumeration_templates(self):
         options = bypass.BypassOptions(
-            flagfile=None,
-            read_env=True, 
+            flagfile="/",
+            read_env=False,
             reflect_shell=False,
             ip="127.0.0.1",
             port=8080,
@@ -128,6 +108,24 @@ class TestNewTechniques(unittest.TestCase):
             payloads,
             "glob directory payload not found",
         )
+
+    def test_read_env_only_env_payloads(self):
+        options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=True,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=7.0,
+        )
+        payloads = bypass.generate_candidates(options)
+
+        self.assertIn("env", payloads)
+        self.assertIn("printenv", payloads)
+        self.assertIn("set", payloads)
+        self.assertNotIn("print_r(scandir('/'));", payloads)
+        self.assertNotIn("var_export(glob('../*'));", payloads)
 
     def test_file_enumeration_templates(self):
         options = bypass.BypassOptions(
