@@ -1,19 +1,29 @@
 # main package
 
+import atexit
+import json
 import logging
 import os
 import sys
 import time
+import urllib.request
 
+from packaging.version import InvalidVersion
+from packaging.version import Version
 from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "1.0-beta_v5"
+version = "1.0"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
 BACKTRACK_LIMIT_POC_EGS = bypass_data.BACKTRACK_LIMIT_POC_EGS
+
+UPDATE_NOTICE_COLOR = "\033[93m"
+UPDATE_COMMAND_COLOR = "\033[96m"
+COLOR_RESET = "\033[0m"
+_UPDATE_NOTICE_REGISTERED = False
 
 
 def banner(version_text):
@@ -62,6 +72,56 @@ def _configure_logger(log_level: str):
     return logger, show_progress
 
 
+def _fetch_latest_pypi_version(package_name: str = "PureWaf", timeout: float = 2.0):
+    url = f"https://pypi.org/pypi/{package_name}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload.get("info", {}).get("version")
+    except Exception:
+        return None
+
+
+def _is_newer_version(latest: str, current: str):
+    try:
+        return Version(str(latest)) > Version(str(current))
+    except (InvalidVersion, TypeError):
+        return False
+
+
+def _emit_update_notice(latest: str, current: str):
+    message = f"[+] New version available: {latest} (current: {current})"
+    upgrade = "[+] Upgrade: pip install -U PureWaf"
+
+    stream = getattr(sys, "stdout", None)
+    if stream and stream.isatty():
+        print(f"{UPDATE_NOTICE_COLOR}{message}{COLOR_RESET}")
+        print(f"{UPDATE_COMMAND_COLOR}{upgrade}{COLOR_RESET}")
+    else:
+        print(message)
+        print(upgrade)
+
+
+def _check_and_notify_update(current_version: str):
+    latest = _fetch_latest_pypi_version()
+    if not latest:
+        return
+    if _is_newer_version(latest, current_version):
+        _emit_update_notice(latest, current_version)
+
+
+def _notify_update_at_exit():
+    _check_and_notify_update(version)
+
+
+def register_update_notice_at_exit():
+    global _UPDATE_NOTICE_REGISTERED
+    if _UPDATE_NOTICE_REGISTERED:
+        return
+    atexit.register(_notify_update_at_exit)
+    _UPDATE_NOTICE_REGISTERED = True
+
+
 def _emit_special_payload_egs(logger, payload):
     if payload not in bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS:
         return
@@ -106,6 +166,10 @@ def _emit_contextual_tips(logger, payload, waf_regex):
 
     if payload in bypass_data.VARIABLE_HIJACK_TIP_TRIGGER_PAYLOADS:
         logger.info("TIPS: POST: 1=system('id');")
+
+    if payload in bypass_data.ASSERT_POST_TIP_TRIGGER_PAYLOADS:
+        logger.info("TIPS: POST: 2=system('cat /flag.txt');")
+        logger.info("TIPS: POST: 2=system('id');")
 
     if _looks_like_backtrack_risk_regex(waf_regex):
         logger.info("Example (Backtrack limit bypass):")
@@ -241,25 +305,3 @@ def purewaf(
     logger.info("")
 
     return shortest_flag
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="PureWaf - WAF Bypass Payload Generator")
-    parser.add_argument("--waf_words", default="", help="Comma separated forbidden words")
-    parser.add_argument("--waf_chars", default="", help="Forbidden characters")
-    parser.add_argument("--waf_regex", default="", help="Forbidden regex")
-    parser.add_argument("--limit_length", type=int, default=999999, help="Max payload length")
-    parser.add_argument("--flagfile", default="/flag", help="Target file to read")
-    parser.add_argument("--read_env", action="store_true", help="Generate env reading payloads")
-    parser.add_argument("--reflect_shell", action="store_true", help="Generate reverse shell payloads")
-    parser.add_argument("--port", type=int, default=8080, help="Reverse shell port")
-    parser.add_argument("--ip", default="127.0.0.1", help="Reverse shell IP")
-    parser.add_argument("--phpinfo", action="store_true", help="Generate phpinfo payloads")
-    parser.add_argument("--log_level", default="INFO", help="Log level")
-    parser.add_argument("--total_payload", action="store_true", help="Show all passed payloads")
-    parser.add_argument("--phpv", default=7.0, type=float, help="PHP Version (e.g. 5.6, 7.4)")
-
-    args = parser.parse_args()
-    purewaf(**vars(args))
