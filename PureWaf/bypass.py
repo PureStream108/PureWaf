@@ -136,6 +136,8 @@ def generate_candidates(options: BypassOptions):
 
         # 文件枚举
         payloads.extend(bypass_data.FILE_ENUM_TEMPLATES)
+        if options.flagfile == "/":
+            payloads.extend(bypass_data.ROOT_DISCOVERY_TEMPLATES)
 
     if options.read_env:
         payloads.extend(bypass_data.READ_ENV_TEMPLATES)
@@ -181,6 +183,7 @@ def generate_candidates(options: BypassOptions):
         payloads.extend(bypass_data.VARIABLE_HIJACK_TEMPLATES)
 
     if target_cmd:
+        payloads.append(bypass_data.NON_ALNUM_ASSERT_POST_PAYLOAD)
         if target_cmd == "phpinfo":
             # 自增
             inc_code = utils.generate_php_increment("phpinfo")
@@ -219,7 +222,9 @@ def generate_candidates(options: BypassOptions):
             for template in bypass_data.SPACE_BYPASS_TEMPLATES:
                 candidates.append(template.format(payload=p))
 
-    return utils.dedupe_preserve_order(candidates)
+    candidates = utils.dedupe_preserve_order(candidates)
+    candidates = [payload for payload in candidates if payload != "`/`"]
+    return candidates
 
 
 def apply_encodings(payloads, strategies):
@@ -258,32 +263,59 @@ def filter_payloads(
 
 class ProgressBar:
     def __init__(self, total, width=24, stream=None, verbose=False):
+        import sys
+
         self.total = max(int(total), 0)
         self.width = max(int(width), 5)
-        self.stream = stream
+        self.stream = stream or sys.stdout
         self.current = 0
         self.passed = 0
         self.verbose = verbose
+        self.last_snapshot = None
+
+        isatty = getattr(self.stream, "isatty", None)
+        self.dynamic = bool(isatty() if callable(isatty) else False)
+
+        if not self.dynamic:
+            self._write_line(end="\n", force=True)
 
     def update(self, current):
         self.current = current
-        self._write_line()
+        if self.dynamic:
+            self._write_line()
 
     def mark_pass(self, payload):
         self.passed += 1
         if self.verbose:
-            self._write_line(end="\n")
+            if self.dynamic:
+                self._write_line(end="\n", force=True)
             self._write(f"PASS: {payload}\n")
-        else:
+            if self.dynamic:
+                self._write_line(force=True)
+        elif self.dynamic:
             self._write_line()
 
     def finish(self):
         self.current = self.total
-        self._write_line(end="\n")
+        if self.dynamic:
+            if self.last_snapshot == (self.current, self.passed):
+                self._write("\n")
+            else:
+                self._write_line(end="\n")
+        else:
+            self._write_line(end="\n", force=True)
 
-    def _write_line(self, end=""):
+    def _write_line(self, end="", force=False):
+        snapshot = (self.current, self.passed)
+        if not force and snapshot == self.last_snapshot:
+            return
+        self.last_snapshot = snapshot
+
         bar = self._render_bar()
-        msg = f"\r{bar} {self.current}/{self.total} passed:{self.passed}"
+        if self.dynamic:
+            msg = f"\r\033[2K{bar} {self.current}/{self.total} passed:{self.passed}"
+        else:
+            msg = f"{bar} {self.current}/{self.total} passed:{self.passed}"
         self._write(msg + end)
 
     def _render_bar(self):
@@ -294,8 +326,5 @@ class ProgressBar:
         return "[" + ("=" * filled).ljust(self.width, ".") + "]"
 
     def _write(self, text):
-        import sys
-
-        stream = self.stream or sys.stdout
-        stream.write(text)
-        stream.flush()
+        self.stream.write(text)
+        self.stream.flush()
