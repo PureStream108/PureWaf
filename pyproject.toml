@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "PureWaf"
+version = "1.0.1"
+description = "WAF Bypass Payload Generator"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "Pure Stream" }]
+dependencies = ["packaging>=24"]
+
+[project.urls]
+Homepage = "https://github.com/PureStream108/PureWaf"
+Repository = "https://github.com/PureStream108/PureWaf"
+
+[tool.setuptools.packages.find]
+include = ["PureWaf*"]
