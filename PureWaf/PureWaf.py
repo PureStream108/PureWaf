@@ -14,7 +14,7 @@ from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "1.0"
+version = "1.0.1"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
