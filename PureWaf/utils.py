@@ -128,6 +128,17 @@ def base64_encode(payload: str):
     return base64.b64encode(data).decode("ascii")
 
 
+def generate_php_chr(text: str):
+    """
+    PHP chr 拼接
+    Example: chr(112).chr(104).chr(112)
+    """
+    data = text.encode("utf-8")
+    if not data:
+        return "''"
+    return ".".join(f"chr({byte})" for byte in data)
+
+
 def generate_php_xor(text: str):
     """
     PHP 异或
