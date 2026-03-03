@@ -1,5 +1,9 @@
 # PureWaf
 
+![Pepy Total Downloads](https://img.shields.io/pepy/dt/PureWaf)
+
+[![PyPI version](https://img.shields.io/pypi/v/PureWaf.svg)](https://pypi.org/project/PureWaf/)
+
 ![License](https://img.shields.io/badge/license-Apache_2.0-cyan.svg)
 
 ![Github stars](https://img.shields.io/github/stars/PureStream108/PureWaf.svg)
@@ -112,7 +116,110 @@ php版本，默认为7.0，针对不同php版本的题目环境，你可以自�
 
 ## Examples
 
-...
+（待完善用法）
+
+**MoeCTF2025 这是…Webshell？**
+
+```PHP
+<?php
+highlight_file(__FILE__);
+if(isset($_GET['shell'])) {
+    $shell = $_GET['shell'];
+    if(!preg_match('/[A-Za-z0-9]/is', $_GET['shell'])) {
+        eval($shell);
+    } else {
+        echo "Hacker!";
+    }
+}
+?>
+```
+
+**[红明谷CTF 2021]write_shell**
+
+[BUUCTF在线评测](https://buuoj.cn/login?next=%2Fchallenges%3F#[红明谷CTF 2021]write_shell)
+
+```PHP
+<?php
+error_reporting(0);
+highlight_file(__FILE__);
+function check($input){
+    if(preg_match("/'| |_|php|;|~|\\^|\\+|eval|{|}/i",$input)){
+        // if(preg_match("/'| |_|=|php/",$input)){
+        die('hacker!!!');
+    }else{
+        return $input;
+    }
+}
+
+function waf($input){
+  if(is_array($input)){
+      foreach($input as $key=>$output){
+          $input[$key] = waf($output);
+      }
+  }else{
+      $input = check($input);
+  }
+}
+
+$dir = 'sandbox/' . md5($_SERVER['REMOTE_ADDR']) . '/';
+if(!file_exists($dir)){
+    mkdir($dir);
+}
+switch($_GET["action"] ?? "") {
+    case 'pwd':
+        echo $dir;
+        break;
+    case 'upload':
+        $data = $_GET["data"] ?? "";
+        waf($data);
+        file_put_contents("$dir" . "index.php", $data);
+}
+?>
+```
+
+**middlerce | NSSCTF**
+
+[[NISACTF 2022\]middlerce | NSSCTF](https://www.nssctf.cn/problem/1897)
+
+```PHP
+<?php
+include "check.php";
+if (isset($_REQUEST['letter'])){
+    $txw4ever = $_REQUEST['letter'];
+    if (preg_match('/^.*([\w]|\^|\*|\(|\~|\`|\?|\/| |\||\&|!|\<|\>|\{|\x09|\x0a|\[).*$/m',$txw4ever)){
+        die("再加把油喔");
+    }
+    else{
+        $command = json_decode($txw4ever,true)['cmd'];
+        checkdata($command);
+        @eval($command);
+    }
+}
+else{
+    highlight_file(__FILE__);
+}
+?>
+```
+
+**CISCN 2024 simple_php**
+
+```PHP
+ini_set('open_basedir', '/var/www/html/');
+error_reporting(0);
+
+if(isset($_POST['cmd'])){
+    $cmd = escapeshellcmd($_POST['cmd']); 
+     if (!preg_match('/ls|dir|nl|nc|cat|tail|more|flag|sh|cut|awk|strings|od|curl|ping|\*|sort|ch|zip|mod|sl|find|sed|cp|mv|ty|grep|fd|df|sudo|more|cc|tac|less|head|\.|{|}|tar|zip|gcc|uniq|vi|vim|file|xxd|base64|date|bash|env|\?|wget|\'|\"|id|whoami/i', $cmd)) {
+         system($cmd);
+}
+}
+
+
+show_source(__FILE__);
+?>
+```
+
+
 
 ## Limitations
 
