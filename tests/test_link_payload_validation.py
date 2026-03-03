@@ -132,6 +132,18 @@ echo $out;
         self.assertEqual(code_vh, 0)
         self.assertIn("vh_ok", out_vh)
 
+        script_chr = """<?php
+$_=chr(115).chr(121).chr(115).chr(116).chr(101).chr(109);
+$__=chr(101).chr(99).chr(104).chr(111).chr(32).chr(99).chr(104).chr(114).chr(95).chr(111).chr(107);
+ob_start();
+$_($__);
+$out = ob_get_clean();
+echo $out;
+"""
+        code_chr, out_chr = run_php(script_chr)
+        self.assertEqual(code_chr, 0)
+        self.assertIn("chr_ok", out_chr)
+
     def test_ctf_style_end_to_end(self):
         fake_logger_a = _FakeLogger()
         with (

