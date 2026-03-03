@@ -68,6 +68,15 @@ class UtilsTests(unittest.TestCase):
     def test_base64_encode(self):
         self.assertEqual(utils.base64_encode("test"), "dGVzdA==")
 
+    def test_generate_php_chr_ascii(self):
+        self.assertEqual(utils.generate_php_chr("Ab"), "chr(65).chr(98)")
+
+    def test_generate_php_chr_utf8(self):
+        self.assertEqual(utils.generate_php_chr("é"), "chr(195).chr(169)")
+
+    def test_generate_php_chr_empty(self):
+        self.assertEqual(utils.generate_php_chr(""), "''")
+
     def test_get_encoding_strategies(self):
         strategies = utils.get_encoding_strategies()
         self.assertEqual(strategies[0][0], "url")
