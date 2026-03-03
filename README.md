@@ -1,6 +1,6 @@
 # PureWaf
 
-![Pepy Total Downloads](https://img.shields.io/pepy/dt/PureWaf)[![PyPI version](https://img.shields.io/pypi/v/PureWaf.svg)](https://pypi.org/project/PureWaf/)![License](https://img.shields.io/badge/license-Apache_2.0-cyan.svg)![Github stars](https://img.shields.io/github/stars/PureStream108/PureWaf.svg)![Example](https://github.com/PureStream108/PureWaf/actions/workflows/eg.yml/badge.svg)[![codecov](https://codecov.io/gh/PureStream108/PureWaf/branch/main/graph/badge.svg)](https://codecov.io/gh/PureStream108/PureWaf)
+![Pepy Total Downloads](https://img.shields.io/pepy/dt/PureWaf) [![PyPI version](https://img.shields.io/pypi/v/PureWaf.svg)](https://pypi.org/project/PureWaf/) ![License](https://img.shields.io/badge/license-Apache_2.0-cyan.svg) ![Github stars](https://img.shields.io/github/stars/PureStream108/PureWaf.svg) ![Example](https://github.com/PureStream108/PureWaf/actions/workflows/eg.yml/badge.svg) [![codecov](https://codecov.io/gh/PureStream108/PureWaf/branch/main/graph/badge.svg)](https://codecov.io/gh/PureStream108/PureWaf)
 
 该项目仅用于教育和学习环节（比如说CTF），不得应用于其他任何恶意目的。
 
