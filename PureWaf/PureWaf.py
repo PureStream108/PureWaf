@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 from packaging.version import InvalidVersion
@@ -14,7 +15,7 @@ from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "1.1.0"
+version = "1.1.1"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
@@ -177,6 +178,36 @@ def _emit_contextual_tips(logger, payload, waf_regex):
             logger.info(line)
 
 
+def _is_upload_payload(payload: str):
+    candidates = [payload]
+    try:
+        once = urllib.parse.unquote(payload)
+    except Exception:
+        once = payload
+    candidates.append(once)
+    try:
+        twice = urllib.parse.unquote(once)
+    except Exception:
+        twice = once
+    candidates.append(twice)
+
+    for text in candidates:
+        normalized = text.strip().lower()
+        if normalized.startswith("<?"):
+            return True
+        if normalized.startswith("<%"):
+            return True
+        if normalized.startswith('<script language="php">'):
+            return True
+        if normalized.startswith("gif89a<?"):
+            return True
+        if normalized.startswith("gif89a<%"):
+            return True
+        if normalized.startswith('gif89a<script language="php">'):
+            return True
+    return False
+
+
 def purewaf(
     waf_words="",
     waf_chars="",
@@ -297,7 +328,14 @@ def purewaf(
             logger.warning("[!] No payload passed WAF filters for Flag File.")
             shortest_flag = "N/A"
         else:
-            shortest_flag = min(passed_flag, key=len)
+            if upload:
+                wrapped_passed_flag = [p for p in passed_flag if _is_upload_payload(p)]
+                if wrapped_passed_flag:
+                    shortest_flag = min(wrapped_passed_flag, key=len)
+                else:
+                    shortest_flag = min(passed_flag, key=len)
+            else:
+                shortest_flag = min(passed_flag, key=len)
 
     logger.info("")
     logger.info("-" * 40)
