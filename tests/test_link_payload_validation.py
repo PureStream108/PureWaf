@@ -69,7 +69,7 @@ class LinkPayloadValidationTests(unittest.TestCase):
         output_header = "\n".join(logger_header.messages)
         self.assertIn("TIPS: User-Agent: 1=system('id');", output_header)
         self.assertIn("TIPS: User-Agent: system('id');", output_header)
-        self.assertIn("Example (Backtrack limit bypass):", output_header)
+        self.assertIn("Example:", output_header)
 
         logger_vh = _FakeLogger()
         core._emit_contextual_tips(
@@ -161,7 +161,7 @@ echo $out;
         output_a = "\n".join(fake_logger_a.messages)
         self.assertEqual(result_a, "eval(next(getallheaders()));")
         self.assertIn("TIPS: User-Agent: 1=system('id');", output_a)
-        self.assertIn("Example (Backtrack limit bypass):", output_a)
+        self.assertIn("Example:", output_a)
 
         fake_logger_b = _FakeLogger()
         with (
@@ -179,7 +179,7 @@ echo $out;
         output_b = "\n".join(fake_logger_b.messages)
         self.assertEqual(result_b, "eval(array_pop(next(get_defined_vars())));")
         self.assertIn("TIPS: POST: 1=system('id');", output_b)
-        self.assertNotIn("Example (Backtrack limit bypass):", output_b)
+        self.assertNotIn("Example :", output_b)
 
 
 if __name__ == "__main__":

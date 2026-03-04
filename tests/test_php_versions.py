@@ -30,7 +30,7 @@ class TestPHPVersions(unittest.TestCase):
                 
     def test_php7_features(self):
         """
-        测试在高版本模式
+        测试高版本模式
         """
         options = bypass.BypassOptions(
             flagfile=None,
@@ -52,6 +52,38 @@ class TestPHPVersions(unittest.TestCase):
                 found = True
                 break
         self.assertTrue(found, f"PHP7 payload {target} not found in PHP7 mode")
+
+    def test_upload_on_php5(self):
+        options = bypass.BypassOptions(
+            flagfile=None,
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=True,
+            php_version=5.6,
+            upload=True,
+        )
+        payloads = bypass.generate_candidates(options)
+        self.assertIn("<% phpinfo(); %>", payloads)
+        self.assertIn("<%=phpinfo()%>", payloads)
+        self.assertIn('<script language="php">phpinfo();</script>', payloads)
+
+    def test_upload_on_php7(self):
+        options = bypass.BypassOptions(
+            flagfile=None,
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=True,
+            php_version=7.4,
+            upload=True,
+        )
+        payloads = bypass.generate_candidates(options)
+        self.assertNotIn("<% phpinfo(); %>", payloads)
+        self.assertNotIn("<%=phpinfo()%>", payloads)
+        self.assertNotIn('<script language="php">phpinfo();</script>', payloads)
 
 if __name__ == '__main__':
     unittest.main()
