@@ -3,7 +3,7 @@ import shutil
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -183,8 +183,11 @@ echo $out;
 
     def test_upload_prefers_payload(self):
         fake_logger = _FakeLogger()
-        wrapped_encoded = "<?php phpinfo() ?>"
-        short_non_wrapper = "cat /flag"
+        wrapped_root_raw = "<?=`ls /`?>"
+        short_non_wrapper_root = "ls%20%2F"
+        wrapped_flag_raw = "<?php phpinfo(); phpinfo(); ?>"
+        wrapped_flag_encoded = "%3C%3F%3Dphpinfo%28%29%3F%3E"
+        short_non_wrapper_flag = "cat /flag"
 
         with (
             patch("PureWaf.PureWaf._configure_logger", return_value=(fake_logger, False)),
@@ -193,12 +196,59 @@ echo $out;
             patch("PureWaf.PureWaf.bypass.apply_encodings", side_effect=lambda payloads, _strategies: payloads),
             patch(
                 "PureWaf.PureWaf.bypass.filter_payloads",
-                side_effect=[["root-ok"], [short_non_wrapper, wrapped_encoded]],
+                side_effect=[
+                    [short_non_wrapper_root, wrapped_root_raw],
+                    [short_non_wrapper_flag, wrapped_flag_encoded, wrapped_flag_raw],
+                ],
             ),
         ):
             result = purewaf(upload=True, log_level="INFO")
 
-        self.assertEqual(result, wrapped_encoded)
+        output = "\n".join(fake_logger.messages)
+        self.assertIn(f"[+] Shortest Root Payload : {wrapped_root_raw}", output)
+        self.assertNotIn(f"[+] Shortest Root Payload : {short_non_wrapper_root}", output)
+        self.assertEqual(result, wrapped_flag_raw)
+        self.assertNotEqual(result, wrapped_flag_encoded)
+
+    def test_targeted_full_encoding(self):
+        fake_logger = _FakeLogger()
+        encode_mock = Mock(return_value=["encoded"])
+
+        with (
+            patch("PureWaf.PureWaf._configure_logger", return_value=(fake_logger, False)),
+            patch("PureWaf.PureWaf.time.sleep", return_value=None),
+            patch("PureWaf.PureWaf.bypass.generate_candidates", side_effect=[["root-seed"], ["flag-seed"]]),
+            patch("PureWaf.PureWaf.bypass._build_targeted_candidates", side_effect=[["root-targeted"], ["flag-targeted"]]),
+            patch("PureWaf.PureWaf.bypass.apply_encodings", encode_mock),
+            patch(
+                "PureWaf.PureWaf.bypass.filter_payloads",
+                side_effect=[["root-targeted-pass"], ["flag-targeted-pass"]],
+            ),
+        ):
+            result = purewaf(log_level="INFO")
+
+        self.assertEqual(result, "flag-targeted-pass")
+        encode_mock.assert_not_called()
+
+    def test_encoding_when_targeted_all_blocked(self):
+        fake_logger = _FakeLogger()
+        encode_mock = Mock(side_effect=lambda payloads, _strategies: payloads)
+
+        with (
+            patch("PureWaf.PureWaf._configure_logger", return_value=(fake_logger, False)),
+            patch("PureWaf.PureWaf.time.sleep", return_value=None),
+            patch("PureWaf.PureWaf.bypass.generate_candidates", side_effect=[["root-seed"], ["flag-seed"]]),
+            patch("PureWaf.PureWaf.bypass._build_targeted_candidates", side_effect=[["root-targeted"], ["flag-targeted"]]),
+            patch("PureWaf.PureWaf.bypass.apply_encodings", encode_mock),
+            patch(
+                "PureWaf.PureWaf.bypass.filter_payloads",
+                side_effect=[[], ["root-fallback-pass"], [], ["flag-fallback-pass"]],
+            ),
+        ):
+            result = purewaf(log_level="INFO")
+
+        self.assertEqual(result, "flag-fallback-pass")
+        self.assertEqual(encode_mock.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from PureWaf import bypass
 from PureWaf import bypass_data
+#from PureWaf import PureWaf as core
 from PureWaf import utils
 
 class TestNewTechniques(unittest.TestCase):
