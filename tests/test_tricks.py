@@ -277,43 +277,5 @@ class TestNewTechniques(unittest.TestCase):
         encoded_payload = utils.url_encode(raw_payload)
         self.assertIn(encoded_payload, payloads)
 
-    def test_upload_disabled_by_default(self):
-        options = bypass.BypassOptions(
-            flagfile=None,
-            read_env=False,
-            reflect_shell=False,
-            ip="127.0.0.1",
-            port=8080,
-            phpinfo=True,
-            php_version=8.0,
-        )
-        payloads = bypass.generate_candidates(options)
-        self.assertIn("phpinfo();", payloads)
-        self.assertNotIn("<?= phpinfo() ?>", payloads)
-        self.assertNotIn("<?=phpinfo();?>", payloads)
-        self.assertNotIn("<?php phpinfo(); ?>", payloads)
-        self.assertNotIn("GIF89a<?php phpinfo(); ?>", payloads)
-
-    def test_upload_true_modern(self):
-        options = bypass.BypassOptions(
-            flagfile=None,
-            read_env=False,
-            reflect_shell=False,
-            ip="127.0.0.1",
-            port=8080,
-            phpinfo=True,
-            php_version=8.0,
-            upload=True,
-        )
-        payloads = bypass.generate_candidates(options)
-        self.assertIn("phpinfo();", payloads)
-        self.assertIn("<?= phpinfo(); ?>", payloads)
-        self.assertIn("<?=phpinfo();?>", payloads)
-        self.assertIn("<?php phpinfo(); ?>", payloads)
-        self.assertIn("GIF89a<?php phpinfo(); ?>", payloads)
-        self.assertIn("GIF89a<?= phpinfo() ?>", payloads)
-        self.assertNotIn("<% phpinfo(); %>", payloads)
-        self.assertNotIn('<script language="php">phpinfo();</script>', payloads)
-
 if __name__ == '__main__':
     unittest.main()

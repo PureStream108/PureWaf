@@ -181,6 +181,25 @@ echo $out;
         self.assertIn("TIPS: POST: 1=system('id');", output_b)
         self.assertNotIn("Example :", output_b)
 
+    def test_upload_prefers_payload(self):
+        fake_logger = _FakeLogger()
+        wrapped_encoded = "<?php phpinfo() ?>"
+        short_non_wrapper = "cat /flag"
+
+        with (
+            patch("PureWaf.PureWaf._configure_logger", return_value=(fake_logger, False)),
+            patch("PureWaf.PureWaf.time.sleep", return_value=None),
+            patch("PureWaf.PureWaf.bypass.generate_candidates", return_value=["seed"]),
+            patch("PureWaf.PureWaf.bypass.apply_encodings", side_effect=lambda payloads, _strategies: payloads),
+            patch(
+                "PureWaf.PureWaf.bypass.filter_payloads",
+                side_effect=[["root-ok"], [short_non_wrapper, wrapped_encoded]],
+            ),
+        ):
+            result = purewaf(upload=True, log_level="INFO")
+
+        self.assertEqual(result, wrapped_encoded)
+
 
 if __name__ == "__main__":
     unittest.main()
