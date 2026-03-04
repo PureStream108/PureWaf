@@ -208,6 +208,37 @@ def _is_upload_payload(payload: str):
     return False
 
 
+def _choose_upload_payload(passed_payloads, prefer_order=False):
+    wrapped = [payload for payload in passed_payloads if _is_upload_payload(payload)]
+    if not wrapped:
+        return "N/A"
+
+    raw_wrapped = []
+    for payload in wrapped:
+        try:
+            decoded = urllib.parse.unquote(payload)
+        except Exception:
+            decoded = payload
+        if decoded == payload:
+            raw_wrapped.append(payload)
+
+    if raw_wrapped:
+        if prefer_order:
+            return raw_wrapped[0]
+        return min(raw_wrapped, key=len)
+    if prefer_order:
+        return wrapped[0]
+    return min(wrapped, key=len)
+
+
+def _choose_shortest_payload(passed_payloads, upload: bool, prefer_order=False):
+    if not passed_payloads:
+        return "N/A"
+    if upload:
+        return _choose_upload_payload(passed_payloads, prefer_order=prefer_order)
+    return min(passed_payloads, key=len)
+
+
 def purewaf(
     waf_words="",
     waf_chars="",
@@ -259,6 +290,7 @@ def purewaf(
     waf_words_list = utils.parse_waf_words(waf_words)
     waf_chars_set = utils.parse_waf_chars(waf_chars)
     waf_regex_obj = utils.parse_waf_regex(waf_regex)
+    strategies = utils.get_encoding_strategies()
 
     options_root = bypass.BypassOptions(
         flagfile="/",  # 初始默认根目录
@@ -289,10 +321,14 @@ def purewaf(
         logger.warning("[!] No base payloads generated for Root Directory.")
         shortest_root = "N/A"
     else:
-        strategies = utils.get_encoding_strategies()
-        encoded_payloads_root = bypass.apply_encodings(base_payloads_root, strategies)
+        targeted_payloads_root = bypass._build_targeted_candidates(
+            base_payloads_root,
+            waf_words_list,
+            waf_chars_set,
+            waf_regex_obj,
+        )
         passed_root = bypass.filter_payloads(
-            encoded_payloads_root,
+            targeted_payloads_root,
             waf_words_list,
             waf_chars_set,
             waf_regex_obj,
@@ -300,11 +336,26 @@ def purewaf(
             show_progress=show_progress,
             verbose=total_payload,
         )
-        if not passed_root:
-            logger.warning("[!] No payload passed WAF filters for Root Directory.")
-            shortest_root = "N/A"
-        else:
-            shortest_root = min(passed_root, key=len)
+        shortest_root = _choose_shortest_payload(passed_root, upload, prefer_order=False)
+
+        if shortest_root == "N/A":
+            encoded_payloads_root = bypass.apply_encodings(base_payloads_root, strategies)
+            passed_root_fallback = bypass.filter_payloads(
+                encoded_payloads_root,
+                waf_words_list,
+                waf_chars_set,
+                waf_regex_obj,
+                limit_length,
+                show_progress=show_progress,
+                verbose=total_payload,
+            )
+            shortest_root = _choose_shortest_payload(passed_root_fallback, upload, prefer_order=False)
+
+        if shortest_root == "N/A":
+            if upload:
+                logger.warning("[!] No wrapped payload passed WAF filters for Root Directory.")
+            else:
+                logger.warning("[!] No payload passed WAF filters for Root Directory.")
 
     logger.info("")
 
@@ -314,9 +365,14 @@ def purewaf(
         logger.warning("[!] No base payloads generated for Flag File.")
         shortest_flag = "N/A"
     else:
-        encoded_payloads_flag = bypass.apply_encodings(base_payloads_flag, strategies)
+        targeted_payloads_flag = bypass._build_targeted_candidates(
+            base_payloads_flag,
+            waf_words_list,
+            waf_chars_set,
+            waf_regex_obj,
+        )
         passed_flag = bypass.filter_payloads(
-            encoded_payloads_flag,
+            targeted_payloads_flag,
             waf_words_list,
             waf_chars_set,
             waf_regex_obj,
@@ -324,18 +380,26 @@ def purewaf(
             show_progress=show_progress,
             verbose=total_payload,
         )
-        if not passed_flag:
-            logger.warning("[!] No payload passed WAF filters for Flag File.")
-            shortest_flag = "N/A"
-        else:
+        shortest_flag = _choose_shortest_payload(passed_flag, upload, prefer_order=False)
+
+        if shortest_flag == "N/A":
+            encoded_payloads_flag = bypass.apply_encodings(base_payloads_flag, strategies)
+            passed_flag_fallback = bypass.filter_payloads(
+                encoded_payloads_flag,
+                waf_words_list,
+                waf_chars_set,
+                waf_regex_obj,
+                limit_length,
+                show_progress=show_progress,
+                verbose=total_payload,
+            )
+            shortest_flag = _choose_shortest_payload(passed_flag_fallback, upload, prefer_order=False)
+
+        if shortest_flag == "N/A":
             if upload:
-                wrapped_passed_flag = [p for p in passed_flag if _is_upload_payload(p)]
-                if wrapped_passed_flag:
-                    shortest_flag = min(wrapped_passed_flag, key=len)
-                else:
-                    shortest_flag = min(passed_flag, key=len)
+                logger.warning("[!] No wrapped payload passed WAF filters for Flag File.")
             else:
-                shortest_flag = min(passed_flag, key=len)
+                logger.warning("[!] No payload passed WAF filters for Flag File.")
 
     logger.info("")
     logger.info("-" * 40)

