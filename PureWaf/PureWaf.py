@@ -14,7 +14,7 @@ from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "1.0.2"
+version = "1.1.0"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
@@ -168,11 +168,11 @@ def _emit_contextual_tips(logger, payload, waf_regex):
         logger.info("TIPS: POST: 1=system('id');")
 
     if payload in bypass_data.ASSERT_POST_TIP_TRIGGER_PAYLOADS:
-        logger.info("TIPS: POST: 2=system('cat /flag.txt');")
+        #logger.info("TIPS: POST: 2=system('cat /flag.txt');")
         logger.info("TIPS: POST: 2=system('id');")
 
     if _looks_like_backtrack_risk_regex(waf_regex):
-        logger.info("Example (Backtrack limit bypass):")
+        logger.info("Example:")
         for line in BACKTRACK_LIMIT_POC_EGS.splitlines():
             logger.info(line)
 
@@ -188,6 +188,7 @@ def purewaf(
     port=8080,
     ip="127.0.0.1",
     phpinfo=False,
+    upload=False,
     log_level="INFO",
     total_payload=False,
     phpv=7.0,
@@ -214,6 +215,7 @@ def purewaf(
     logger.info(f"    - flagfile: {flagfile}")
     logger.info(f"    - read_env: {read_env}")
     logger.info(f"    - reflect_shell: {reflect_shell}")
+    logger.info(f"    - upload: {upload}")
     logger.info(f"    - port: {port}")
     logger.info(f"    - ip: {ip}")
     logger.info(f"    - phpinfo: {phpinfo}")
@@ -235,6 +237,7 @@ def purewaf(
         port=port,
         phpinfo=False,
         php_version=phpv,
+        upload=upload,
     )
 
     options_flag = bypass.BypassOptions(
@@ -245,6 +248,7 @@ def purewaf(
         port=port,
         phpinfo=phpinfo,
         php_version=phpv,
+        upload=upload,
     )
 
     # 生成 payload
