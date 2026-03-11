@@ -25,12 +25,23 @@
     "readgzfile('{path}')",
     "vi {path}",
     "grep '{keyword}' {path}",
+    "shuf {path}",
+    "xargs < {path}",
+    "cut -c1- {path}",
+    "column {path}",
+    "pr -T {path}",
+    "xxd -r {path}",
+    "file -s {path}",
+    "env 0<{path}",
+    "bash < {path}",
+    "tar -xf {path} -O -"
 ]
 
 READ_ENV_TEMPLATES = [
     "env",
     "printenv",
     "set",
+    "declare",
 ]
 
 ROOT_DISCOVERY_TEMPLATES = [
