@@ -112,6 +112,45 @@ php版本，默认为7.0，针对不同php版本的题目环境，你可以自�
 
 ## Examples
 
+**第十届”楚慧杯“**
+
+```php
+$forbidden = array('system', 'exec', 'passthru', 'shell_exec', 'popen', 'proc_open');  
+foreach ($forbidden as $bad) {  
+	if (stripos($spell, $bad) !== false) {  
+		die("⚠️ 检测到禁忌的黑魔法!n芙芙: "宝箱怪拒绝了这个咒语..."n</pre></div></body></html>");  
+	}  
+}  
+
+if (stripos($spell, 'flag') !== false) {  
+	die("⚠️ 宝箱怪的魔法屏障启动了!它不允许直接念出 'flag' 这个词!\n</pre></div></body></html>");  
+}  
+
+$blocked_commands = array('cat', 'tac', 'nl', 'more', 'less', 'head', 'tail', 'sort', 'uniq', 'strings', 'od', 'xxd', 'hexdump', 'grep', 'awk', 'sed', 'cut', 'rev', 'base64', 'env');  
+foreach ($blocked_commands as $cmd) {  
+	if (stripos($spell, $cmd) !== false) {  
+	die("⚠️ 宝箱怪识破了你的咒语!命令 '$cmd' 已被封印!\n芙芙: \"这些常用的命令都被屏蔽了...得想想其他办法...\"\n</pre></div></body></html>");  
+	}  
+}  
+```
+
+新鲜出炉这一块，可以提取出来 Waf 就是：
+
+```py
+from PureWaf import purewaf
+
+w = purewaf(
+    waf_words="system|exec|passthru|shell_exec|popen|proc_open|flag|cat|tac|nl|more|less|head|tail|sort|uniq|strings|od|xxd|hexdump|grep|awk|sed|cut|rev|base64|env"
+)
+
+print(w)
+
+#[+] Shortest Root Payload : ls /
+#[+] Shortest Flag Payload : vi /f???
+```
+
+这个过滤的不算严格就是了
+
 **CISCN 2024 simple_php**
 
 [ctf.show](https://ctf.show/challenges#simple_php-4329)
