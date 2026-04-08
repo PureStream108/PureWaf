@@ -60,6 +60,12 @@ pip install PureWaf
 from PureWaf import purewaf
 ```
 
+如果你要启动前端界面，需要使用 Python 3.9 及以上，并额外安装 Flask：
+
+```bash
+pip install "flask>=3.1,<4"
+```
+
 ## Parameters
 
 **waf_words**
@@ -109,6 +115,10 @@ php版本，默认为7.0，针对不同php版本的题目环境，你可以自�
 **upload**
 
 默认为 False（关闭），开启后会生成由 `<?php` 等包裹后的 payload，适用于部分上传文件场景，可结合 phpv 使用
+
+**webui**
+
+默认为 False（关闭），`webui` 暂仅支持 Python 3.9 及以上
 
 ## Examples
 
@@ -354,7 +364,6 @@ N/A
 ## Limitations
 
 - 暂时无法实现自定义命令
-- 暂时没有图形化界面
 - 暂时没有内部检查payload是否可行机制
 - 暂时没有白名单选项
 - 暂时只适配 eval($a) 情形
