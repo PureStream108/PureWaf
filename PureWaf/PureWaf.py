@@ -1,30 +1,56 @@
 # main package
 
-import atexit
-import json
+import importlib
 import logging
 import os
 import sys
 import time
 import urllib.parse
-import urllib.request
+from dataclasses import dataclass
+from typing import List
 
-from packaging.version import InvalidVersion
-from packaging.version import Version
 from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "1.1.2"
+version = "1.2.0"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
 BACKTRACK_LIMIT_POC_EGS = bypass_data.BACKTRACK_LIMIT_POC_EGS
 
-UPDATE_NOTICE_COLOR = "\033[93m"
-UPDATE_COMMAND_COLOR = "\033[96m"
-COLOR_RESET = "\033[0m"
-_UPDATE_NOTICE_REGISTERED = False
+WEBUI_MIN_PYTHON = (3, 9)
+WEBUI_FLASK_SPEC = "flask>=3.1,<4"
+WEBUI_INSTALL_COMMAND = f'pip install "{WEBUI_FLASK_SPEC}"'
+
+
+@dataclass(frozen=True)
+class PureWafConfig:
+    waf_words: str = ""
+    waf_chars: str = ""
+    waf_regex: str = ""
+    limit_length: int = 999999
+    flagfile: str = "/flag"
+    read_env: bool = False
+    reflect_shell: bool = False
+    port: int = 8080
+    ip: str = "127.0.0.1"
+    phpinfo: bool = False
+    upload: bool = False
+    log_level: str = "INFO"
+    total_payload: bool = False
+    phpv: float = 7.0
+    webui: bool = False
+
+
+@dataclass
+class PureWafExecutionResult:
+    shortest_root: str
+    shortest_flag: str
+    root_passed_payloads: List[str]
+    flag_passed_payloads: List[str]
+    tips_text: str
+    log_text: str
 
 
 def banner(version_text):
@@ -42,6 +68,41 @@ def banner(version_text):
 
 
 """
+
+
+class _ExecutionLogger:
+    def __init__(self, forward_logger=None, event_callback=None):
+        self.forward_logger = forward_logger
+        self.event_callback = event_callback
+        self.messages = []
+
+    def info(self, message):
+        self._emit("info", message)
+
+    def warning(self, message):
+        self._emit("warning", message)
+
+    def error(self, message):
+        self._emit("error", message)
+
+    def _emit(self, level, message):
+        text = str(message)
+        self.messages.append(text)
+        if self.forward_logger:
+            getattr(self.forward_logger, level)(text)
+        _emit_event(
+            self.event_callback,
+            {
+                "type": "log",
+                "level": level,
+                "message": text,
+            },
+        )
+
+
+def _emit_event(event_callback, event):
+    if event_callback:
+        event_callback(event)
 
 
 def _configure_logger(log_level: str):
@@ -71,56 +132,6 @@ def _configure_logger(log_level: str):
         warnings.filterwarnings("ignore")
 
     return logger, show_progress
-
-
-def _fetch_latest_pypi_version(package_name: str = "PureWaf", timeout: float = 2.0):
-    url = f"https://pypi.org/pypi/{package_name}/json"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        return payload.get("info", {}).get("version")
-    except Exception:
-        return None
-
-
-def _is_newer_version(latest: str, current: str):
-    try:
-        return Version(str(latest)) > Version(str(current))
-    except (InvalidVersion, TypeError):
-        return False
-
-
-def _emit_update_notice(latest: str, current: str):
-    message = f"[+] New version available: {latest} (current: {current})"
-    upgrade = "[+] Upgrade: pip install -U PureWaf"
-
-    stream = getattr(sys, "stdout", None)
-    if stream and stream.isatty():
-        print(f"{UPDATE_NOTICE_COLOR}{message}{COLOR_RESET}")
-        print(f"{UPDATE_COMMAND_COLOR}{upgrade}{COLOR_RESET}")
-    else:
-        print(message)
-        print(upgrade)
-
-
-def _check_and_notify_update(current_version: str):
-    latest = _fetch_latest_pypi_version()
-    if not latest:
-        return
-    if _is_newer_version(latest, current_version):
-        _emit_update_notice(latest, current_version)
-
-
-def _notify_update_at_exit():
-    _check_and_notify_update(version)
-
-
-def register_update_notice_at_exit():
-    global _UPDATE_NOTICE_REGISTERED
-    if _UPDATE_NOTICE_REGISTERED:
-        return
-    atexit.register(_notify_update_at_exit)
-    _UPDATE_NOTICE_REGISTERED = True
 
 
 def _emit_special_payload_egs(logger, payload):
@@ -169,7 +180,6 @@ def _emit_contextual_tips(logger, payload, waf_regex):
         logger.info("TIPS: POST: 1=system('id');")
 
     if payload in bypass_data.ASSERT_POST_TIP_TRIGGER_PAYLOADS:
-        #logger.info("TIPS: POST: 2=system('cat /flag.txt');")
         logger.info("TIPS: POST: 2=system('id');")
 
     if _looks_like_backtrack_risk_regex(waf_regex):
@@ -239,6 +249,293 @@ def _choose_shortest_payload(passed_payloads, upload: bool, prefer_order=False):
     return min(passed_payloads, key=len)
 
 
+def _normalize_php_version(phpv, logger):
+    try:
+        return float(phpv)
+    except (ValueError, TypeError):
+        logger.error(f"[!] Invalid php_version: {phpv}. Using default 7.0")
+        return 7.0
+
+
+def _log_configuration(logger, config: PureWafConfig, phpv: float):
+    logger.info("")
+    logger.info("-" * 40)
+    logger.info("[*] Configuration:")
+    logger.info(f"    - waf_words: {config.waf_words}")
+    logger.info(f"    - waf_chars: {config.waf_chars}")
+    logger.info(f"    - waf_regex: {config.waf_regex}")
+    logger.info(f"    - limit_length: {config.limit_length}")
+    logger.info(f"    - flagfile: {config.flagfile}")
+    logger.info(f"    - read_env: {config.read_env}")
+    logger.info(f"    - reflect_shell: {config.reflect_shell}")
+    logger.info(f"    - upload: {config.upload}")
+    logger.info(f"    - port: {config.port}")
+    logger.info(f"    - ip: {config.ip}")
+    logger.info(f"    - phpinfo: {config.phpinfo}")
+    logger.info(f"    - phpv: {phpv}")
+    logger.info(f"    - log_level: {config.log_level}")
+    logger.info(f"    - total_payload: {config.total_payload}")
+    logger.info("-" * 40)
+    logger.info("")
+
+
+def _build_filter_progress_callback(event_callback, scope: str, phase: str):
+    if not event_callback:
+        return None
+
+    def callback(event):
+        event_payload = dict(event)
+        event_payload["scope"] = scope
+        event_payload["phase"] = phase
+        _emit_event(event_callback, event_payload)
+
+    return callback
+
+
+def _build_filter_trace_callback(event_callback, scope: str, phase: str):
+    if not event_callback:
+        return None
+
+    def callback(event):
+        event_payload = dict(event)
+        event_payload["scope"] = scope
+        event_payload["phase"] = phase
+        _emit_event(event_callback, event_payload)
+
+    return callback
+
+
+def _emit_candidate_events(event_callback, scope: str, phase: str, scope_label: str, payloads):
+    if not event_callback:
+        return
+
+    total = len(payloads)
+    _emit_event(
+        event_callback,
+        {
+            "type": "stage",
+            "scope": scope,
+            "phase": phase,
+            "message": f"[*] {scope_label} {phase} payloads: {total}",
+        },
+    )
+    for idx, payload in enumerate(payloads, start=1):
+        _emit_event(
+            event_callback,
+            {
+                "type": "candidate",
+                "scope": scope,
+                "phase": phase,
+                "current": idx,
+                "total": total,
+                "payload": payload,
+            },
+        )
+
+
+def _process_payload_scope(
+    scope_key: str,
+    scope_label: str,
+    options,
+    waf_words_list,
+    waf_chars_set,
+    waf_regex_obj,
+    config: PureWafConfig,
+    strategies,
+    logger,
+    show_progress: bool,
+    event_callback=None,
+):
+    logger.info(f"[*] Generating payloads for {scope_label}...")
+
+    base_payloads = bypass.generate_candidates(options)
+    if not base_payloads:
+        logger.warning(f"[!] No base payloads generated for {scope_label}.")
+        return "N/A", []
+    _emit_candidate_events(event_callback, scope_key, "base", scope_label, base_payloads)
+
+    targeted_payloads = bypass._build_targeted_candidates(
+        base_payloads,
+        waf_words_list,
+        waf_chars_set,
+        waf_regex_obj,
+    )
+    _emit_candidate_events(event_callback, scope_key, "targeted", scope_label, targeted_payloads)
+    passed_payloads = bypass.filter_payloads(
+        targeted_payloads,
+        waf_words_list,
+        waf_chars_set,
+        waf_regex_obj,
+        config.limit_length,
+        show_progress=show_progress,
+        verbose=config.total_payload,
+        progress_callback=_build_filter_progress_callback(event_callback, scope_key, "targeted"),
+        trace_callback=_build_filter_trace_callback(event_callback, scope_key, "targeted"),
+    )
+    shortest_payload = _choose_shortest_payload(
+        passed_payloads,
+        config.upload,
+        prefer_order=False,
+    )
+    final_passed_payloads = passed_payloads
+
+    if shortest_payload == "N/A":
+        _emit_event(
+            event_callback,
+            {
+                "type": "stage",
+                "scope": scope_key,
+                "phase": "encoded_fallback",
+                "message": f"[*] Trying encoded payload fallback for {scope_label}...",
+            },
+        )
+        encoded_payloads = bypass.apply_encodings(base_payloads, strategies)
+        _emit_candidate_events(event_callback, scope_key, "encoded", scope_label, encoded_payloads)
+        fallback_passed_payloads = bypass.filter_payloads(
+            encoded_payloads,
+            waf_words_list,
+            waf_chars_set,
+            waf_regex_obj,
+            config.limit_length,
+            show_progress=show_progress,
+            verbose=config.total_payload,
+            progress_callback=_build_filter_progress_callback(event_callback, scope_key, "fallback"),
+            trace_callback=_build_filter_trace_callback(event_callback, scope_key, "fallback"),
+        )
+        shortest_payload = _choose_shortest_payload(
+            fallback_passed_payloads,
+            config.upload,
+            prefer_order=False,
+        )
+        if fallback_passed_payloads:
+            final_passed_payloads = fallback_passed_payloads
+
+    if shortest_payload == "N/A":
+        if config.upload:
+            logger.warning(f"[!] No wrapped payload passed WAF filters for {scope_label}.")
+        else:
+            logger.warning(f"[!] No payload passed WAF filters for {scope_label}.")
+
+    return shortest_payload, final_passed_payloads
+
+
+def _execute_purewaf(
+    config: PureWafConfig,
+    output_logger=None,
+    show_progress=True,
+    sleep_before_run=True,
+    event_callback=None,
+):
+    logger = _ExecutionLogger(forward_logger=output_logger, event_callback=event_callback)
+
+    logger.info(banner(version).rstrip())
+    if sleep_before_run:
+        time.sleep(1)
+
+    phpv = _normalize_php_version(config.phpv, logger)
+    _log_configuration(logger, config, phpv)
+
+    waf_words_list = utils.parse_waf_words(config.waf_words)
+    waf_chars_set = utils.parse_waf_chars(config.waf_chars)
+    waf_regex_obj = utils.parse_waf_regex(config.waf_regex)
+    strategies = utils.get_encoding_strategies()
+
+    options_root = bypass.BypassOptions(
+        flagfile="/",
+        read_env=False,
+        reflect_shell=False,
+        ip=config.ip,
+        port=config.port,
+        phpinfo=False,
+        php_version=phpv,
+        upload=config.upload,
+    )
+
+    options_flag = bypass.BypassOptions(
+        flagfile=config.flagfile,
+        read_env=config.read_env,
+        reflect_shell=config.reflect_shell,
+        ip=config.ip,
+        port=config.port,
+        phpinfo=config.phpinfo,
+        php_version=phpv,
+        upload=config.upload,
+    )
+
+    shortest_root, root_passed_payloads = _process_payload_scope(
+        "root",
+        "Root Directory",
+        options_root,
+        waf_words_list,
+        waf_chars_set,
+        waf_regex_obj,
+        config,
+        strategies,
+        logger,
+        show_progress,
+        event_callback=event_callback,
+    )
+
+    logger.info("")
+
+    shortest_flag, flag_passed_payloads = _process_payload_scope(
+        "flag",
+        "Flag File",
+        options_flag,
+        waf_words_list,
+        waf_chars_set,
+        waf_regex_obj,
+        config,
+        strategies,
+        logger,
+        show_progress,
+        event_callback=event_callback,
+    )
+
+    logger.info("")
+    logger.info("-" * 40)
+    logger.info(f"[+] Shortest Root Payload : {shortest_root}")
+    logger.info(f"[+] Shortest Flag Payload : {shortest_flag}")
+    logger.info("-" * 40)
+    logger.info("")
+
+    tips_logger = _ExecutionLogger(forward_logger=logger, event_callback=event_callback)
+    _emit_contextual_tips(tips_logger, shortest_flag, config.waf_regex)
+    logger.info("")
+
+    return PureWafExecutionResult(
+        shortest_root=shortest_root,
+        shortest_flag=shortest_flag,
+        root_passed_payloads=root_passed_payloads,
+        flag_passed_payloads=flag_passed_payloads,
+        tips_text="\n".join(tips_logger.messages),
+        log_text="\n".join(logger.messages),
+    )
+
+
+def _launch_webui(config: PureWafConfig):
+    if sys.version_info < WEBUI_MIN_PYTHON:
+        current_version = ".".join(str(part) for part in sys.version_info[:3])
+        minimum_version = ".".join(str(part) for part in WEBUI_MIN_PYTHON)
+        raise RuntimeError(
+            "Web UI requires Python "
+            f"{minimum_version}+; current Python is {current_version}. "
+            f"Install {WEBUI_FLASK_SPEC} on Python {minimum_version}+."
+        )
+    try:
+        webui_module = importlib.import_module(".webui", package=__package__)
+    except ModuleNotFoundError as exc:
+        missing_name = exc.name or ""
+        if missing_name.startswith("flask"):
+            raise RuntimeError(
+                "Web UI dependencies are incomplete or outdated. "
+                f"Current Python is {sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}. "
+                f"Install or upgrade them with: {WEBUI_INSTALL_COMMAND}"
+            ) from exc
+        raise
+    webui_module.launch_webui(config)
+
+
 def purewaf(
     waf_words="",
     waf_chars="",
@@ -254,160 +551,35 @@ def purewaf(
     log_level="INFO",
     total_payload=False,
     phpv=7.0,
+    webui=False,
 ):
-    logger, show_progress = _configure_logger(log_level)
-    logger.info(banner(version).rstrip())
-    time.sleep(1)
-
-    # 校验版本
-    try:
-        phpv = float(phpv)
-    except (ValueError, TypeError):
-        logger.error(f"[!] Invalid php_version: {phpv}. Using default 7.0")
-        phpv = 7.0
-
-    # 打印配置
-    logger.info("")
-    logger.info("-" * 40)
-    logger.info(f"[*] Configuration:")
-    logger.info(f"    - waf_words: {waf_words}")
-    logger.info(f"    - waf_chars: {waf_chars}")
-    logger.info(f"    - waf_regex: {waf_regex}")
-    logger.info(f"    - limit_length: {limit_length}")
-    logger.info(f"    - flagfile: {flagfile}")
-    logger.info(f"    - read_env: {read_env}")
-    logger.info(f"    - reflect_shell: {reflect_shell}")
-    logger.info(f"    - upload: {upload}")
-    logger.info(f"    - port: {port}")
-    logger.info(f"    - ip: {ip}")
-    logger.info(f"    - phpinfo: {phpinfo}")
-    logger.info(f"    - phpv: {phpv}")
-    logger.info(f"    - log_level: {log_level}")
-    logger.info(f"    - total_payload: {total_payload}")
-    logger.info("-" * 40)
-    logger.info("")
-
-    waf_words_list = utils.parse_waf_words(waf_words)
-    waf_chars_set = utils.parse_waf_chars(waf_chars)
-    waf_regex_obj = utils.parse_waf_regex(waf_regex)
-    strategies = utils.get_encoding_strategies()
-
-    options_root = bypass.BypassOptions(
-        flagfile="/",  # 初始默认根目录
-        read_env=False,
-        reflect_shell=False,
-        ip=ip,
-        port=port,
-        phpinfo=False,
-        php_version=phpv,
-        upload=upload,
-    )
-
-    options_flag = bypass.BypassOptions(
+    config = PureWafConfig(
+        waf_words=waf_words,
+        waf_chars=waf_chars,
+        waf_regex=waf_regex,
+        limit_length=limit_length,
         flagfile=flagfile,
         read_env=read_env,
         reflect_shell=reflect_shell,
-        ip=ip,
         port=port,
+        ip=ip,
         phpinfo=phpinfo,
-        php_version=phpv,
         upload=upload,
+        log_level=log_level,
+        total_payload=total_payload,
+        phpv=phpv,
+        webui=webui,
     )
 
-    # 生成 payload
-    logger.info("[*] Generating payloads for Root Directory...")
-    base_payloads_root = bypass.generate_candidates(options_root)
-    if not base_payloads_root:
-        logger.warning("[!] No base payloads generated for Root Directory.")
-        shortest_root = "N/A"
-    else:
-        targeted_payloads_root = bypass._build_targeted_candidates(
-            base_payloads_root,
-            waf_words_list,
-            waf_chars_set,
-            waf_regex_obj,
-        )
-        passed_root = bypass.filter_payloads(
-            targeted_payloads_root,
-            waf_words_list,
-            waf_chars_set,
-            waf_regex_obj,
-            limit_length,
-            show_progress=show_progress,
-            verbose=total_payload,
-        )
-        shortest_root = _choose_shortest_payload(passed_root, upload, prefer_order=False)
+    if config.webui:
+        _launch_webui(config)
+        return None
 
-        if shortest_root == "N/A":
-            encoded_payloads_root = bypass.apply_encodings(base_payloads_root, strategies)
-            passed_root_fallback = bypass.filter_payloads(
-                encoded_payloads_root,
-                waf_words_list,
-                waf_chars_set,
-                waf_regex_obj,
-                limit_length,
-                show_progress=show_progress,
-                verbose=total_payload,
-            )
-            shortest_root = _choose_shortest_payload(passed_root_fallback, upload, prefer_order=False)
-
-        if shortest_root == "N/A":
-            if upload:
-                logger.warning("[!] No wrapped payload passed WAF filters for Root Directory.")
-            else:
-                logger.warning("[!] No payload passed WAF filters for Root Directory.")
-
-    logger.info("")
-
-    logger.info("[*] Generating payloads for Flag File...")
-    base_payloads_flag = bypass.generate_candidates(options_flag)
-    if not base_payloads_flag:
-        logger.warning("[!] No base payloads generated for Flag File.")
-        shortest_flag = "N/A"
-    else:
-        targeted_payloads_flag = bypass._build_targeted_candidates(
-            base_payloads_flag,
-            waf_words_list,
-            waf_chars_set,
-            waf_regex_obj,
-        )
-        passed_flag = bypass.filter_payloads(
-            targeted_payloads_flag,
-            waf_words_list,
-            waf_chars_set,
-            waf_regex_obj,
-            limit_length,
-            show_progress=show_progress,
-            verbose=total_payload,
-        )
-        shortest_flag = _choose_shortest_payload(passed_flag, upload, prefer_order=False)
-
-        if shortest_flag == "N/A":
-            encoded_payloads_flag = bypass.apply_encodings(base_payloads_flag, strategies)
-            passed_flag_fallback = bypass.filter_payloads(
-                encoded_payloads_flag,
-                waf_words_list,
-                waf_chars_set,
-                waf_regex_obj,
-                limit_length,
-                show_progress=show_progress,
-                verbose=total_payload,
-            )
-            shortest_flag = _choose_shortest_payload(passed_flag_fallback, upload, prefer_order=False)
-
-        if shortest_flag == "N/A":
-            if upload:
-                logger.warning("[!] No wrapped payload passed WAF filters for Flag File.")
-            else:
-                logger.warning("[!] No payload passed WAF filters for Flag File.")
-
-    logger.info("")
-    logger.info("-" * 40)
-    logger.info(f"[+] Shortest Root Payload : {shortest_root}")
-    logger.info(f"[+] Shortest Flag Payload : {shortest_flag}")
-    logger.info("-" * 40)
-    logger.info("")
-    _emit_contextual_tips(logger, shortest_flag, waf_regex)
-    logger.info("")
-
-    return shortest_flag
+    output_logger, show_progress = _configure_logger(config.log_level)
+    result = _execute_purewaf(
+        config,
+        output_logger=output_logger,
+        show_progress=show_progress,
+        sleep_before_run=True,
+    )
+    return result.shortest_flag
