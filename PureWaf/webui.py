@@ -180,7 +180,7 @@ PAGE_TEMPLATE = """
         </div>
         <div class="result-wrap">
           <div class="result-console-wrap">
-            <pre id="result_output" class="result-console">[*] 点击左侧 Run 后，这里会显示终端式结果摘要。</pre>
+            <pre id="result_output" class="result-console">[*] 点击 Run 后，这里会显示结果</pre>
           </div>
         </div>
       </section>
@@ -231,7 +231,7 @@ PAGE_TEMPLATE = """
       if(!lines.length) return;
       const chunk = lines.join("\\n");
       const current = getProcessText();
-      if(current === "[*] Web UI 任务已启动，正在生成结果..."){
+      if(current === "[*] Running"){
         processTextNode.appendData(`\\n${chunk}`);
       }else if(current === "[*] 还没有运行任务。" || current === "[*] idle" || !current){
         processTextNode.data = chunk;
@@ -339,14 +339,14 @@ PAGE_TEMPLATE = """
     function clearOutput(){
       terminalEventReceived = false;
       clearReconnectTimer();
-      setProcessText("[*] Web UI 任务已启动，正在生成结果...");
+      setProcessText("[*] Running");
       setResultText("[*] 等待结果摘要...");
     }
     function resetOutput(){
       terminalEventReceived = false;
       clearReconnectTimer();
       setProcessText("[*] 还没有运行任务。");
-      setResultText("[*] 点击左侧 Run 后，这里会显示终端式结果摘要。");
+      setResultText("[*] 点击 Run 后，这里会显示终端式结果");
     }
     function appendLine(text){
       appendLines([text]);
