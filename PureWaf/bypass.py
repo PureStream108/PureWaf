@@ -490,16 +490,54 @@ def filter_payloads(
     limit_length,
     show_progress=True,
     verbose=False,
+    progress_callback=None,
+    trace_callback=None,
 ):
     passed = []
     progress = ProgressBar(len(payloads), verbose=verbose) if show_progress else None
+    total = len(payloads)
     for idx, payload in enumerate(payloads, start=1):
         if progress:
             progress.update(idx)
-        if utils.is_payload_allowed(payload, waf_words, waf_chars, waf_regex, limit_length):
+        if progress_callback and (idx == 1 or idx % 100 == 0 or idx == total):
+            progress_callback(
+                {
+                    "type": "progress",
+                    "current": idx,
+                    "total": total,
+                    "passed": len(passed),
+                }
+            )
+        allowed = utils.is_payload_allowed(payload, waf_words, waf_chars, waf_regex, limit_length)
+        if trace_callback:
+            event = {
+                "type": "filter",
+                "current": idx,
+                "total": total,
+                "payload": payload,
+                "allowed": allowed,
+                "payload_length": len(payload),
+            }
+            if not allowed:
+                blocked = _analyze_block_reasons(payload, waf_words, waf_chars, waf_regex)
+                if limit_length is not None and len(payload) > limit_length:
+                    blocked["limit_length"] = limit_length
+                event["blocked"] = blocked
+            trace_callback(event)
+        if allowed:
             passed.append(payload)
             if progress:
                 progress.mark_pass(payload)
+            if progress_callback and verbose:
+                progress_callback(
+                    {
+                        "type": "pass",
+                        "current": idx,
+                        "total": total,
+                        "passed": len(passed),
+                        "payload": payload,
+                    }
+                )
     if progress:
         progress.finish()
     return passed
