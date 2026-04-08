@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "PureWaf"
-version = "1.1.2"
+version = "1.2.0"
 description = "WAF Bypass Payload Generator"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
 authors = [{ name = "Pure Stream" }]
-dependencies = ["packaging>=24"]
+dependencies = []
+
+[project.optional-dependencies]
+webui = ['flask>=3.1,<4; python_version >= "3.9"']
 
 [project.urls]
 Homepage = "https://github.com/PureStream108/PureWaf"
