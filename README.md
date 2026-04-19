@@ -58,12 +58,8 @@ system($cmd);
 pip install PureWaf
 
 from PureWaf import purewaf
-```
 
-如果你要启动前端界面，需要使用 Python 3.9 及以上，并额外安装 Flask：
-
-```bash
-pip install "flask>=3.1,<4"
+purewaf(webui=True)
 ```
 
 ## Parameters
@@ -116,9 +112,15 @@ php版本，默认为7.0，针对不同php版本的题目环境，你可以自�
 
 默认为 False（关闭），开启后会生成由 `<?php` 等包裹后的 payload，适用于部分上传文件场景，可结合 phpv 使用
 
+## WebUI & Auto
+
 **webui**
 
-默认为 False（关闭），`webui` 暂仅支持 Python 3.9 及以上
+默认为 False，暂仅支持 Python 3.9 及以上
+
+**auto**
+
+默认为 False，当且仅当 `webui=True` 时自身才可以生效，此时将解锁自动分析能力，只需将你的 php 源码丢给它即可（不过只支持单文件，必须得是单文件里有明确可以绕过点的）
 
 ## Examples
 
@@ -385,6 +387,10 @@ N/A
 [以一道CTF题目看无参数RCE - 泠涯 - 博客园](https://www.cnblogs.com/hello-there/p/12880566.html)
 
 [CTF中的RCE绕过-腾讯云开发者社区-腾讯云](https://cloud.tencent.com/developer/article/2393421)
+
+[CTFshow-RCE极限大挑战 | 晴川's Blog🌈](https://blog.q1ngchuan.top/2023/10/01/CTFshow-RCE极限大挑战/index.html)
+
+[CTF中WEB题——RCE - tomyyyyy - 博客园](https://www.cnblogs.com/tomyyyyy/p/13905357.html)
 
 ## Star History
 
