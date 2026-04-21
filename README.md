@@ -376,7 +376,7 @@ N/A
 
 欢迎在 issues 中提供 PureWaf 无法解出的题目并附带对应的wp！
 
-供题者的 ID 将会出现在下一版本的 release中！
+供题者的 ID 将会出现在下一版本的 release 中！
 
 ## Thanks & References
 
@@ -391,6 +391,14 @@ N/A
 [CTFshow-RCE极限大挑战 | 晴川's Blog🌈](https://blog.q1ngchuan.top/2023/10/01/CTFshow-RCE极限大挑战/index.html)
 
 [CTF中WEB题——RCE - tomyyyyy - 博客园](https://www.cnblogs.com/tomyyyyy/p/13905357.html)
+
+[exploit-bypass-php-escapeshellarg-escapeshellcmd](https://github.com/kacperszurek/exploits/blob/master/GitList/exploit-bypass-php-escapeshellarg-escapeshellcmd.md)
+
+[PHP escapeshellcmd/escapeshellarg security advisory](https://gist.github.com/Zenexer/40d02da5e07f151adeaeeaa11af9ab36)
+
+[Exploit PHP Remotely - WAF Rule & Filter Bypass](https://www.secjuice.com/php-rce-bypass-filters-sanitization-waf/)
+
+[异或、取反、或绕过 - SCU-CTF](https://wiki.scuctf.com/ctfwiki/web/3.rce/异或取反或绕过/)
 
 ## Star History
 
