@@ -12,6 +12,7 @@ sys.path.insert(0, ROOT)
 from PureWaf import bypass
 from PureWaf import bypass_data
 from PureWaf import PureWaf as core
+from PureWaf import utils
 from PureWaf.PureWaf import purewaf
 
 
@@ -81,6 +82,16 @@ class LinkPayloadValidationTests(unittest.TestCase):
         self.assertIn("TIPS: POST: 1=system('id');", output_vh)
         self.assertNotIn("Example (Backtrack limit bypass):", output_vh)
 
+        logger_nan = _FakeLogger()
+        core._emit_contextual_tips(
+            logger_nan,
+            utils.generate_nan_seed_post_gateway(),
+            "/safe/",
+        )
+        output_nan = "\n".join(logger_nan.messages)
+        self.assertIn("TIPS: POST: 0=assert", output_nan)
+        self.assertIn("TIPS: POST: 1=system('id');", output_nan)
+
     def test_runtime_validation_php_cli(self):
         php_bin = shutil.which("php")
         if not php_bin:
@@ -123,8 +134,16 @@ echo $out;
 
         script_vh = """<?php
 $_POST["x"] = "system('echo vh_ok');";
+$vars = get_defined_vars();
+$carrier = [];
+while (($candidate = next($vars)) !== false) {
+    if (is_array($candidate) && isset($candidate["x"])) {
+        $carrier = $candidate;
+        break;
+    }
+}
 ob_start();
-eval(array_pop(next(get_defined_vars())));
+eval(array_pop($carrier));
 $out = ob_get_clean();
 echo $out;
 """
@@ -144,7 +163,7 @@ echo $out;
         self.assertEqual(code_chr, 0)
         self.assertIn("chr_ok", out_chr)
 
-    def test_ctf_style_end_to_end(self):
+    def test_ctf(self):
         fake_logger_a = _FakeLogger()
         with (
             patch("PureWaf.PureWaf._configure_logger", return_value=(fake_logger_a, False)),

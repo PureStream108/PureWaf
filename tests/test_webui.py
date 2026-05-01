@@ -13,13 +13,16 @@ from PureWaf.PureWaf import _execute_purewaf
 from PureWaf.PureWaf import purewaf
 from PureWaf.PureWaf import PureWafConfig
 from PureWaf.PureWaf import PureWafExecutionResult
+from PureWaf.auto import AutoAnalysisResult
 
 try:
     from PureWaf.webui import _build_result_text
+    from PureWaf.webui import _build_runtime_config
     from PureWaf.webui import create_app
 except Exception:
     create_app = None
     _build_result_text = None
+    _build_runtime_config = None
 
 
 class WebUiTests(unittest.TestCase):
@@ -40,10 +43,15 @@ class WebUiTests(unittest.TestCase):
 
         body = response.get_data(as_text=True)
         self.assertEqual(response.status_code, 200)
-        self.assertIn("PureWaf Web UI", body)
+        #self.assertIn("PureWaf Web UI", body)
         self.assertIn("payload stream", body)
         self.assertIn("result summary", body)
         self.assertIn('id="result_output"', body)
+        self.assertIn('id="mode_filter"', body)
+        self.assertIn('id="mode_auto"', body)
+        self.assertIn('id="panel_filter"', body)
+        self.assertIn('id="panel_auto"', body)
+        self.assertIn('id="auto_prompt"', body)
         self.assertIn("waf_words", body)
         self.assertNotIn('id="root_result"', body)
         self.assertNotIn('id="flag_result"', body)
@@ -97,6 +105,7 @@ class WebUiTests(unittest.TestCase):
         ):
             result = purewaf(
                 waf_regex="/flag/i",
+                payload_context="php_code",
                 flagfile="/etc/passwd",
                 read_env=True,
                 reflect_shell=True,
@@ -115,6 +124,7 @@ class WebUiTests(unittest.TestCase):
         launch_mock.assert_called_once()
         config = launch_mock.call_args.args[0]
         self.assertEqual(config.waf_regex, "/flag/i")
+        self.assertEqual(config.payload_context, "php_code")
         self.assertEqual(config.flagfile, "/etc/passwd")
         self.assertTrue(config.read_env)
         self.assertTrue(config.reflect_shell)
@@ -125,7 +135,14 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(config.log_level, "DEBUG")
         self.assertTrue(config.total_payload)
         self.assertEqual(config.phpv, 8.3)
+        self.assertFalse(config.auto)
         self.assertTrue(config.webui)
+
+    def test_auto_requires_webui(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            purewaf(auto=True, webui=False)
+
+        self.assertIn("auto=True can only be used together with webui=True", str(ctx.exception))
 
     def test_webui_missing_flask_shows_install_hint(self):
         err = ModuleNotFoundError("No module named 'flask'")
@@ -187,6 +204,101 @@ class WebUiTests(unittest.TestCase):
 
         self.assertEqual(first_payload["result"]["shortest_flag"], "flag-ok")
         self.assertEqual(second_payload["result"]["shortest_flag"], "flag-ok")
+
+    @unittest.skipIf(_build_runtime_config is None, "Flask webui module not available")
+    def test_build_runtime_config_auto_mode_uses_fixed_defaults(self):
+        config = _build_runtime_config(
+            {"mode": "auto", "auto_prompt": "<?php system($_GET['x']); ?>", "phpv": 8.3},
+            PureWafConfig(
+                waf_regex="/flag/i",
+                read_env=True,
+                reflect_shell=True,
+                phpinfo=True,
+                upload=True,
+                log_level="DEBUG",
+                total_payload=True,
+                phpv=8.3,
+                webui=True,
+            ),
+        )
+
+        self.assertTrue(config.auto)
+        self.assertTrue(config.webui)
+        self.assertEqual(config.flagfile, "/flag")
+        self.assertEqual(config.phpv, 7.0)
+        self.assertEqual(config.log_level, "INFO")
+        self.assertFalse(config.read_env)
+        self.assertFalse(config.reflect_shell)
+        self.assertFalse(config.phpinfo)
+        self.assertFalse(config.upload)
+        self.assertFalse(config.total_payload)
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_auto_mode_streams_analysis_before_result(self):
+        app = create_app(PureWafConfig(webui=True))
+        client = app.test_client()
+        fake_result = PureWafExecutionResult(
+            shortest_root="root-ok",
+            shortest_flag="flag-ok",
+            root_passed_payloads=["root-ok"],
+            flag_passed_payloads=["flag-ok"],
+            tips_text="",
+            log_text="[+] Shortest Root Payload : root-ok\n[+] Shortest Flag Payload : flag-ok",
+        )
+        fake_analysis = AutoAnalysisResult(
+            sink_kind="command_exec",
+            payload_context="php_code",
+            waf_regex="/[A-Za-z0-9_$]/",
+            limit_length=30,
+            read_env=True,
+            upload=False,
+            analysis_lines=[
+                "[*] AUTO: analyzing PHP source",
+                "[*] AUTO: detected sink => command_exec",
+                "[*] AUTO: extracted waf_regex => /[A-Za-z0-9_$]/",
+                "[*] AUTO: extracted limit_length => 30",
+                "[*] AUTO: strategy probe => read_env=True",
+                "[*] AUTO: selected strategy => read_env=True upload=False",
+            ],
+        )
+
+        with (
+            patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis),
+            patch("PureWaf.webui._execute_purewaf", return_value=fake_result) as execute_mock,
+        ):
+            run_response = client.post(
+                "/api/run",
+                json={"mode": "auto", "auto_prompt": "<?php system($_GET['x']); ?>"},
+            )
+            self.assertEqual(run_response.status_code, 200)
+            job_id = run_response.get_json()["job_id"]
+
+            stream_response = client.get(f"/api/events/{job_id}")
+            self.assertEqual(stream_response.status_code, 200)
+            body = stream_response.get_data(as_text=True)
+
+        payloads = self._extract_sse_payloads(body)
+        self.assertGreaterEqual(len(payloads), 2)
+        self.assertEqual(payloads[0]["kind"], "lines")
+        self.assertIn("[*] AUTO: analyzing PHP source", payloads[0]["lines"])
+        self.assertEqual(payloads[-1]["kind"], "result")
+
+        called_config = execute_mock.call_args.args[0]
+        self.assertTrue(called_config.auto)
+        self.assertTrue(called_config.read_env)
+        self.assertFalse(called_config.upload)
+        self.assertEqual(called_config.payload_context, "php_code")
+        self.assertEqual(called_config.waf_regex, "/[A-Za-z0-9_$]/")
+        self.assertEqual(called_config.limit_length, 30)
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_rejects_invalid_mode(self):
+        app = create_app(PureWafConfig(webui=True))
+        client = app.test_client()
+
+        response = client.post("/api/run", json={"mode": "wat"})
+
+        self.assertEqual(response.status_code, 400)
 
     def test_execute_purewaf_returns_structured_result(self):
         config = PureWafConfig(

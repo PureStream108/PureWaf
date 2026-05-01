@@ -67,6 +67,10 @@ class TestNewTechniques(unittest.TestCase):
                 found_eval = True
                 break
         self.assertTrue(found_eval, "Webshell eval/assert payload not found")
+        self.assertTrue(any("call_user_func_array" in p for p in payloads), "call_user_func_array payload not found")
+        self.assertTrue(any("array_map(" in p for p in payloads), "array_map payload not found")
+        self.assertTrue(any("preg_replace('/.*/e'" in p for p in payloads), "preg_replace /e payload not found")
+        self.assertTrue(any("create_function" in p for p in payloads), "create_function payload not found")
 
     def test_new_commands(self):
         options = bypass.BypassOptions(
@@ -187,6 +191,37 @@ class TestNewTechniques(unittest.TestCase):
         self.assertIn("echo `tac /flag`;", generated)
         self.assertIn("print(`cat /flag`);", generated)
 
+    def test_payload_context_php_code_prefers_eval_safe_payloads(self):
+        root_options = bypass.BypassOptions(
+            flagfile="/",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=8.0,
+            payload_context="php_code",
+        )
+        root_payloads = bypass.generate_candidates(root_options)
+        self.assertIn("echo `ls /`;", root_payloads)
+        self.assertNotIn("ls /", root_payloads)
+
+        flag_options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=8.0,
+            payload_context="php_code",
+        )
+        flag_payloads = bypass.generate_candidates(flag_options)
+        self.assertIn("echo `cat /flag`;", flag_payloads)
+        self.assertNotIn("cat /flag", flag_payloads)
+        self.assertNotIn("`cat /flag`", flag_payloads)
+        self.assertNotIn("$'\\154\\163'", flag_payloads)
+
     def test_readfile_templates_exclude_directory_listing_entries(self):
         self.assertNotIn("ls {path}", bypass_data.READFILE_TEMPLATES)
         self.assertNotIn("b=l;c=s;d={path};$b$c $d", bypass_data.READFILE_TEMPLATES)
@@ -235,6 +270,19 @@ class TestNewTechniques(unittest.TestCase):
         )
         payloads = bypass.generate_candidates(options)
         self.assertIn(f"$_={utils.generate_php_chr('phpinfo')};$_();", payloads)
+
+    def test_nan_post_gateway_payload_present(self):
+        options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=8.0,
+        )
+        payloads = bypass.generate_candidates(options)
+        self.assertIn(utils.generate_nan_seed_post_gateway(), payloads)
 
     def test_chr_payloads_do_not_couple_with_not_xor_increment(self):
         payloads = bypass._generate_php_rce_payloads("id", php_version=8.0)

@@ -77,6 +77,11 @@ class UtilsTests(unittest.TestCase):
     def test_generate_php_chr_empty(self):
         self.assertEqual(utils.generate_php_chr(""), "''")
 
+    def test_generate_nan_seed_post_gateway(self):
+        payload = utils.generate_nan_seed_post_gateway()
+        self.assertTrue(payload.startswith("$_=([].[])[0];"))
+        self.assertIn("$$_[0]($$_[1]);", payload)
+
     def test_get_encoding_strategies(self):
         strategies = utils.get_encoding_strategies()
         self.assertEqual(strategies[0][0], "url")
