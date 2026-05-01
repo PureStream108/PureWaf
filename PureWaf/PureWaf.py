@@ -13,7 +13,7 @@ from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "1.2.0"
+version = "1.2.1"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
@@ -29,6 +29,7 @@ class PureWafConfig:
     waf_words: str = ""
     waf_chars: str = ""
     waf_regex: str = ""
+    payload_context: str = "any"
     limit_length: int = 999999
     flagfile: str = "/flag"
     read_env: bool = False
@@ -40,6 +41,7 @@ class PureWafConfig:
     log_level: str = "INFO"
     total_payload: bool = False
     phpv: float = 7.0
+    auto: bool = False
     webui: bool = False
 
 
@@ -182,6 +184,10 @@ def _emit_contextual_tips(logger, payload, waf_regex):
     if payload in bypass_data.ASSERT_POST_TIP_TRIGGER_PAYLOADS:
         logger.info("TIPS: POST: 2=system('id');")
 
+    if payload == utils.generate_nan_seed_post_gateway():
+        logger.info("TIPS: POST: 0=assert")
+        logger.info("TIPS: POST: 1=system('id');")
+
     if _looks_like_backtrack_risk_regex(waf_regex):
         logger.info("Example:")
         for line in BACKTRACK_LIMIT_POC_EGS.splitlines():
@@ -264,6 +270,7 @@ def _log_configuration(logger, config: PureWafConfig, phpv: float):
     logger.info(f"    - waf_words: {config.waf_words}")
     logger.info(f"    - waf_chars: {config.waf_chars}")
     logger.info(f"    - waf_regex: {config.waf_regex}")
+    logger.info(f"    - payload_context: {config.payload_context}")
     logger.info(f"    - limit_length: {config.limit_length}")
     logger.info(f"    - flagfile: {config.flagfile}")
     logger.info(f"    - read_env: {config.read_env}")
@@ -449,6 +456,7 @@ def _execute_purewaf(
         phpinfo=False,
         php_version=phpv,
         upload=config.upload,
+        payload_context=config.payload_context,
     )
 
     options_flag = bypass.BypassOptions(
@@ -460,6 +468,7 @@ def _execute_purewaf(
         phpinfo=config.phpinfo,
         php_version=phpv,
         upload=config.upload,
+        payload_context=config.payload_context,
     )
 
     shortest_root, root_passed_payloads = _process_payload_scope(
@@ -540,6 +549,7 @@ def purewaf(
     waf_words="",
     waf_chars="",
     waf_regex="",
+    payload_context="any",
     limit_length=999999,
     flagfile="/flag",
     read_env=False,
@@ -551,12 +561,17 @@ def purewaf(
     log_level="INFO",
     total_payload=False,
     phpv=7.0,
+    auto=False,
     webui=False,
 ):
+    if auto and not webui:
+        raise RuntimeError("auto=True can only be used together with webui=True.")
+
     config = PureWafConfig(
         waf_words=waf_words,
         waf_chars=waf_chars,
         waf_regex=waf_regex,
+        payload_context=payload_context,
         limit_length=limit_length,
         flagfile=flagfile,
         read_env=read_env,
@@ -568,6 +583,7 @@ def purewaf(
         log_level=log_level,
         total_payload=total_payload,
         phpv=phpv,
+        auto=auto,
         webui=webui,
     )
 

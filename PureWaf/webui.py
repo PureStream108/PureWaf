@@ -13,6 +13,7 @@ from flask import render_template_string
 from flask import request
 from flask import stream_with_context
 
+from .auto import resolve_auto_parameters
 from .PureWaf import PureWafConfig
 from .PureWaf import _execute_purewaf
 from .PureWaf import version
@@ -26,7 +27,7 @@ PAGE_TEMPLATE = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PureWaf Web UI</title>
+  <title>PureWaf Web</title>
   <style>
     :root{--bg:#090909;--bg-2:#111111;--side:#171717;--line:#2a2a2a;--line-2:#383838;--text:#f2f2f2;--muted:#868686;--green:#39d353;--blue:#58a6ff;--white:#f8f8f8}
     *{box-sizing:border-box}
@@ -42,12 +43,19 @@ PAGE_TEMPLATE = """
     .brand small{font-size:13px;color:var(--muted);font-weight:500;margin-left:10px}
     .doc-link{display:inline-block;margin-left:8px;color:var(--blue);font-size:12px;text-decoration:none}
     .form{padding:14px 18px 16px;display:grid;gap:12px;overflow:hidden;min-height:0}
+    .mode-tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .mode-tab{padding:9px 10px;border:1px solid var(--line);border-radius:7px;background:#131313;color:#8e8e8e;font:700 12px/1 "Cascadia Code","JetBrains Mono",monospace;letter-spacing:.08em;cursor:pointer;text-transform:uppercase}
+    .mode-tab.active{background:#ececec;color:#0b0b0b;border-color:#ececec}
+    .mode-panel{display:none;min-height:0}
+    .mode-panel.active{display:grid;gap:12px;min-height:0}
     .group{padding-bottom:8px;border-bottom:1px solid #202020}
     .group:last-of-type{border-bottom:0;padding-bottom:0}
     .group-title{margin:0 0 9px;font:700 12px/1 "Cascadia Code","JetBrains Mono",monospace;color:#7e7e7e;letter-spacing:.08em}
     .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
     .row.three{grid-template-columns:1fr 1fr 1fr}
     .field{display:grid;gap:6px;margin-bottom:8px}
+    .field.auto-field{margin-bottom:0;min-height:0}
+    .field.auto-field textarea{min-height:360px;resize:vertical}
     label{font:600 11px/1 "Cascadia Code","JetBrains Mono",monospace;color:#9a9a9a;letter-spacing:.06em}
     input,textarea,select{width:100%;padding:10px 11px;border:1px solid var(--line-2);border-radius:6px;background:#e9eef8;color:#101010;outline:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.2)}
     textarea{min-height:60px;resize:none}
@@ -100,47 +108,63 @@ PAGE_TEMPLATE = """
   <div class="app">
     <aside class="side">
       <div class="side-top">
-        <div class="brand">PUREWAF <small>v{{ version }}</small><a class="doc-link" href="https://github.com/PureStream108/PureWaf" target="_blank" rel="noreferrer">docs</a></div>
+        <div class="brand">PUREWAF <small>v{{ version }}</small><a class="doc-link" href="https://github.com/PureStream108/PureWaf" target="_blank" rel="noreferrer">Source</a></div>
       </div>
 
       <form id="form" class="form">
-        <section class="group">
-          <h3 class="group-title">FILTER</h3>
-          <div class="field"><label for="waf_words">waf_words</label><textarea id="waf_words"></textarea></div>
-          <div class="field"><label for="waf_regex">waf_regex</label><textarea id="waf_regex"></textarea></div>
-          <div class="row">
-            <div class="field"><label for="waf_chars">waf_chars</label><input id="waf_chars" type="text"></div>
-            <div class="field"><label for="limit_length">limit_length</label><input id="limit_length" type="number" step="1"></div>
-          </div>
-        </section>
+        <div class="mode-tabs">
+          <button id="mode_filter" class="mode-tab active" type="button" data-mode-switch="filter">FILTER</button>
+          <button id="mode_auto" class="mode-tab" type="button" data-mode-switch="auto">AUTO</button>
+        </div>
 
-        <section class="group">
-          <h3 class="group-title">TARGET</h3>
-          <div class="row three">
-            <div class="field"><label for="flagfile">flagfile</label><input id="flagfile" type="text"></div>
-            <div class="field"><label for="phpv">phpv</label><input id="phpv" type="number" step="0.1"></div>
-            <div class="field"><label for="log_level">log_level</label><select id="log_level"><option>INFO</option><option>DEBUG</option><option>QUIET</option></select></div>
-          </div>
-        </section>
+        <div id="panel_filter" class="mode-panel active">
+          <section class="group">
+            <div class="field"><label for="waf_words">waf_words</label><textarea id="waf_words"></textarea></div>
+            <div class="field"><label for="waf_regex">waf_regex</label><textarea id="waf_regex"></textarea></div>
+            <div class="row">
+              <div class="field"><label for="waf_chars">waf_chars</label><input id="waf_chars" type="text"></div>
+              <div class="field"><label for="limit_length">limit_length</label><input id="limit_length" type="number" step="1"></div>
+            </div>
+          </section>
 
-        <section class="group">
-          <h3 class="group-title">FLAGS</h3>
-          <div class="checks">
-            <label class="check"><input id="read_env" type="checkbox">read_env</label>
-            <label class="check"><input id="reflect_shell" type="checkbox">reflect_shell</label>
-            <label class="check"><input id="phpinfo" type="checkbox">phpinfo</label>
-            <label class="check"><input id="upload" type="checkbox">upload</label>
-            <label class="check"><input id="total_payload" type="checkbox">total_payload</label>
-          </div>
-        </section>
+          <section class="group">
+            <h3 class="group-title">TARGET</h3>
+            <div class="row three">
+              <div class="field"><label for="flagfile">flagfile</label><input id="flagfile" type="text"></div>
+              <div class="field"><label for="phpv">phpv</label><input id="phpv" type="number" step="0.1"></div>
+              <div class="field"><label for="log_level">log_level</label><select id="log_level"><option>INFO</option><option>DEBUG</option><option>QUIET</option></select></div>
+            </div>
+            <div class="field"><label for="payload_context">payload_context</label><select id="payload_context"><option value="any">any</option><option value="php_code">php_code</option><option value="shell_command">shell_command</option></select></div>
+          </section>
 
-        <section class="group">
-          <h3 class="group-title">NETWORK</h3>
-          <div class="row">
-            <div class="field"><label for="ip">ip</label><input id="ip" type="text"></div>
-            <div class="field"><label for="port">port</label><input id="port" type="number" step="1"></div>
-          </div>
-        </section>
+          <section class="group">
+            <h3 class="group-title">FLAGS</h3>
+            <div class="checks">
+              <label class="check"><input id="read_env" type="checkbox">read_env</label>
+              <label class="check"><input id="reflect_shell" type="checkbox">reflect_shell</label>
+              <label class="check"><input id="phpinfo" type="checkbox">phpinfo</label>
+              <label class="check"><input id="upload" type="checkbox">upload</label>
+              <label class="check"><input id="total_payload" type="checkbox">total_payload</label>
+            </div>
+          </section>
+
+          <section class="group">
+            <h3 class="group-title">NETWORK</h3>
+            <div class="row">
+              <div class="field"><label for="ip">ip</label><input id="ip" type="text"></div>
+              <div class="field"><label for="port">port</label><input id="port" type="number" step="1"></div>
+            </div>
+          </section>
+        </div>
+
+        <div id="panel_auto" class="mode-panel">
+          <section class="group">
+            <div class="field auto-field">
+              <label for="auto_prompt">auto_input</label>
+              <textarea id="auto_prompt" placeholder="把你的一大坨代码全部放进来"></textarea>
+            </div>
+          </section>
+        </div>
 
         <div class="status"><span class="dot"></span><span id="status">idle</span></div>
       </form>
@@ -189,7 +213,7 @@ PAGE_TEMPLATE = """
 
   <script>
     const INITIAL_CONFIG = {{ initial_config | tojson }};
-    const ids = ["waf_words","waf_chars","waf_regex","limit_length","flagfile","read_env","reflect_shell","ip","port","phpinfo","upload","log_level","total_payload","phpv"];
+    const ids = ["waf_words","waf_chars","waf_regex","payload_context","limit_length","flagfile","read_env","reflect_shell","ip","port","phpinfo","upload","log_level","total_payload","phpv","auto_prompt"];
     const processEl = document.getElementById("process");
     const resultEl = document.getElementById("result_output");
     const statusEl = document.getElementById("status");
@@ -318,6 +342,8 @@ PAGE_TEMPLATE = """
       $("waf_words").value = cfg.waf_words || "";
       $("waf_chars").value = cfg.waf_chars || "";
       $("waf_regex").value = cfg.waf_regex || "";
+      $("payload_context").value = cfg.payload_context || "any";
+      $("auto_prompt").value = "";
       $("limit_length").value = cfg.limit_length ?? 999999;
       $("flagfile").value = cfg.flagfile || "/flag";
       $("read_env").checked = !!cfg.read_env;
@@ -331,6 +357,13 @@ PAGE_TEMPLATE = """
       $("phpv").value = cfg.phpv ?? 7.0;
       syncReflect();
     }
+    function setMode(mode){
+      document.querySelectorAll("[data-mode-switch]").forEach((button) => {
+        button.classList.toggle("active", button.dataset.modeSwitch === mode);
+      });
+      $("panel_filter").classList.toggle("active", mode === "filter");
+      $("panel_auto").classList.toggle("active", mode === "auto");
+    }
     function syncReflect(){
       const on = $("reflect_shell").checked;
       $("ip").disabled = !on;
@@ -340,13 +373,13 @@ PAGE_TEMPLATE = """
       terminalEventReceived = false;
       clearReconnectTimer();
       setProcessText("[*] Running");
-      setResultText("[*] 等待结果摘要...");
+      setResultText("[*] 等待结果...");
     }
     function resetOutput(){
       terminalEventReceived = false;
       clearReconnectTimer();
       setProcessText("[*] 还没有运行任务。");
-      setResultText("[*] 点击 Run 后，这里会显示终端式结果");
+      setResultText("[*] 点击 Run 后，这里会显示结果");
     }
     function appendLine(text){
       appendLines([text]);
@@ -362,10 +395,19 @@ PAGE_TEMPLATE = """
       scheduleProcessPlayback();
     }
     function buildPayload(){
+      const mode = document.querySelector("[data-mode-switch].active")?.dataset.modeSwitch || "filter";
+      if(mode === "auto"){
+        return {
+          mode,
+          auto_prompt: $("auto_prompt").value
+        };
+      }
       return {
+        mode,
         waf_words: $("waf_words").value,
         waf_chars: $("waf_chars").value,
         waf_regex: $("waf_regex").value,
+        payload_context: $("payload_context").value,
         limit_length: Number($("limit_length").value || 999999),
         flagfile: $("flagfile").value,
         read_env: $("read_env").checked,
@@ -376,7 +418,8 @@ PAGE_TEMPLATE = """
         upload: $("upload").checked,
         log_level: $("log_level").value,
         total_payload: $("total_payload").checked,
-        phpv: Number($("phpv").value || 7.0)
+        phpv: Number($("phpv").value || 7.0),
+        auto_prompt: $("auto_prompt").value
       };
     }
     function closeStream(){
@@ -461,9 +504,13 @@ PAGE_TEMPLATE = """
     }
 
     $("reflect_shell").addEventListener("change", syncReflect);
+    document.querySelectorAll("[data-mode-switch]").forEach((button) => {
+      button.addEventListener("click", () => setMode(button.dataset.modeSwitch));
+    });
     resetButton.addEventListener("click", () => {
       closeStream();
       setConfig(INITIAL_CONFIG);
+      setMode("filter");
       resetOutput();
       statusEl.textContent = "已恢复初始参数";
       runButton.disabled = false;
@@ -484,6 +531,7 @@ PAGE_TEMPLATE = """
     });
 
     setConfig(INITIAL_CONFIG);
+    setMode("filter");
     resetOutput();
   </script>
 </body>
@@ -554,11 +602,12 @@ def _coerce_float(value, default):
         return float(default)
 
 
-def _build_runtime_config(payload, base_config: PureWafConfig):
+def _build_filter_runtime_config(payload, base_config: PureWafConfig):
     return PureWafConfig(
         waf_words=str(payload.get("waf_words", base_config.waf_words) or ""),
         waf_chars=str(payload.get("waf_chars", base_config.waf_chars) or ""),
         waf_regex=str(payload.get("waf_regex", base_config.waf_regex) or ""),
+        payload_context=str(payload.get("payload_context", base_config.payload_context) or "any"),
         limit_length=_coerce_int(payload.get("limit_length"), base_config.limit_length),
         flagfile=str(payload.get("flagfile", base_config.flagfile) or "/flag"),
         read_env=_coerce_bool(payload.get("read_env", base_config.read_env)),
@@ -570,8 +619,38 @@ def _build_runtime_config(payload, base_config: PureWafConfig):
         log_level=str(payload.get("log_level", base_config.log_level) or "INFO").upper(),
         total_payload=_coerce_bool(payload.get("total_payload", base_config.total_payload)),
         phpv=_coerce_float(payload.get("phpv"), base_config.phpv),
+        auto=False,
         webui=True,
     )
+
+
+def _build_auto_runtime_config():
+    return PureWafConfig(
+        waf_words="",
+        waf_chars="",
+        waf_regex="",
+        payload_context="any",
+        limit_length=999999,
+        flagfile="/flag",
+        read_env=False,
+        reflect_shell=False,
+        port=8080,
+        ip="127.0.0.1",
+        phpinfo=False,
+        upload=False,
+        log_level="INFO",
+        total_payload=False,
+        phpv=7.0,
+        auto=True,
+        webui=True,
+    )
+
+
+def _build_runtime_config(payload, base_config: PureWafConfig):
+    mode = str(payload.get("mode") or "filter").strip().lower()
+    if mode == "auto":
+        return _build_auto_runtime_config()
+    return _build_filter_runtime_config(payload, base_config)
 
 
 def _serialize_result(result):
@@ -661,7 +740,29 @@ def _format_stream_line(event):
     return ""
 
 
-def _run_job(job, config: PureWafConfig):
+def _build_auto_execution_config(base_config: PureWafConfig, analysis):
+    return PureWafConfig(
+        waf_words=analysis.waf_words,
+        waf_chars=analysis.waf_chars,
+        waf_regex=analysis.waf_regex,
+        payload_context=analysis.payload_context,
+        limit_length=analysis.limit_length,
+        flagfile="/flag",
+        read_env=analysis.read_env,
+        reflect_shell=False,
+        port=base_config.port,
+        ip=base_config.ip,
+        phpinfo=False,
+        upload=analysis.upload,
+        log_level="INFO",
+        total_payload=False,
+        phpv=7.0,
+        auto=True,
+        webui=True,
+    )
+
+
+def _run_job(job, config: PureWafConfig, auto_prompt=""):
     def publish(item):
         with job["condition"]:
             job["events"].append(item)
@@ -685,8 +786,18 @@ def _run_job(job, config: PureWafConfig):
                 flush_lines()
 
     try:
+        execution_config = config
+        if config.auto:
+            analysis = resolve_auto_parameters(auto_prompt)
+            if analysis.analysis_lines:
+                publish({"kind": "lines", "lines": analysis.analysis_lines})
+            if analysis.error:
+                raise RuntimeError(analysis.error)
+            publish({"kind": "lines", "lines": ["[*] AUTO: executing payload generation"]})
+            execution_config = _build_auto_execution_config(config, analysis)
+
         result = _execute_purewaf(
-            config,
+            execution_config,
             output_logger=None,
             show_progress=False,
             sleep_before_run=False,
@@ -712,15 +823,20 @@ def create_app(initial_config: PureWafConfig):
     @app.get("/")
     def index():
         public_config = asdict(initial_config)
+        public_config.pop("auto", None)
         public_config.pop("webui", None)
         return render_template_string(PAGE_TEMPLATE, initial_config=public_config, version=version)
 
     @app.post("/api/run")
     def run_job():
         payload = request.get_json(silent=True) or {}
+        mode = str(payload.get("mode") or "filter").strip().lower()
+        if mode not in {"filter", "auto"}:
+            return Response("invalid mode", status=400)
         config = _build_runtime_config(payload, initial_config)
+        auto_prompt = str(payload.get("auto_prompt") or "")
         job_id, job = job_store.create()
-        threading.Thread(target=_run_job, args=(job, config), daemon=True).start()
+        threading.Thread(target=_run_job, args=(job, config, auto_prompt), daemon=True).start()
         return jsonify({"job_id": job_id})
 
     @app.get("/api/events/<job_id>")

