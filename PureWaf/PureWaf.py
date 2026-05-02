@@ -13,7 +13,7 @@ from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "1.2.1"
+version = "1.2.2"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
@@ -336,6 +336,7 @@ def _emit_candidate_events(event_callback, scope: str, phase: str, scope_label: 
                 "current": idx,
                 "total": total,
                 "payload": payload,
+                "techniques": list(bypass.infer_payload_techniques(payload)),
             },
         )
 
@@ -366,6 +367,7 @@ def _process_payload_scope(
         waf_words_list,
         waf_chars_set,
         waf_regex_obj,
+        payload_context=config.payload_context,
     )
     _emit_candidate_events(event_callback, scope_key, "targeted", scope_label, targeted_payloads)
     passed_payloads = bypass.filter_payloads(
