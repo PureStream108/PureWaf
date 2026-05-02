@@ -1,7 +1,9 @@
+import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from . import bypass_data
+from . import tamper
 from . import utils
 
 if TYPE_CHECKING:
@@ -20,6 +22,12 @@ class BypassOptions:
     upload: bool = False
     payload_context: str = "any"
     auto_context: Optional["AutoContext"] = None
+
+
+@dataclass(frozen=True)
+class PayloadRecord:
+    payload: str
+    techniques: Tuple[str, ...]
 
 
 def _octal_encode(command: str):
@@ -202,6 +210,12 @@ def _is_php_style_payload(payload: str):
         "require_once(",
         "eval(",
         "assert(",
+        "system(",
+        "passthru(",
+        "shell_exec(",
+        "exec(",
+        "popen(",
+        "proc_open(",
         "call_user_func(",
         "die(",
         "exit(",
@@ -332,21 +346,112 @@ def _is_space_blocked(reasons):
     return False
 
 
-def _apply_targeted_replacements(payload: str, waf_words, waf_chars, waf_regex):
+def _apply_targeted_replacements(payload: str, waf_words, waf_chars, waf_regex, payload_context="any"):
     reasons = _analyze_block_reasons(payload, waf_words, waf_chars, waf_regex)
     candidates = [payload]
 
     if _is_space_blocked(reasons):
         candidates.extend(_apply_space_replacements(payload))
 
+    candidates.extend(
+        tamper.apply_contextual_tampers(
+            payload,
+            reasons,
+            payload_context=payload_context,
+            shell_like=_is_shell_style_payload(payload),
+        )
+    )
+
     return utils.dedupe_preserve_order(candidates)
 
 
-def _build_targeted_candidates(payloads, waf_words, waf_chars, waf_regex):
+def _build_targeted_candidates(payloads, waf_words, waf_chars, waf_regex, payload_context="any"):
     targeted = []
     for payload in payloads:
-        targeted.extend(_apply_targeted_replacements(payload, waf_words, waf_chars, waf_regex))
+        targeted.extend(
+            _apply_targeted_replacements(
+                payload,
+                waf_words,
+                waf_chars,
+                waf_regex,
+                payload_context=payload_context,
+            )
+        )
     return utils.dedupe_preserve_order(targeted)
+
+
+def infer_payload_techniques(payload: str):
+    text = payload or ""
+    lowered = text.lower()
+    labels = []
+
+    def add(label):
+        if label not in labels:
+            labels.append(label)
+
+    if _is_upload_wrapper_like_payload(text):
+        add("upload_wrapper")
+    if "`" in text:
+        add("shell_backticks")
+    if lowered.startswith("$'"):
+        add("shell_octal")
+    if "${ifs}" in lowered or "$ifs$9" in lowered:
+        add("tamper:space2ifs")
+    if "\t" in text or "%09" in lowered or "\\t" in lowered:
+        add("tamper:space2htab")
+    if "+" in text and " " not in text:
+        add("tamper:space2plus")
+    if "${pwd:0:1}" in lowered:
+        add("tamper:slash2env")
+    if "''" in text:
+        add("tamper:singlequotes")
+    if '""' in text:
+        add("tamper:doublequotes")
+    if re.search(r"[A-Za-z]\\[A-Za-z]", text):
+        add("tamper:backslashes")
+    if "${purewaf_x}" in lowered:
+        add("tamper:uninitializedvariable")
+    if "php://filter" in lowered:
+        add("php_stream_filter")
+    if "data://text/plain" in lowered:
+        add("php_data_wrapper")
+    if "getallheaders" in lowered:
+        add("header_exec")
+    if "get_defined_vars" in lowered:
+        add("variable_hijack")
+    if "scandir" in lowered or "glob(" in lowered or "directoryiterator" in lowered:
+        add("directory_enum")
+    if "chr(" in lowered:
+        add("php_chr")
+    if "(~" in lowered or "~'" in lowered:
+        add("php_not")
+    if "^" in text:
+        add("php_xor")
+    if "$____" in text:
+        add("php_increment")
+    if "nan" in lowered or "$$_[" in text:
+        add("non_alnum_post_gateway")
+    if "open_basedir" in lowered or "glob://" in lowered:
+        add("open_basedir_bypass")
+    if "ld_preload" in lowered or "ffi::cdef" in lowered or "pcntl_exec" in lowered:
+        add("disable_functions_bypass")
+    if any(token in lowered for token in ("system(", "passthru(", "shell_exec(", "exec(", "popen(", "proc_open(")):
+        add("php_exec_wrapper")
+    if any(lowered.startswith(cmd) for cmd in ("cat ", "tac ", "nl ", "sort ", "od ", "strings ", "dd ", "tail ", "head ")):
+        add("file_read_shell")
+    if "include" in lowered or "require" in lowered:
+        add("php_include")
+    if not labels:
+        add("raw")
+    return tuple(labels)
+
+
+def build_payload_record(payload: str):
+    return PayloadRecord(payload=payload, techniques=infer_payload_techniques(payload))
+
+
+def generate_candidate_records(options: BypassOptions):
+    return [build_payload_record(payload) for payload in generate_candidates(options)]
 
 
 def _append_increment_with_url(payloads, raw_payload: str):
@@ -719,6 +824,7 @@ def filter_payloads(
                 "current": idx,
                 "total": total,
                 "payload": payload,
+                "techniques": list(infer_payload_techniques(payload)),
                 "allowed": allowed,
                 "payload_length": len(payload),
             }
