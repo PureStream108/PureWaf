@@ -13,11 +13,18 @@ from PureWaf import bypass
 from PureWaf import bypass_data
 from PureWaf import PureWaf as core
 from PureWaf import utils
+from PureWaf.PureWaf import PureWafConfig
+from PureWaf.PureWaf import _execute_purewaf
 from PureWaf.PureWaf import purewaf
 
 
 REMOVED_PAYLOAD = "readfile(next(array_reverse(scandir(current(localeconv())))));"
 BACKTRACK_REGEX = r"/^.*([\w]|\^|\*|\(|\~|\`|\?|\/| |\||\&|!|\<|\>|\{|\x09|\x0a|\[).*$/m"
+CISCN_SIMPLE_PHP_REGEX = (
+    r"/ls|dir|nl|nc|cat|tail|more|flag|sh|cut|awk|strings|od|curl|ping|\*|sort|ch|zip|mod|sl|"
+    r"find|sed|cp|mv|ty|grep|fd|df|sudo|more|cc|tac|less|head|\.|{|}|tar|zip|gcc|uniq|vi|"
+    r"vim|file|xxd|base64|date|bash|env|\?|wget|\'|\"|id|whoami/i"
+)
 
 
 class _FakeLogger:
@@ -199,6 +206,22 @@ echo $out;
         self.assertEqual(result_b, "eval(array_pop(next(get_defined_vars())));")
         self.assertIn("TIPS: POST: 1=system('id');", output_b)
         self.assertNotIn("Example :", output_b)
+
+    def test_ciscn_simple_php_avoids_unsafe_backslash_split_root(self):
+        result = _execute_purewaf(
+            PureWafConfig(
+                waf_regex=CISCN_SIMPLE_PHP_REGEX,
+                flagfile="/etc/passwd",
+                log_level="INFO",
+            ),
+            output_logger=None,
+            show_progress=False,
+            sleep_before_run=False,
+        )
+
+        self.assertEqual(result.shortest_root, "diff / /tmp")
+        self.assertEqual(result.shortest_flag, "rev /etc/passwd")
+        self.assertNotIn("\\", result.shortest_root)
 
     def test_upload_prefers_payload(self):
         fake_logger = _FakeLogger()

