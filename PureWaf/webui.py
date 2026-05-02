@@ -18,7 +18,7 @@ from .PureWaf import PureWafConfig
 from .PureWaf import _execute_purewaf
 from .PureWaf import version
 
-STREAM_LINE_BATCH_SIZE = 40
+STREAM_LINE_BATCH_SIZE = 160
 
 
 PAGE_TEMPLATE = """
@@ -31,18 +31,18 @@ PAGE_TEMPLATE = """
   <style>
     :root{--bg:#090909;--bg-2:#111111;--side:#171717;--line:#2a2a2a;--line-2:#383838;--text:#f2f2f2;--muted:#868686;--green:#39d353;--blue:#58a6ff;--white:#f8f8f8}
     *{box-sizing:border-box}
-    html,body{margin:0;height:100%;overflow:hidden;background:#0b0b0b;color:var(--text);font-family:"Segoe UI","Noto Sans SC",sans-serif}
-    body{background:
+    html,body{margin:0;min-height:100%;background:#0b0b0b;color:var(--text);font-family:"Segoe UI","Noto Sans SC",sans-serif}
+    body{min-height:100vh;overflow:auto;background:
       radial-gradient(circle at 0% 0%,rgba(88,166,255,.08),transparent 24%),
       radial-gradient(circle at 100% 100%,rgba(57,211,83,.06),transparent 22%),
       linear-gradient(180deg,#0b0b0b 0%,#111 100%)}
-    .app{height:100vh;display:grid;grid-template-columns:420px minmax(0,1fr);overflow:hidden}
-    .side{min-height:0;display:flex;flex-direction:column;overflow:hidden;background:linear-gradient(180deg,#171717 0%,#141414 100%);border-right:1px solid var(--line)}
+    .app{height:100vh;min-height:0;display:grid;grid-template-columns:minmax(340px,420px) minmax(0,1fr);overflow:hidden}
+    .side{height:100vh;min-height:0;display:flex;flex-direction:column;overflow:auto;background:linear-gradient(180deg,#171717 0%,#141414 100%);border-right:1px solid var(--line)}
     .side-top{padding:20px 22px 14px;border-bottom:1px solid var(--line)}
     .brand{font:700 31px/1 "Bahnschrift","Segoe UI",sans-serif;letter-spacing:.06em}
     .brand small{font-size:13px;color:var(--muted);font-weight:500;margin-left:10px}
     .doc-link{display:inline-block;margin-left:8px;color:var(--blue);font-size:12px;text-decoration:none}
-    .form{padding:14px 18px 16px;display:grid;gap:12px;overflow:hidden;min-height:0}
+    .form{padding:14px 18px 16px;display:grid;gap:12px;overflow:visible;min-height:auto;align-content:start}
     .mode-tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px}
     .mode-tab{padding:9px 10px;border:1px solid var(--line);border-radius:7px;background:#131313;color:#8e8e8e;font:700 12px/1 "Cascadia Code","JetBrains Mono",monospace;letter-spacing:.08em;cursor:pointer;text-transform:uppercase}
     .mode-tab.active{background:#ececec;color:#0b0b0b;border-color:#ececec}
@@ -55,7 +55,7 @@ PAGE_TEMPLATE = """
     .row.three{grid-template-columns:1fr 1fr 1fr}
     .field{display:grid;gap:6px;margin-bottom:8px}
     .field.auto-field{margin-bottom:0;min-height:0}
-    .field.auto-field textarea{min-height:360px;resize:vertical}
+    .field.auto-field textarea{min-height:clamp(180px,34vh,360px);resize:vertical}
     label{font:600 11px/1 "Cascadia Code","JetBrains Mono",monospace;color:#9a9a9a;letter-spacing:.06em}
     input,textarea,select{width:100%;padding:10px 11px;border:1px solid var(--line-2);border-radius:6px;background:#e9eef8;color:#101010;outline:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.2)}
     textarea{min-height:60px;resize:none}
@@ -71,8 +71,8 @@ PAGE_TEMPLATE = """
     .btn:disabled{opacity:.5;cursor:wait}
     .status{display:flex;align-items:center;gap:10px;margin-top:2px;color:var(--muted);font:500 12px/1.4 "Cascadia Code","JetBrains Mono",monospace}
     .dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 6px rgba(57,211,83,.08)}
-    .main{min-width:0;min-height:0;padding:18px;display:grid;grid-template-rows:auto minmax(0,1.95fr) minmax(220px,.95fr);gap:14px;overflow:hidden}
-    .topbar{display:flex;align-items:center;justify-content:flex-end;gap:10px}
+    .main{min-width:0;height:100vh;min-height:0;padding:18px;display:grid;grid-template-rows:auto minmax(0,1.95fr) minmax(0,.95fr);gap:14px;overflow:hidden}
+    .topbar{position:sticky;top:0;z-index:3;display:flex;align-items:center;justify-content:flex-end;gap:10px;padding-bottom:2px;background:linear-gradient(180deg,rgba(11,11,11,.96),rgba(11,11,11,.78))}
     .panel{min-height:0;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--line);border-radius:10px;background:rgba(0,0,0,.72)}
     .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 14px;border-bottom:1px solid var(--line);background:#161616}
     .toolbar-left{display:flex;align-items:center;gap:12px;min-width:0}
@@ -99,9 +99,9 @@ PAGE_TEMPLATE = """
       radial-gradient(circle at 76% 68%,rgba(88,166,255,.06),transparent 20%);
       pointer-events:none}
     .result-console{position:relative;z-index:1;height:100%;min-height:0;overflow:auto;padding:14px 16px;color:var(--green);font:13px/1.6 "Cascadia Code","JetBrains Mono",monospace}
-    @media (max-width:1200px){.app{grid-template-columns:390px minmax(0,1fr)}}
-    @media (max-width:1100px){.app{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}.side{overflow:auto}.form{overflow:visible}.main{grid-template-rows:auto minmax(0,1.7fr) minmax(220px,1fr)}}
-    @media (max-width:760px){.main,.side-top,.form{padding-left:14px;padding-right:14px}.row,.row.three,.checks{grid-template-columns:1fr}.main{padding:14px;grid-template-rows:auto minmax(0,1.5fr) minmax(220px,1fr)}}
+    @media (max-width:1200px){.app{grid-template-columns:minmax(320px,390px) minmax(0,1fr)}}
+    @media (max-width:1100px){.app{height:auto;min-height:100vh;grid-template-columns:1fr;grid-template-rows:auto auto;overflow:visible}.side{height:auto;min-height:auto;border-right:0;border-bottom:1px solid var(--line)}.main{height:72vh;min-height:560px;grid-template-rows:auto minmax(0,1.6fr) minmax(0,1fr)}}
+    @media (max-width:760px){.main,.side-top,.form{padding-left:14px;padding-right:14px}.row,.row.three,.checks{grid-template-columns:1fr}.main{height:76vh;min-height:520px;padding:14px;grid-template-rows:auto minmax(0,1.45fr) minmax(0,1fr)}}
   </style>
 </head>
 <body>
@@ -179,7 +179,6 @@ PAGE_TEMPLATE = """
         <div class="toolbar">
           <div class="toolbar-left">
             <span class="toolbar-title">payload stream</span>
-            <span class="toolbar-meta">realtime process / local flask ui</span>
           </div>
           <div class="toolbar-actions">
             <span class="pill">local only</span>
@@ -220,8 +219,8 @@ PAGE_TEMPLATE = """
     const runButton = document.getElementById("run");
     const resetButton = document.getElementById("reset");
     const processTextNode = document.createTextNode("");
-    const PROCESS_PLAYBACK_INTERVAL_MS = 40;
-    const PROCESS_PLAYBACK_LINES_PER_TICK = 12;
+    const PROCESS_PLAYBACK_INTERVAL_MS = 20;
+    const PROCESS_PLAYBACK_LINES_PER_TICK = 80;
     let stream = null;
     let reconnectTimer = null;
     let terminalEventReceived = false;
@@ -388,7 +387,7 @@ PAGE_TEMPLATE = """
       const normalized = (lines || []).filter(Boolean);
       if(!normalized.length) return;
       processLineQueue.push(...normalized);
-      if(processLineQueue.length >= PROCESS_PLAYBACK_LINES_PER_TICK * 3){
+      if(processLineQueue.length >= PROCESS_PLAYBACK_LINES_PER_TICK * 2){
         drainProcessLines(false);
         return;
       }
@@ -432,11 +431,12 @@ PAGE_TEMPLATE = """
     function formatEvent(item){
       if(item.kind !== "event") return "";
       const e = item.event || {};
+      const tech = Array.isArray(e.techniques) && e.techniques.length ? ` [${e.techniques.join(",")}]` : "";
       if(e.type === "log" || e.type === "stage") return e.message || "";
-      if(e.type === "candidate") return `[${e.scope}:${e.phase}:GEN ${e.current}/${e.total}] ${e.payload}`;
+      if(e.type === "candidate") return `[${e.scope}:${e.phase}:GEN ${e.current}/${e.total}] ${e.payload}${tech}`;
       if(e.type === "filter"){
         const verdict = e.allowed ? "PASS" : "BLOCK";
-        return `[${e.scope}:${e.phase}:${verdict} ${e.current}/${e.total}] ${e.payload}${e.allowed ? "" : formatBlockedReasons(e.blocked)}`;
+        return `[${e.scope}:${e.phase}:${verdict} ${e.current}/${e.total}] ${e.payload}${tech}${e.allowed ? "" : formatBlockedReasons(e.blocked)}`;
       }
       if(e.type === "progress") return `[${e.scope}:${e.phase}] ${e.current}/${e.total} passed:${e.passed}`;
       if(e.type === "pass") return "";
@@ -726,15 +726,20 @@ def _format_stream_line(event):
             f"passed:{event.get('passed')}"
         )
     if event_type == "candidate":
+        techniques = event.get("techniques") or []
+        technique_text = f" [{','.join(techniques)}]" if techniques else ""
         return (
             f"[{event.get('scope')}:{event.get('phase')}:GEN "
-            f"{event.get('current')}/{event.get('total')}] {event.get('payload')}"
+            f"{event.get('current')}/{event.get('total')}] {event.get('payload')}{technique_text}"
         )
     if event_type == "filter":
         verdict = "PASS" if event.get("allowed") else "BLOCK"
+        techniques = event.get("techniques") or []
+        technique_text = f" [{','.join(techniques)}]" if techniques else ""
         return (
             f"[{event.get('scope')}:{event.get('phase')}:{verdict} "
             f"{event.get('current')}/{event.get('total')}] {event.get('payload')}"
+            f"{technique_text}"
             f"{_format_blocked_reason_text(event.get('blocked'))}"
         )
     return ""
