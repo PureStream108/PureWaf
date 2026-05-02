@@ -19,10 +19,12 @@ try:
     from PureWaf.webui import _build_result_text
     from PureWaf.webui import _build_runtime_config
     from PureWaf.webui import create_app
+    from PureWaf.webui import STREAM_LINE_BATCH_SIZE
 except Exception:
     create_app = None
     _build_result_text = None
     _build_runtime_config = None
+    STREAM_LINE_BATCH_SIZE = None
 
 
 class WebUiTests(unittest.TestCase):
@@ -56,6 +58,16 @@ class WebUiTests(unittest.TestCase):
         self.assertNotIn('id="root_result"', body)
         self.assertNotIn('id="flag_result"', body)
         self.assertNotIn('id="tips_result"', body)
+        self.assertIn("body{min-height:100vh;overflow:auto", body)
+        self.assertIn(".app{height:100vh;min-height:0", body)
+        self.assertIn(".main{min-width:0;height:100vh;min-height:0", body)
+        self.assertIn("grid-template-rows:auto minmax(0,1.95fr) minmax(0,.95fr)", body)
+        self.assertNotIn("html,body{margin:0;height:100%;overflow:hidden", body)
+        self.assertIn("PROCESS_PLAYBACK_LINES_PER_TICK = 80", body)
+
+    @unittest.skipIf(STREAM_LINE_BATCH_SIZE is None, "Flask webui module not available")
+    def test_webui_streams_larger_server_batches(self):
+        self.assertGreaterEqual(STREAM_LINE_BATCH_SIZE, 120)
 
     @unittest.skipIf(_build_result_text is None, "Flask webui module not available")
     def test_build_result_text_omits_banner_and_keeps_result_tail(self):
