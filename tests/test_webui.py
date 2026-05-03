@@ -275,7 +275,7 @@ class WebUiTests(unittest.TestCase):
         )
 
         with (
-            patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis),
+            patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis) as resolve_mock,
             patch("PureWaf.webui._execute_purewaf", return_value=fake_result) as execute_mock,
         ):
             run_response = client.post(
@@ -290,6 +290,7 @@ class WebUiTests(unittest.TestCase):
             body = stream_response.get_data(as_text=True)
 
         payloads = self._extract_sse_payloads(body)
+        resolve_mock.assert_called_once_with("<?php system($_GET['x']); ?>", use_llm=True)
         self.assertGreaterEqual(len(payloads), 2)
         self.assertEqual(payloads[0]["kind"], "lines")
         self.assertIn("[*] AUTO: analyzing PHP source", payloads[0]["lines"])

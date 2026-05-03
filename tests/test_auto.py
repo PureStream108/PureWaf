@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -10,6 +11,8 @@ from PureWaf.auto import analyze_php_auto
 from PureWaf.auto import resolve_auto_parameters
 from PureWaf import bypass
 from PureWaf import bypass_data
+from PureWaf.agent import LlmSinkAnalysis
+from PureWaf.agent import LlmSinkCandidate
 
 
 class AutoModeTests(unittest.TestCase):
@@ -29,6 +32,90 @@ if(isset($_POST['cmd'])){
         self.assertEqual(result.sink_kind, "command_exec")
         self.assertEqual(result.waf_regex, "/ls|cat|flag/i")
         self.assertIn("[*] AUTO: detected sink => command_exec", result.analysis_lines)
+
+    def test_llm_runs_before_local_sink_detection_and_can_fallback(self):
+        source = """<?php
+$cmd = $_GET['cmd'];
+if(!preg_match('/cat|flag/i', $cmd)) {
+    system($cmd);
+}
+"""
+
+        with patch("PureWaf.auto._detect_llm_sink", return_value=None) as llm_mock:
+            result = resolve_auto_parameters(source, use_llm=True)
+
+        self.assertEqual(result.error, "")
+        self.assertEqual(result.sink_kind, "command_exec")
+        llm_mock.assert_called_once()
+
+    def test_llm_metadata_can_be_used_even_when_local_sink_exists(self):
+        source = """<?php
+$cmd = $_GET['cmd'];
+if(!preg_match('/cat|flag/i', $cmd)) {
+    system($cmd);
+}
+"""
+        analysis = LlmSinkAnalysis(
+            enabled=True,
+            used=True,
+            model="unit-model",
+            candidates=[
+                LlmSinkCandidate(
+                    function="system",
+                    kind="command_exec",
+                    payload_context="shell_command",
+                    argument_index=0,
+                    confidence=0.95,
+                    evidence="system receives filtered user input",
+                )
+            ],
+        )
+
+        with patch("PureWaf.agent.PureWafLlmSinkAgent.analyze_php", return_value=analysis):
+            result = resolve_auto_parameters(source, use_llm=True)
+
+        self.assertEqual(result.error, "")
+        self.assertTrue(result.llm_used)
+        self.assertEqual(result.sink_function, "system")
+        self.assertEqual(result.payload_context, "shell_command")
+        self.assertIn("LLM sink candidate", "\n".join(result.analysis_lines))
+
+    def test_llm_can_supply_custom_wrapper_sink_metadata(self):
+        source = """<?php
+function run_cmd($x){
+    system($x);
+}
+$cmd = $_GET['cmd'];
+if(!preg_match('/cat|flag/i', $cmd)) {
+    run_cmd($cmd);
+}
+"""
+        analysis = LlmSinkAnalysis(
+            enabled=True,
+            used=True,
+            model="unit-model",
+            candidates=[
+                LlmSinkCandidate(
+                    function="run_cmd",
+                    kind="command_exec",
+                    payload_context="shell_command",
+                    argument_index=0,
+                    confidence=0.92,
+                    evidence="run_cmd forwards input to system",
+                )
+            ],
+        )
+
+        with patch("PureWaf.agent.PureWafLlmSinkAgent.analyze_php", return_value=analysis):
+            result = resolve_auto_parameters(source, use_llm=True)
+
+        self.assertEqual(result.error, "")
+        self.assertTrue(result.llm_used)
+        self.assertEqual(result.sink_kind, "command_exec")
+        self.assertEqual(result.sink_function, "run_cmd")
+        self.assertEqual(result.payload_context, "shell_command")
+        self.assertEqual(result.waf_regex, "/cat|flag/i")
+        self.assertIn("LLM sink candidate", "\n".join(result.analysis_lines))
 
     def test_analyze_stripos_array_blacklist_words(self):
         source = """<?php
