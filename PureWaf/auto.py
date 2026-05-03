@@ -87,6 +87,9 @@ class AutoContext:
     php_version_hint: Optional[float] = None
     input_key: str = ""
     multi_input_filters: Dict[str, "_FilterAccumulator"] = field(default_factory=dict)
+    llm_used: bool = False
+    llm_error: str = ""
+    llm_sink_candidates: List[Dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -113,6 +116,9 @@ class AutoAnalysisResult:
     php_version_hint: Optional[float] = None
     input_key: str = ""
     multi_input_filters: Dict[str, "_FilterAccumulator"] = field(default_factory=dict)
+    llm_used: bool = False
+    llm_error: str = ""
+    llm_sink_candidates: List[Dict[str, object]] = field(default_factory=list)
 
     def to_context(self) -> AutoContext:
         return AutoContext(
@@ -128,6 +134,9 @@ class AutoAnalysisResult:
             php_version_hint=self.php_version_hint,
             input_key=self.input_key,
             multi_input_filters=dict(self.multi_input_filters),
+            llm_used=self.llm_used,
+            llm_error=self.llm_error,
+            llm_sink_candidates=list(self.llm_sink_candidates),
         )
 
 
@@ -201,7 +210,7 @@ class _FilterAccumulator:
         return bool(self.words or self.chars or self.regexes or self.limit_length is not None)
 
 
-def analyze_php_auto(source: str) -> AutoAnalysisResult:
+def analyze_php_auto(source: str, use_llm: bool = False) -> AutoAnalysisResult:
     result = AutoAnalysisResult()
     result.analysis_lines.append("[*] AUTO: analyzing PHP source")
 
@@ -227,7 +236,9 @@ def analyze_php_auto(source: str) -> AutoAnalysisResult:
     if result.php_version_hint is not None:
         result.analysis_lines.append(f"[*] AUTO: php_version_hint => {result.php_version_hint}")
 
-    sink = _detect_sink(global_text, assignments, array_sources)
+    sink = _detect_llm_sink(source, global_text, assignments, result) if use_llm else None
+    if sink is None:
+        sink = _detect_sink(global_text, assignments, array_sources)
     if sink is None:
         result.error = "no supported sink/filter pattern detected; use FILTER mode instead"
         return result
@@ -395,8 +406,80 @@ def _collect_auto_context_metadata(
     result.input_key = _extract_input_key(refs[0]) if refs else ""
 
 
-def resolve_auto_parameters(source: str) -> AutoAnalysisResult:
-    result = analyze_php_auto(source)
+def _detect_llm_sink(
+    source: str,
+    global_text: str,
+    assignments: Dict[str, List[str]],
+    result: AutoAnalysisResult,
+) -> Optional[_SinkInfo]:
+    try:
+        from .agent import PureWafLlmSinkAgent
+    except Exception as exc:
+        result.llm_error = f"LLM skipped: agent unavailable: {exc}"
+        result.analysis_lines.append(f"[*] AUTO: {result.llm_error}")
+        return None
+
+    analysis = PureWafLlmSinkAgent().analyze_php(source)
+    result.llm_used = analysis.used
+    result.llm_error = analysis.error
+    result.llm_sink_candidates = [candidate.as_dict() for candidate in analysis.candidates]
+
+    if analysis.used:
+        result.analysis_lines.append(f"[*] AUTO: LLM sink analysis => model={analysis.model}")
+    if analysis.error:
+        result.analysis_lines.append(f"[*] AUTO: {analysis.error}")
+
+    for candidate in analysis.candidates:
+        result.analysis_lines.append(
+            "[*] AUTO: LLM sink candidate => "
+            f"{candidate.kind}:{candidate.function}[{candidate.argument_index}] "
+            f"context={candidate.payload_context} confidence={candidate.confidence:.2f}"
+        )
+
+    for candidate in analysis.candidates:
+        sink = _sink_from_llm_candidate(candidate, global_text, assignments)
+        if sink is not None:
+            return sink
+
+    if analysis.candidates:
+        result.analysis_lines.append("[*] AUTO: no usable LLM sink candidate matched source calls")
+    return None
+
+
+def _sink_from_llm_candidate(
+    candidate,
+    global_text: str,
+    assignments: Dict[str, List[str]],
+) -> Optional[_SinkInfo]:
+    for name, args_text, _start, _end in _iter_named_calls(global_text, {candidate.function}):
+        args = _split_top_level(args_text)
+        if candidate.argument_index >= len(args):
+            continue
+        target_expr = args[candidate.argument_index].strip()
+        if not _expression_looks_input_related(target_expr):
+            continue
+
+        prefix = ""
+        tail = ""
+        slots: List[str] = []
+        if candidate.kind == "command_exec":
+            prefix, tail, slots = _parse_fixed_command_concat(target_expr, assignments)
+
+        return _SinkInfo(
+            kind=candidate.kind,
+            payload_context=candidate.payload_context,
+            target_expr=target_expr,
+            target_var=_extract_simple_var(target_expr),
+            function_name=name.lower(),
+            fixed_command_prefix=prefix,
+            fixed_command_tail=tail,
+            input_slots=slots,
+        )
+    return None
+
+
+def resolve_auto_parameters(source: str, use_llm: bool = False) -> AutoAnalysisResult:
+    result = analyze_php_auto(source, use_llm=use_llm)
     if result.error:
         return result
 

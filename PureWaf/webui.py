@@ -793,7 +793,7 @@ def _run_job(job, config: PureWafConfig, auto_prompt=""):
     try:
         execution_config = config
         if config.auto:
-            analysis = resolve_auto_parameters(auto_prompt)
+            analysis = resolve_auto_parameters(auto_prompt, use_llm=True)
             if analysis.analysis_lines:
                 publish({"kind": "lines", "lines": analysis.analysis_lines})
             if analysis.error:
