@@ -7,6 +7,8 @@ import sys
 import time
 import urllib.parse
 from dataclasses import dataclass
+from dataclasses import replace
+from pathlib import Path
 from typing import List
 
 from . import bypass
@@ -43,6 +45,8 @@ class PureWafConfig:
     phpv: float = 7.0
     auto: bool = False
     webui: bool = False
+    agent: bool = False
+    auto_context: object = None
 
 
 @dataclass
@@ -282,6 +286,8 @@ def _log_configuration(logger, config: PureWafConfig, phpv: float):
     logger.info(f"    - phpv: {phpv}")
     logger.info(f"    - log_level: {config.log_level}")
     logger.info(f"    - total_payload: {config.total_payload}")
+    logger.info(f"    - auto: {config.auto}")
+    logger.info(f"    - agent: {config.agent}")
     logger.info("-" * 40)
     logger.info("")
 
@@ -459,6 +465,7 @@ def _execute_purewaf(
         php_version=phpv,
         upload=config.upload,
         payload_context=config.payload_context,
+        auto_context=config.auto_context,
     )
 
     options_flag = bypass.BypassOptions(
@@ -471,6 +478,7 @@ def _execute_purewaf(
         php_version=phpv,
         upload=config.upload,
         payload_context=config.payload_context,
+        auto_context=config.auto_context,
     )
 
     shortest_root, root_passed_payloads = _process_payload_scope(
@@ -524,6 +532,106 @@ def _execute_purewaf(
     )
 
 
+def _build_agent_auto_execution_config(config: PureWafConfig, analysis):
+    return replace(
+        config,
+        waf_words=analysis.waf_words,
+        waf_chars=analysis.waf_chars,
+        waf_regex=analysis.waf_regex,
+        payload_context=analysis.payload_context,
+        limit_length=analysis.limit_length,
+        flagfile="/flag",
+        read_env=analysis.read_env,
+        reflect_shell=False,
+        phpinfo=False,
+        upload=analysis.upload,
+        total_payload=False,
+        phpv=analysis.php_version_hint or 7.0,
+        auto=True,
+        webui=False,
+        agent=True,
+        auto_context=analysis.to_context(),
+    )
+
+
+def _format_agent_review_lines(review):
+    lines = []
+    if review.used:
+        lines.append(f"[*] AGENT: payload review => valid={str(review.valid).lower()}")
+    if review.error:
+        lines.append(f"[*] AGENT: payload review skipped => {review.error}")
+    if review.notes:
+        lines.append(f"[*] AGENT: review notes => {review.notes}")
+    if review.fallback_payload:
+        lines.append(f"[+] LLM Fallback Payload : {review.fallback_payload}")
+    return lines
+
+
+def _append_agent_review_to_result(result: PureWafExecutionResult, review):
+    lines = _format_agent_review_lines(review)
+    if not lines:
+        return result
+    if review.fallback_payload and result.shortest_flag == "N/A":
+        result.shortest_flag = review.fallback_payload
+        result.flag_passed_payloads = [review.fallback_payload]
+    suffix = "\n".join(lines)
+    result.log_text = (result.log_text.rstrip() + "\n" + suffix).strip()
+    if review.notes or review.fallback_payload:
+        result.tips_text = (result.tips_text.rstrip() + "\n" + suffix).strip()
+    return result
+
+
+def _execute_agent_auto_from_project(
+    config: PureWafConfig,
+    output_logger=None,
+    show_progress=True,
+):
+    from .agent import PureWafProjectAgent
+    from .auto import resolve_auto_parameters
+
+    project_agent = PureWafProjectAgent(cwd=Path.cwd())
+    bundle = project_agent.build_project_source(Path.cwd() / "pure")
+    if output_logger:
+        for line in bundle.analysis_lines:
+            output_logger.info(line)
+
+    analysis = resolve_auto_parameters(bundle.source, use_llm=True)
+    if output_logger and analysis.analysis_lines:
+        for line in analysis.analysis_lines:
+            output_logger.info(line)
+
+    if analysis.error:
+        review = project_agent.review_payloads(
+            bundle.source,
+            analysis.analysis_lines + [analysis.error],
+        )
+        if output_logger:
+            for line in _format_agent_review_lines(review):
+                output_logger.info(line)
+        return review.fallback_payload or analysis.error
+
+    execution_config = _build_agent_auto_execution_config(config, analysis)
+    result = _execute_purewaf(
+        execution_config,
+        output_logger=output_logger,
+        show_progress=show_progress,
+        sleep_before_run=False,
+    )
+    review = project_agent.review_payloads(
+        bundle.source,
+        analysis.analysis_lines,
+        shortest_root=result.shortest_root,
+        shortest_flag=result.shortest_flag,
+        root_payloads=result.root_passed_payloads,
+        flag_payloads=result.flag_passed_payloads,
+    )
+    _append_agent_review_to_result(result, review)
+    if output_logger:
+        for line in _format_agent_review_lines(review):
+            output_logger.info(line)
+    return result.shortest_flag
+
+
 def _launch_webui(config: PureWafConfig):
     if sys.version_info < WEBUI_MIN_PYTHON:
         current_version = ".".join(str(part) for part in sys.version_info[:3])
@@ -565,9 +673,10 @@ def purewaf(
     phpv=7.0,
     auto=False,
     webui=False,
+    agent=False,
 ):
-    if auto and not webui:
-        raise RuntimeError("auto=True can only be used together with webui=True.")
+    if auto and not (webui or agent):
+        raise RuntimeError("auto=True can only be used together with webui=True or agent=True.")
 
     config = PureWafConfig(
         waf_words=waf_words,
@@ -587,6 +696,7 @@ def purewaf(
         phpv=phpv,
         auto=auto,
         webui=webui,
+        agent=agent,
     )
 
     if config.webui:
@@ -594,6 +704,16 @@ def purewaf(
         return None
 
     output_logger, show_progress = _configure_logger(config.log_level)
+    if config.auto and config.agent:
+        cwd = Path.cwd()
+        if not (cwd / ".env").exists() or not (cwd / "pure").is_dir():
+            return ".env/pure Not FOUND"
+        return _execute_agent_auto_from_project(
+            config,
+            output_logger=output_logger,
+            show_progress=show_progress,
+        )
+
     result = _execute_purewaf(
         config,
         output_logger=output_logger,
