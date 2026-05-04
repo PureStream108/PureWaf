@@ -1,10 +1,19 @@
 import json
+import atexit
+import io
+import re
+import shutil
 import socket
+import stat
+import tempfile
 import threading
 import time
 import uuid
 import webbrowser
+import zipfile
 from dataclasses import asdict
+from pathlib import Path
+from pathlib import PurePosixPath
 
 from flask import Flask
 from flask import Response
@@ -13,12 +22,20 @@ from flask import render_template_string
 from flask import request
 from flask import stream_with_context
 
+from .agent import MAX_PROJECT_FILE_BYTES
+from .agent import MAX_PROJECT_FILES
+from .agent import PHP_PROJECT_EXTENSIONS
+from .agent import PROJECT_SKIP_DIRS
+from .agent import PureWafProjectAgent
 from .auto import resolve_auto_parameters
 from .PureWaf import PureWafConfig
+from .PureWaf import _append_agent_review_to_result
+from .PureWaf import _format_agent_review_lines
 from .PureWaf import _execute_purewaf
 from .PureWaf import version
 
 STREAM_LINE_BATCH_SIZE = 160
+MAX_ZIP_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
 PAGE_TEMPLATE = """
@@ -56,6 +73,9 @@ PAGE_TEMPLATE = """
     .field{display:grid;gap:6px;margin-bottom:8px}
     .field.auto-field{margin-bottom:0;min-height:0}
     .field.auto-field textarea{min-height:clamp(180px,34vh,360px);resize:vertical}
+    .upload-box{display:grid;gap:8px;margin-top:10px;padding:10px;border:1px dashed var(--line-2);border-radius:8px;background:#151515}
+    .upload-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}
+    .upload-status{color:var(--muted);font:500 12px/1.5 "Cascadia Code","JetBrains Mono",monospace}
     label{font:600 11px/1 "Cascadia Code","JetBrains Mono",monospace;color:#9a9a9a;letter-spacing:.06em}
     input,textarea,select{width:100%;padding:10px 11px;border:1px solid var(--line-2);border-radius:6px;background:#e9eef8;color:#101010;outline:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.2)}
     textarea{min-height:60px;resize:none}
@@ -73,6 +93,8 @@ PAGE_TEMPLATE = """
     .dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 6px rgba(57,211,83,.08)}
     .main{min-width:0;height:100vh;min-height:0;padding:18px;display:grid;grid-template-rows:auto minmax(0,1.95fr) minmax(0,.95fr);gap:14px;overflow:hidden}
     .topbar{position:sticky;top:0;z-index:3;display:flex;align-items:center;justify-content:flex-end;gap:10px;padding-bottom:2px;background:linear-gradient(180deg,rgba(11,11,11,.96),rgba(11,11,11,.78))}
+    .agent-toggle{display:inline-flex;align-items:center;gap:8px;line-height:1;background:#141414;color:#a7a7a7;border-color:var(--line)}
+    .agent-toggle.active{background:#102317;color:#e8ffee;border-color:#2f8f46}
     .panel{min-height:0;display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--line);border-radius:10px;background:rgba(0,0,0,.72)}
     .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 14px;border-bottom:1px solid var(--line);background:#161616}
     .toolbar-left{display:flex;align-items:center;gap:12px;min-width:0}
@@ -163,6 +185,14 @@ PAGE_TEMPLATE = """
               <label for="auto_prompt">auto_input</label>
               <textarea id="auto_prompt" placeholder="把你的一大坨代码全部放进来"></textarea>
             </div>
+            <div class="upload-box">
+              <label for="auto_zip">upload_zip</label>
+              <div class="upload-row">
+                <input id="auto_zip" type="file" accept=".zip">
+                <button id="upload_project" class="btn reset" type="button">UPLOAD</button>
+              </div>
+              <div id="upload_status" class="upload-status">未开始agent功能</div>
+            </div>
           </section>
         </div>
 
@@ -172,6 +202,7 @@ PAGE_TEMPLATE = """
 
     <main class="main">
       <div class="topbar">
+        <button id="agent_toggle" class="btn agent-toggle" type="button" aria-pressed="false"><span id="agent_toggle_text">AGENT OFF</span></button>
         <button id="reset" class="btn reset" type="button">RESET</button>
         <button id="run" class="btn run" type="submit" form="form">RUN</button>
       </div>
@@ -213,11 +244,14 @@ PAGE_TEMPLATE = """
   <script>
     const INITIAL_CONFIG = {{ initial_config | tojson }};
     const ids = ["waf_words","waf_chars","waf_regex","payload_context","limit_length","flagfile","read_env","reflect_shell","ip","port","phpinfo","upload","log_level","total_payload","phpv","auto_prompt"];
+    let agentEnabled = !!INITIAL_CONFIG.agent;
     const processEl = document.getElementById("process");
     const resultEl = document.getElementById("result_output");
     const statusEl = document.getElementById("status");
     const runButton = document.getElementById("run");
     const resetButton = document.getElementById("reset");
+    const agentToggleButton = document.getElementById("agent_toggle");
+    const agentToggleText = document.getElementById("agent_toggle_text");
     const processTextNode = document.createTextNode("");
     const PROCESS_PLAYBACK_INTERVAL_MS = 20;
     const PROCESS_PLAYBACK_LINES_PER_TICK = 80;
@@ -228,6 +262,7 @@ PAGE_TEMPLATE = """
     let processPlaybackTimer = null;
     let pendingResult = null;
     let pendingError = null;
+    let uploadedProjectId = "";
 
     processEl.textContent = "";
     processEl.appendChild(processTextNode);
@@ -354,7 +389,27 @@ PAGE_TEMPLATE = """
       $("log_level").value = cfg.log_level || "INFO";
       $("total_payload").checked = !!cfg.total_payload;
       $("phpv").value = cfg.phpv ?? 7.0;
+      uploadedProjectId = "";
+      if($("auto_zip")) $("auto_zip").value = "";
+      syncAgentUpload();
       syncReflect();
+    }
+    function syncAgentUpload(){
+      const zipInput = $("auto_zip");
+      const uploadButton = $("upload_project");
+      if(!zipInput || !uploadButton) return;
+      zipInput.disabled = !agentEnabled;
+      uploadButton.disabled = !agentEnabled;
+      agentToggleButton.classList.toggle("active", agentEnabled);
+      agentToggleButton.setAttribute("aria-pressed", agentEnabled ? "true" : "false");
+      agentToggleText.textContent = agentEnabled ? "AGENT ON" : "AGENT OFF";
+      if(!agentEnabled){
+        $("upload_status").textContent = "未开始agent功能";
+      }else if(uploadedProjectId){
+        $("upload_status").textContent = `已上传项目: ${uploadedProjectId.slice(0,8)}`;
+      }else{
+        $("upload_status").textContent = "agent已开启";
+      }
     }
     function setMode(mode){
       document.querySelectorAll("[data-mode-switch]").forEach((button) => {
@@ -378,7 +433,7 @@ PAGE_TEMPLATE = """
       terminalEventReceived = false;
       clearReconnectTimer();
       setProcessText("[*] 还没有运行任务。");
-      setResultText("[*] 点击 Run 后，这里会显示结果");
+      setResultText("[*] 这里显示结果~");
     }
     function appendLine(text){
       appendLines([text]);
@@ -398,7 +453,9 @@ PAGE_TEMPLATE = """
       if(mode === "auto"){
         return {
           mode,
-          auto_prompt: $("auto_prompt").value
+          auto_prompt: $("auto_prompt").value,
+          upload_id: uploadedProjectId,
+          agent: agentEnabled
         };
       }
       return {
@@ -446,6 +503,34 @@ PAGE_TEMPLATE = """
       const res = await fetch("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
       if(!res.ok) throw new Error(await res.text() || "启动失败");
       return await res.json();
+    }
+    async function uploadProjectZip(){
+      if(!agentEnabled){
+        $("upload_status").textContent = "未开始agent功能";
+        return;
+      }
+      const file = $("auto_zip").files && $("auto_zip").files[0];
+      if(!file){
+        $("upload_status").textContent = "请选择zip文件";
+        return;
+      }
+      const form = new FormData();
+      form.append("project_zip", file);
+      form.append("agent", agentEnabled ? "true" : "false");
+      $("upload_project").disabled = true;
+      $("upload_status").textContent = "正在上传并解压...";
+      try{
+        const res = await fetch("/api/upload",{method:"POST",body:form});
+        if(!res.ok) throw new Error(await res.text() || "上传失败");
+        const data = await res.json();
+        uploadedProjectId = data.upload_id || "";
+        $("upload_status").textContent = `已上传 ${data.php_file_count || 0} 个PHP文件`;
+      }catch(err){
+        uploadedProjectId = "";
+        $("upload_status").textContent = `[!] ${err.message}`;
+      }finally{
+        $("upload_project").disabled = !agentEnabled;
+      }
     }
     function attach(jobId){
       closeStream();
@@ -504,13 +589,24 @@ PAGE_TEMPLATE = """
     }
 
     $("reflect_shell").addEventListener("change", syncReflect);
+    agentToggleButton.addEventListener("click", () => {
+      agentEnabled = !agentEnabled;
+      if(!agentEnabled){
+        uploadedProjectId = "";
+        $("auto_zip").value = "";
+      }
+      syncAgentUpload();
+    });
+    $("upload_project").addEventListener("click", uploadProjectZip);
     document.querySelectorAll("[data-mode-switch]").forEach((button) => {
       button.addEventListener("click", () => setMode(button.dataset.modeSwitch));
     });
     resetButton.addEventListener("click", () => {
       closeStream();
       setConfig(INITIAL_CONFIG);
+      agentEnabled = !!INITIAL_CONFIG.agent;
       setMode("filter");
+      syncAgentUpload();
       resetOutput();
       statusEl.textContent = "已恢复初始参数";
       runButton.disabled = false;
@@ -580,6 +676,113 @@ class _JobStore:
             return self.jobs.pop(job_id, None)
 
 
+def _zip_entry_is_symlink(info: zipfile.ZipInfo) -> bool:
+    mode = info.external_attr >> 16
+    return stat.S_ISLNK(mode)
+
+
+def _zip_path_parts(name: str):
+    normalized = (name or "").replace("\\", "/")
+    if re.match(r"^[A-Za-z]:", normalized):
+        raise ValueError("zip path traversal is not allowed")
+    pure_path = PurePosixPath(normalized)
+    if pure_path.is_absolute():
+        raise ValueError("zip path traversal is not allowed")
+    parts = [part for part in pure_path.parts if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError("zip path traversal is not allowed")
+    return parts
+
+
+def _should_skip_project_parts(parts) -> bool:
+    return any(part in PROJECT_SKIP_DIRS for part in parts)
+
+
+def _safe_extract_zip_bytes(raw: bytes, target_dir: Path) -> None:
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("invalid zip file") from exc
+
+    target_root = Path(target_dir).resolve()
+    extracted = 0
+    with archive:
+        infos = archive.infolist()
+        if not infos:
+            raise ValueError("empty zip file")
+        for info in infos:
+            if info.is_dir():
+                continue
+            if _zip_entry_is_symlink(info):
+                raise ValueError("zip symbolic links are not supported")
+
+            parts = _zip_path_parts(info.filename)
+            if _should_skip_project_parts(parts[:-1]):
+                continue
+
+            output_path = (target_root / Path(*parts)).resolve()
+            if target_root != output_path and target_root not in output_path.parents:
+                raise ValueError("zip path traversal is not allowed")
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as src, output_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted += 1
+
+    if extracted == 0:
+        raise ValueError("empty zip file")
+
+
+class _UploadStore:
+    def __init__(self):
+        self.tempdir = tempfile.TemporaryDirectory(prefix="purewaf-webui-")
+        self.root = Path(self.tempdir.name)
+        self.lock = threading.Lock()
+        self.uploads = {}
+        atexit.register(self.cleanup)
+
+    def cleanup(self):
+        try:
+            self.tempdir.cleanup()
+        except Exception:
+            pass
+
+    def save_zip(self, storage):
+        filename = str(getattr(storage, "filename", "") or "")
+        if not filename.lower().endswith(".zip"):
+            raise ValueError("zip file required")
+
+        raw = storage.read(MAX_ZIP_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_ZIP_UPLOAD_BYTES:
+            raise ValueError("zip file too large")
+
+        upload_id = uuid.uuid4().hex
+        target = self.root / upload_id
+        target.mkdir(parents=True, exist_ok=False)
+        try:
+            _safe_extract_zip_bytes(raw, target)
+            files = PureWafProjectAgent().scan_project_files(target)
+        except Exception:
+            shutil.rmtree(target, ignore_errors=True)
+            raise
+
+        with self.lock:
+            self.uploads[upload_id] = {
+                "path": target,
+                "files": [file.path for file in files],
+                "created_at": time.monotonic(),
+            }
+        return upload_id, files
+
+    def get_path(self, upload_id: str):
+        with self.lock:
+            item = self.uploads.get(upload_id)
+            if not item:
+                return None
+            path = item["path"]
+        return path if path.exists() else None
+
+
 def _coerce_bool(value):
     if isinstance(value, bool):
         return value
@@ -621,10 +824,11 @@ def _build_filter_runtime_config(payload, base_config: PureWafConfig):
         phpv=_coerce_float(payload.get("phpv"), base_config.phpv),
         auto=False,
         webui=True,
+        agent=_coerce_bool(payload.get("agent", base_config.agent)),
     )
 
 
-def _build_auto_runtime_config():
+def _build_auto_runtime_config(payload, base_config: PureWafConfig):
     return PureWafConfig(
         waf_words="",
         waf_chars="",
@@ -643,13 +847,14 @@ def _build_auto_runtime_config():
         phpv=7.0,
         auto=True,
         webui=True,
+        agent=_coerce_bool(payload.get("agent", base_config.agent)),
     )
 
 
 def _build_runtime_config(payload, base_config: PureWafConfig):
     mode = str(payload.get("mode") or "filter").strip().lower()
     if mode == "auto":
-        return _build_auto_runtime_config()
+        return _build_auto_runtime_config(payload, base_config)
     return _build_filter_runtime_config(payload, base_config)
 
 
@@ -764,10 +969,12 @@ def _build_auto_execution_config(base_config: PureWafConfig, analysis):
         phpv=7.0,
         auto=True,
         webui=True,
+        agent=base_config.agent,
+        auto_context=analysis.to_context(),
     )
 
 
-def _run_job(job, config: PureWafConfig, auto_prompt=""):
+def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, upload_id=""):
     def publish(item):
         with job["condition"]:
             job["events"].append(item)
@@ -792,11 +999,53 @@ def _run_job(job, config: PureWafConfig, auto_prompt=""):
 
     try:
         execution_config = config
+        source_for_review = auto_prompt
+        agent_project = None
         if config.auto:
-            analysis = resolve_auto_parameters(auto_prompt, use_llm=True)
+            if config.agent and upload_id:
+                if not (Path.cwd() / ".env").exists():
+                    raise RuntimeError(".env Not FOUND")
+                if upload_store is None:
+                    raise RuntimeError("uploaded project store is unavailable")
+                project_path = upload_store.get_path(upload_id)
+                if project_path is None:
+                    raise RuntimeError("uploaded project not found")
+                agent_project = PureWafProjectAgent(cwd=Path.cwd())
+                bundle = agent_project.build_project_source(project_path)
+                source_for_review = bundle.source
+                if bundle.analysis_lines:
+                    publish({"kind": "lines", "lines": bundle.analysis_lines})
+                analysis = resolve_auto_parameters(bundle.source, use_llm=True)
+            else:
+                analysis = resolve_auto_parameters(auto_prompt, use_llm=True)
             if analysis.analysis_lines:
                 publish({"kind": "lines", "lines": analysis.analysis_lines})
             if analysis.error:
+                if config.agent:
+                    agent_project = agent_project or PureWafProjectAgent(cwd=Path.cwd())
+                    review = agent_project.review_payloads(
+                        source_for_review,
+                        analysis.analysis_lines + [analysis.error],
+                    )
+                    review_lines = _format_agent_review_lines(review)
+                    if review_lines:
+                        publish({"kind": "lines", "lines": review_lines})
+                    if review.fallback_payload:
+                        publish(
+                            {
+                                "kind": "result",
+                                "result": {
+                                    "shortest_root": "N/A",
+                                    "shortest_flag": review.fallback_payload,
+                                    "root_passed_payloads": [],
+                                    "flag_passed_payloads": [review.fallback_payload],
+                                    "tips_text": "\n".join(review_lines),
+                                    "log_text": "\n".join(review_lines),
+                                    "result_text": "\n".join(review_lines),
+                                },
+                            }
+                        )
+                        return
                 raise RuntimeError(analysis.error)
             publish({"kind": "lines", "lines": ["[*] AUTO: executing payload generation"]})
             execution_config = _build_auto_execution_config(config, analysis)
@@ -808,6 +1057,20 @@ def _run_job(job, config: PureWafConfig, auto_prompt=""):
             sleep_before_run=False,
             event_callback=event_callback,
         )
+        if config.auto and config.agent:
+            agent_project = agent_project or PureWafProjectAgent(cwd=Path.cwd())
+            review = agent_project.review_payloads(
+                source_for_review,
+                analysis.analysis_lines,
+                shortest_root=result.shortest_root,
+                shortest_flag=result.shortest_flag,
+                root_payloads=result.root_passed_payloads,
+                flag_payloads=result.flag_passed_payloads,
+            )
+            review_lines = _format_agent_review_lines(review)
+            if review_lines:
+                publish({"kind": "lines", "lines": review_lines})
+            _append_agent_review_to_result(result, review)
         flush_lines()
         publish({"kind": "result", "result": _serialize_result(result)})
     except Exception as exc:
@@ -824,13 +1087,37 @@ def _run_job(job, config: PureWafConfig, auto_prompt=""):
 def create_app(initial_config: PureWafConfig):
     app = Flask(__name__)
     job_store = _JobStore()
+    upload_store = _UploadStore()
 
     @app.get("/")
     def index():
         public_config = asdict(initial_config)
         public_config.pop("auto", None)
         public_config.pop("webui", None)
+        public_config.pop("auto_context", None)
         return render_template_string(PAGE_TEMPLATE, initial_config=public_config, version=version)
+
+    @app.post("/api/upload")
+    def upload_project():
+        agent_enabled = _coerce_bool(request.form.get("agent", initial_config.agent))
+        if not agent_enabled:
+            return Response("agent disabled", status=400)
+        storage = request.files.get("project_zip")
+        if storage is None:
+            return Response("zip file required", status=400)
+        try:
+            upload_id, files = upload_store.save_zip(storage)
+        except ValueError as exc:
+            return Response(str(exc), status=400)
+        return jsonify(
+            {
+                "upload_id": upload_id,
+                "php_file_count": len(files),
+                "files": [file.path for file in files[:20]],
+                "max_php_files": MAX_PROJECT_FILES,
+                "max_file_bytes": MAX_PROJECT_FILE_BYTES,
+            }
+        )
 
     @app.post("/api/run")
     def run_job():
@@ -840,8 +1127,13 @@ def create_app(initial_config: PureWafConfig):
             return Response("invalid mode", status=400)
         config = _build_runtime_config(payload, initial_config)
         auto_prompt = str(payload.get("auto_prompt") or "")
+        upload_id = str(payload.get("upload_id") or "")
         job_id, job = job_store.create()
-        threading.Thread(target=_run_job, args=(job, config, auto_prompt), daemon=True).start()
+        threading.Thread(
+            target=_run_job,
+            args=(job, config, auto_prompt, upload_store, upload_id),
+            daemon=True,
+        ).start()
         return jsonify({"job_id": job_id})
 
     @app.get("/api/events/<job_id>")
