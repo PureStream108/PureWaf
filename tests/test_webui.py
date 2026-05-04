@@ -1,7 +1,11 @@
 import json
+import io
 import os
 import sys
+import tempfile
 import unittest
+import zipfile
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -14,6 +18,9 @@ from PureWaf.PureWaf import purewaf
 from PureWaf.PureWaf import PureWafConfig
 from PureWaf.PureWaf import PureWafExecutionResult
 from PureWaf.auto import AutoAnalysisResult
+from PureWaf.agent import ProjectSourceBundle
+from PureWaf.agent import ProjectSourceFile
+from PureWaf.agent import LlmPayloadReview
 
 try:
     from PureWaf.webui import _build_result_text
@@ -54,6 +61,11 @@ class WebUiTests(unittest.TestCase):
         self.assertIn('id="panel_filter"', body)
         self.assertIn('id="panel_auto"', body)
         self.assertIn('id="auto_prompt"', body)
+        self.assertIn('id="auto_zip"', body)
+        self.assertIn('id="upload_project"', body)
+        self.assertIn('id="agent_toggle"', body)
+        self.assertIn("AGENT OFF", body)
+        self.assertIn("未开始agent功能", body)
         self.assertIn("waf_words", body)
         self.assertNotIn('id="root_result"', body)
         self.assertNotIn('id="flag_result"', body)
@@ -129,6 +141,7 @@ class WebUiTests(unittest.TestCase):
                 total_payload=True,
                 phpv=8.3,
                 webui=True,
+                agent=True,
             )
 
         self.assertIsNone(result)
@@ -149,12 +162,20 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(config.phpv, 8.3)
         self.assertFalse(config.auto)
         self.assertTrue(config.webui)
+        self.assertTrue(config.agent)
 
     def test_auto_requires_webui(self):
         with self.assertRaises(RuntimeError) as ctx:
             purewaf(auto=True, webui=False)
 
-        self.assertIn("auto=True can only be used together with webui=True", str(ctx.exception))
+        self.assertIn("auto=True can only be used together with webui=True or agent=True", str(ctx.exception))
+
+    def test_agent_auto_missing_env_or_pure_returns_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("PureWaf.PureWaf.Path.cwd", return_value=Path(tmp)):
+                result = purewaf(auto=True, agent=True, webui=False)
+
+        self.assertEqual(result, ".env/pure Not FOUND")
 
     def test_webui_missing_flask_shows_install_hint(self):
         err = ModuleNotFoundError("No module named 'flask'")
@@ -236,6 +257,7 @@ class WebUiTests(unittest.TestCase):
 
         self.assertTrue(config.auto)
         self.assertTrue(config.webui)
+        self.assertFalse(config.agent)
         self.assertEqual(config.flagfile, "/flag")
         self.assertEqual(config.phpv, 7.0)
         self.assertEqual(config.log_level, "INFO")
@@ -244,6 +266,83 @@ class WebUiTests(unittest.TestCase):
         self.assertFalse(config.phpinfo)
         self.assertFalse(config.upload)
         self.assertFalse(config.total_payload)
+
+    @unittest.skipIf(_build_runtime_config is None, "Flask webui module not available")
+    def test_build_runtime_config_auto_mode_uses_payload_agent_toggle(self):
+        config = _build_runtime_config(
+            {"mode": "auto", "agent": True},
+            PureWafConfig(webui=True, agent=False),
+        )
+
+        self.assertTrue(config.auto)
+        self.assertTrue(config.agent)
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_agent_upload_zip_returns_upload_id(self):
+        app = create_app(PureWafConfig(webui=True, auto=True, agent=False))
+        client = app.test_client()
+        zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(zip_bytes, "w") as archive:
+            archive.writestr("index.php", "<?php system($_GET['x']);")
+        zip_bytes.seek(0)
+
+        response = client.post(
+            "/api/upload",
+            data={"project_zip": (zip_bytes, "project.zip"), "agent": "true"},
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertIn("upload_id", payload)
+        self.assertEqual(payload["php_file_count"], 1)
+        self.assertEqual(payload["files"], ["index.php"])
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_upload_disabled_when_agent_not_enabled(self):
+        app = create_app(PureWafConfig(webui=True, auto=True, agent=False))
+        client = app.test_client()
+
+        response = client.post("/api/upload", data={}, content_type="multipart/form-data")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("agent disabled", response.get_data(as_text=True))
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_upload_rejects_zip_path_traversal(self):
+        app = create_app(PureWafConfig(webui=True, auto=True, agent=False))
+        client = app.test_client()
+        zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(zip_bytes, "w") as archive:
+            archive.writestr("../evil.php", "<?php system($_GET['x']);")
+        zip_bytes.seek(0)
+
+        response = client.post(
+            "/api/upload",
+            data={"project_zip": (zip_bytes, "project.zip"), "agent": "true"},
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("path traversal", response.get_data(as_text=True))
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_upload_rejects_zip_without_php_files(self):
+        app = create_app(PureWafConfig(webui=True, auto=True, agent=False))
+        client = app.test_client()
+        zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(zip_bytes, "w") as archive:
+            archive.writestr("README.txt", "no php")
+        zip_bytes.seek(0)
+
+        response = client.post(
+            "/api/upload",
+            data={"project_zip": (zip_bytes, "project.zip"), "agent": "true"},
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("no PHP files", response.get_data(as_text=True))
 
     @unittest.skipIf(create_app is None, "Flask webui module not available")
     def test_webui_auto_mode_streams_analysis_before_result(self):
@@ -303,6 +402,65 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(called_config.payload_context, "php_code")
         self.assertEqual(called_config.waf_regex, "/[A-Za-z0-9_$]/")
         self.assertEqual(called_config.limit_length, 30)
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_agent_auto_uses_uploaded_project_bundle(self):
+        app = create_app(PureWafConfig(webui=True, auto=True, agent=False))
+        client = app.test_client()
+        zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(zip_bytes, "w") as archive:
+            archive.writestr("index.php", "<?php run_cmd($_GET['x']);")
+        zip_bytes.seek(0)
+        upload_response = client.post(
+            "/api/upload",
+            data={"project_zip": (zip_bytes, "project.zip"), "agent": "true"},
+            content_type="multipart/form-data",
+        )
+        upload_id = upload_response.get_json()["upload_id"]
+        fake_analysis = AutoAnalysisResult(
+            sink_kind="command_exec",
+            payload_context="shell_command",
+            waf_regex="/cat|flag/i",
+            analysis_lines=["[*] AUTO: analyzing uploaded bundle"],
+        )
+        fake_result = PureWafExecutionResult(
+            shortest_root="root-ok",
+            shortest_flag="flag-ok",
+            root_passed_payloads=["root-ok"],
+            flag_passed_payloads=["flag-ok"],
+            tips_text="",
+            log_text="[+] Shortest Flag Payload : flag-ok",
+        )
+        fake_bundle = ProjectSourceBundle(
+            root=Path("project"),
+            files=[ProjectSourceFile("index.php", "<?php run_cmd($_GET['x']);", 24)],
+            selected_paths=["index.php"],
+            source="/* BEGIN_FILE: index.php */\n<?php run_cmd($_GET['x']);",
+            analysis_lines=["[*] AGENT: selected PHP files => 1"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, ".env").write_text("API_KEY=x\nBASE_URL=http://x\nMODEL=x\n", encoding="utf-8")
+            with (
+                patch("PureWaf.webui.Path.cwd", return_value=Path(tmp)),
+                patch("PureWaf.webui.PureWafProjectAgent.build_project_source", return_value=fake_bundle),
+                patch("PureWaf.webui.PureWafProjectAgent.review_payloads") as review_mock,
+                patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis) as resolve_mock,
+                patch("PureWaf.webui._execute_purewaf", return_value=fake_result),
+            ):
+                review_mock.return_value = LlmPayloadReview()
+                run_response = client.post(
+                    "/api/run",
+                    json={"mode": "auto", "upload_id": upload_id, "auto_prompt": "", "agent": True},
+                )
+                self.assertEqual(run_response.status_code, 200)
+                job_id = run_response.get_json()["job_id"]
+                body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
+
+        resolve_mock.assert_called_once_with(fake_bundle.source, use_llm=True)
+        payloads = self._extract_sse_payloads(body)
+        first_lines = payloads[0]["lines"]
+        self.assertIn("[*] AGENT: selected PHP files => 1", first_lines)
 
     @unittest.skipIf(create_app is None, "Flask webui module not available")
     def test_webui_rejects_invalid_mode(self):

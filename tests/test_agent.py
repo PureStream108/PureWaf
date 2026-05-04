@@ -11,6 +11,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 from PureWaf.agent import PureWafLlmSinkAgent
+from PureWaf.agent import PureWafProjectAgent
+from PureWaf.agent import MAX_PROJECT_FILE_BYTES
 
 
 class _FakeResponse:
@@ -182,6 +184,68 @@ class LlmSinkAgentTests(unittest.TestCase):
         candidates = PureWafLlmSinkAgent()._parse_candidates(json.dumps(payload))
 
         self.assertEqual(candidates, [])
+
+    def test_project_scan_skips_vendor_and_reads_php_like_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Path(root, "index.php").write_text("<?php system($_GET['x']);", encoding="utf-8")
+            Path(root, "template.phtml").write_text("<?php echo $x;", encoding="utf-8")
+            Path(root, "vendor").mkdir()
+            Path(root, "vendor", "ignored.php").write_text("<?php eval($x);", encoding="utf-8")
+            Path(root, "README.txt").write_text("ignore", encoding="utf-8")
+
+            files = PureWafProjectAgent(cwd=root).scan_project_files(root)
+
+        paths = [file.path for file in files]
+        self.assertEqual(paths, ["index.php", "template.phtml"])
+
+    def test_project_scan_truncates_large_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Path(root, "big.php").write_text(
+                "<?php\n" + ("A" * (MAX_PROJECT_FILE_BYTES + 32)),
+                encoding="utf-8",
+            )
+
+            files = PureWafProjectAgent(cwd=root).scan_project_files(root)
+
+        self.assertTrue(files[0].truncated)
+        self.assertLessEqual(len(files[0].content.encode("utf-8")), MAX_PROJECT_FILE_BYTES)
+
+    def test_parse_selected_paths_keeps_only_known_project_files(self):
+        payload = json.dumps(
+            {
+                "selected_files": [
+                    "index.php",
+                    "missing.php",
+                    "../evil.php",
+                    "index.php",
+                    "lib/waf.php",
+                ]
+            }
+        )
+
+        selected = PureWafProjectAgent._parse_selected_paths(
+            payload,
+            {"index.php", "lib/waf.php"},
+        )
+
+        self.assertEqual(selected, ["index.php", "lib/waf.php"])
+
+    def test_parse_payload_review_extracts_fallback(self):
+        payload = json.dumps(
+            {
+                "valid": False,
+                "fallback_payload": "system('cat /flag');",
+                "notes": "PureWaf did not produce a usable payload",
+            }
+        )
+
+        review = PureWafProjectAgent._parse_payload_review(payload)
+
+        self.assertFalse(review.valid)
+        self.assertEqual(review.fallback_payload, "system('cat /flag');")
+        self.assertIn("PureWaf", review.notes)
 
 
 if __name__ == "__main__":
