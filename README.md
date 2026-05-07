@@ -10,7 +10,13 @@
 
 一些参数的使用看这里：[Parameters](docs/parameters.md)
 
-关于Agent看这里：[Use With LLM](docs/LLM.md)
+关于 Agent 看这里：[Use With LLM](docs/LLM.md)
+
+使用 Agent 示例看这里：[Example](docs/Example.md)
+
+## SKILL
+
+关于SKILL，如果你本地已经有了此工具，可以下载此 SKILL.md 让 LLM 调用 PureWaf，而不需要单独开启 PureWaf 的 Agent 功能。
 
 ## Foreword
 
