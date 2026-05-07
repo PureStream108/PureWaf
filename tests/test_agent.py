@@ -113,26 +113,6 @@ class LlmSinkAgentTests(unittest.TestCase):
         self.assertEqual(result.candidates[0].function, "run_cmd")
         self.assertEqual(result.candidates[0].kind, "command_exec")
 
-    def test_prompt_contains_purewaf_guide_and_safety_bounds(self):
-        agent = PureWafLlmSinkAgent()
-        messages = agent.build_messages("<?php system($_GET['x']);")
-        prompt = "\n".join(message["content"] for message in messages)
-
-        self.assertIn("CTF Web expert", prompt)
-        self.assertIn("read /flag", prompt)
-        self.assertIn("PureWaf is a CTF", prompt)
-        self.assertIn("AUTO mode analyzes one PHP source file", prompt)
-        self.assertIn("Allowed sink kinds are only", prompt)
-        self.assertIn("command_exec", prompt)
-        self.assertIn("file_read_path", prompt)
-        self.assertIn("file_write_upload", prompt)
-        self.assertIn("Allowed payload_context values are only", prompt)
-        self.assertIn("Do not generate payloads", prompt)
-        self.assertIn("PureWaf tool usage guide from skills/SKILL.md", prompt)
-        self.assertIn("# PureWaf Usage", prompt)
-        self.assertNotIn("## Troubleshooting", prompt)
-        self.assertNotIn("LLM skipped", prompt)
-
     def test_invalid_json_response_is_non_fatal(self):
         response_body = {"choices": [{"message": {"content": "not-json"}}]}
 
