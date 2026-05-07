@@ -179,6 +179,29 @@ echo file_get_contents($_GET['f']);
 
         self.assertEqual(result.error, "")
         self.assertEqual(result.sink_kind, "file_read_path")
+
+    def test_iconv_file_read_preserves_multi_input_and_upstream_filters(self):
+        source = """<?php
+$user = null;
+if (isset($_COOKIE['user'])) {
+    $user = @unserialize($_COOKIE['user']);
+}
+$f = (string)($_GET['f'] ?? "");
+$rawPath = $user->basePath . $f;
+if (preg_match('/flag|\\/flag|\\.\\.|php:|data:|expect:/i', $rawPath)) {
+    die('blocked');
+}
+$convertedPath = @iconv($user->encoding, "UTF-8//IGNORE", $rawPath);
+echo file_get_contents($convertedPath);
+"""
+
+        result = resolve_auto_parameters(source)
+
+        self.assertEqual(result.error, "")
+        self.assertEqual(result.sink_kind, "file_read_path")
+        self.assertIn("iconv", result.preprocessors)
+        self.assertIn("$_COOKIE['user']", result.input_refs)
+        self.assertIn("$_GET['f']", result.input_refs)
         self.assertEqual(result.sink_function, "file_get_contents")
         self.assertEqual(result.payload_context, "any")
         self.assertEqual(result.input_key, "f")

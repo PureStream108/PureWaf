@@ -247,8 +247,8 @@ echo $out;
             result = purewaf(upload=True, log_level="INFO")
 
         output = "\n".join(fake_logger.messages)
-        self.assertIn(f"[+] Shortest Root Payload : {wrapped_root_raw}", output)
-        self.assertNotIn(f"[+] Shortest Root Payload : {short_non_wrapper_root}", output)
+        self.assertIn(f"[+] Final Payload: {wrapped_flag_raw}", output)
+        self.assertNotIn(f"[+] Final Payload: {short_non_wrapper_flag}", output)
         self.assertEqual(result, wrapped_flag_raw)
         self.assertNotEqual(result, wrapped_flag_encoded)
 

@@ -93,8 +93,7 @@ class WebUiTests(unittest.TestCase):
                 "banner line\n"
                 "config line\n"
                 "----------------------------------------\n"
-                "[+] Shortest Root Payload : ls /\n"
-                "[+] Shortest Flag Payload : vi /flag\n"
+                "[+] Final Payload: vi /flag\n"
                 "----------------------------------------\n"
                 "\n"
                 "Example:\n"
@@ -105,8 +104,7 @@ class WebUiTests(unittest.TestCase):
         text = _build_result_text(result)
 
         self.assertFalse(text.startswith("banner line"))
-        self.assertTrue(text.startswith("[+] Shortest Root Payload : ls /"))
-        self.assertIn("[+] Shortest Flag Payload : vi /flag", text)
+        self.assertTrue(text.startswith("[+] Final Payload: vi /flag"))
         self.assertIn("Example:\nfoo", text)
 
     def test_webui_false_keeps_default_path(self):
@@ -354,7 +352,7 @@ class WebUiTests(unittest.TestCase):
             root_passed_payloads=["root-ok"],
             flag_passed_payloads=["flag-ok"],
             tips_text="",
-            log_text="[+] Shortest Root Payload : root-ok\n[+] Shortest Flag Payload : flag-ok",
+            log_text="[+] Final Payload: flag-ok",
         )
         fake_analysis = AutoAnalysisResult(
             sink_kind="command_exec",
@@ -429,7 +427,7 @@ class WebUiTests(unittest.TestCase):
             root_passed_payloads=["root-ok"],
             flag_passed_payloads=["flag-ok"],
             tips_text="",
-            log_text="[+] Shortest Flag Payload : flag-ok",
+            log_text="[+] Final Payload: flag-ok",
         )
         fake_bundle = ProjectSourceBundle(
             root=Path("project"),
@@ -461,6 +459,124 @@ class WebUiTests(unittest.TestCase):
         payloads = self._extract_sse_payloads(body)
         first_lines = payloads[0]["lines"]
         self.assertIn("[*] AGENT: selected PHP files => 1", first_lines)
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_agent_auto_stops_when_sink_llm_fails(self):
+        app = create_app(PureWafConfig(webui=True))
+        client = app.test_client()
+        fake_analysis = AutoAnalysisResult(
+            analysis_lines=[
+                "[*] AUTO: analyzing PHP source",
+                "[*] AUTO: LLM request failed: timeout",
+            ],
+            llm_error="LLM request failed: timeout",
+        )
+
+        with (
+            patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis),
+            patch("PureWaf.webui._execute_purewaf") as execute_mock,
+        ):
+            run_response = client.post(
+                "/api/run",
+                json={"mode": "auto", "auto_prompt": "<?php system($_GET['x']); ?>", "agent": True},
+            )
+            self.assertEqual(run_response.status_code, 200)
+            job_id = run_response.get_json()["job_id"]
+            body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
+
+        execute_mock.assert_not_called()
+        payloads = self._extract_sse_payloads(body)
+        self.assertEqual(payloads[-1]["kind"], "error")
+        self.assertIn("LLM调用失败", payloads[-1]["error"])
+        self.assertIn("timeout", payloads[-1]["error"])
+        self.assertTrue(all(item["kind"] != "result" for item in payloads))
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_agent_auto_stops_when_project_selection_llm_fails(self):
+        app = create_app(PureWafConfig(webui=True, auto=True, agent=False))
+        client = app.test_client()
+        zip_bytes = io.BytesIO()
+        with zipfile.ZipFile(zip_bytes, "w") as archive:
+            archive.writestr("index.php", "<?php system($_GET['x']);")
+        zip_bytes.seek(0)
+        upload_response = client.post(
+            "/api/upload",
+            data={"project_zip": (zip_bytes, "project.zip"), "agent": "true"},
+            content_type="multipart/form-data",
+        )
+        upload_id = upload_response.get_json()["upload_id"]
+        fake_bundle = ProjectSourceBundle(
+            root=Path("project"),
+            files=[ProjectSourceFile("index.php", "<?php system($_GET['x']);", 24)],
+            selected_paths=["index.php"],
+            source="/* BEGIN_FILE: index.php */\n<?php system($_GET['x']);",
+            analysis_lines=["[*] AGENT: file selection fallback => LLM request failed: timeout"],
+            selection_error="LLM request failed: timeout",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, ".env").write_text("API_KEY=x\nBASE_URL=http://x\nMODEL=x\n", encoding="utf-8")
+            with (
+                patch("PureWaf.webui.Path.cwd", return_value=Path(tmp)),
+                patch("PureWaf.webui.PureWafProjectAgent.build_project_source", return_value=fake_bundle),
+                patch("PureWaf.webui.resolve_auto_parameters") as resolve_mock,
+                patch("PureWaf.webui._execute_purewaf") as execute_mock,
+            ):
+                run_response = client.post(
+                    "/api/run",
+                    json={"mode": "auto", "upload_id": upload_id, "agent": True},
+                )
+                self.assertEqual(run_response.status_code, 200)
+                job_id = run_response.get_json()["job_id"]
+                body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
+
+        resolve_mock.assert_not_called()
+        execute_mock.assert_not_called()
+        payloads = self._extract_sse_payloads(body)
+        self.assertEqual(payloads[-1]["kind"], "error")
+        self.assertIn("LLM调用失败", payloads[-1]["error"])
+        self.assertIn("timeout", payloads[-1]["error"])
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_agent_auto_stops_when_payload_review_llm_fails(self):
+        app = create_app(PureWafConfig(webui=True))
+        client = app.test_client()
+        fake_analysis = AutoAnalysisResult(
+            sink_kind="command_exec",
+            payload_context="shell_command",
+            analysis_lines=["[*] AUTO: selected strategy => baseline"],
+        )
+        fake_result = PureWafExecutionResult(
+            shortest_root="root-ok",
+            shortest_flag="flag-ok",
+            root_passed_payloads=["root-ok"],
+            flag_passed_payloads=["flag-ok"],
+            tips_text="",
+            log_text="[+] Final Payload: flag-ok",
+        )
+
+        with (
+            patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis),
+            patch("PureWaf.webui._execute_purewaf", return_value=fake_result) as execute_mock,
+            patch(
+                "PureWaf.webui.PureWafProjectAgent.review_payloads",
+                return_value=LlmPayloadReview(used=True, error="LLM request failed: timeout"),
+            ),
+        ):
+            run_response = client.post(
+                "/api/run",
+                json={"mode": "auto", "auto_prompt": "<?php system($_GET['x']); ?>", "agent": True},
+            )
+            self.assertEqual(run_response.status_code, 200)
+            job_id = run_response.get_json()["job_id"]
+            body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
+
+        execute_mock.assert_called_once()
+        payloads = self._extract_sse_payloads(body)
+        self.assertEqual(payloads[-1]["kind"], "error")
+        self.assertIn("LLM调用失败", payloads[-1]["error"])
+        self.assertIn("timeout", payloads[-1]["error"])
+        self.assertTrue(all(item["kind"] != "result" for item in payloads))
 
     @unittest.skipIf(create_app is None, "Flask webui module not available")
     def test_webui_rejects_invalid_mode(self):
@@ -498,7 +614,7 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(result.root_passed_payloads, ["root-pass"])
         self.assertEqual(result.flag_passed_payloads, ["eval(next(getallheaders()));"])
         self.assertIn("TIPS: User-Agent: 1=system('id');", result.tips_text)
-        self.assertIn("[+] Shortest Flag Payload : eval(next(getallheaders()));", result.log_text)
+        self.assertIn("[+] Final Payload: eval(next(getallheaders()));", result.log_text)
 
     def test_execute_purewaf_emits_stage_events_for_encoded_fallback(self):
         config = PureWafConfig()

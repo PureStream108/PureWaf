@@ -118,6 +118,8 @@ class LlmSinkAgentTests(unittest.TestCase):
         messages = agent.build_messages("<?php system($_GET['x']);")
         prompt = "\n".join(message["content"] for message in messages)
 
+        self.assertIn("CTF Web expert", prompt)
+        self.assertIn("read /flag", prompt)
         self.assertIn("PureWaf is a CTF", prompt)
         self.assertIn("AUTO mode analyzes one PHP source file", prompt)
         self.assertIn("Allowed sink kinds are only", prompt)
@@ -127,7 +129,7 @@ class LlmSinkAgentTests(unittest.TestCase):
         self.assertIn("Allowed payload_context values are only", prompt)
         self.assertIn("Do not generate payloads", prompt)
         self.assertIn("PureWaf tool usage guide from skills/SKILL.md", prompt)
-        self.assertIn("# PureWaf LLM AUTO", prompt)
+        self.assertIn("# PureWaf Usage", prompt)
         self.assertNotIn("## Troubleshooting", prompt)
         self.assertNotIn("LLM skipped", prompt)
 
@@ -246,6 +248,22 @@ class LlmSinkAgentTests(unittest.TestCase):
         self.assertFalse(review.valid)
         self.assertEqual(review.fallback_payload, "system('cat /flag');")
         self.assertIn("PureWaf", review.notes)
+
+    def test_payload_review_prompt_prioritizes_flag_fallback(self):
+        messages = PureWafProjectAgent().build_payload_review_messages(
+            source="<?php system($_GET['cmd']);",
+            analysis_lines=["[*] AUTO: detected sink => command_exec"],
+            shortest_root="ls /",
+            shortest_flag="N/A",
+            root_payloads=["ls /"],
+            flag_payloads=[],
+        )
+        prompt = "\n".join(message["content"] for message in messages)
+
+        self.assertIn("CTF Web expert", prompt)
+        self.assertIn("primary objective is reading /flag", prompt)
+        self.assertIn("provide exactly one", prompt)
+        self.assertIn("fallback_payload", prompt)
 
 
 if __name__ == "__main__":
