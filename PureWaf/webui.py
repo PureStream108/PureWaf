@@ -30,6 +30,8 @@ from .agent import PureWafProjectAgent
 from .auto import resolve_auto_parameters
 from .PureWaf import PureWafConfig
 from .PureWaf import _append_agent_review_to_result
+from .PureWaf import _choose_final_payload
+from .PureWaf import _format_agent_llm_failure
 from .PureWaf import _format_agent_review_lines
 from .PureWaf import _execute_purewaf
 from .PureWaf import version
@@ -363,8 +365,7 @@ PAGE_TEMPLATE = """
         return resultText;
       }
       const lines = [
-        `[+] Shortest Root Payload : ${result.shortest_root || "N/A"}`,
-        `[+] Shortest Flag Payload : ${result.shortest_flag || "N/A"}`
+        `[+] Final Payload: ${result.final_payload || result.shortest_flag || result.shortest_root || "N/A"}`
       ];
       const tipsText = (result.tips_text || "").trim();
       if(tipsText){
@@ -862,6 +863,7 @@ def _serialize_result(result):
     return {
         "shortest_root": result.shortest_root,
         "shortest_flag": result.shortest_flag,
+        "final_payload": _choose_final_payload(result.shortest_flag, result.shortest_root),
         "root_passed_payloads": result.root_passed_payloads,
         "flag_passed_payloads": result.flag_passed_payloads,
         "tips_text": result.tips_text,
@@ -871,17 +873,8 @@ def _serialize_result(result):
 
 
 def _build_result_text(result):
-    log_text = (result.log_text or "").strip()
-    if log_text:
-        lines = log_text.splitlines()
-        for idx, line in enumerate(lines):
-            if line.startswith("[+] Shortest Root Payload :"):
-                return "\n".join(lines[idx:]).strip()
-        return log_text
-
     lines = [
-        f"[+] Shortest Root Payload : {result.shortest_root or 'N/A'}",
-        f"[+] Shortest Flag Payload : {result.shortest_flag or 'N/A'}",
+        f"[+] Final Payload: {_choose_final_payload(result.shortest_flag, result.shortest_root)}",
     ]
     if result.tips_text:
         lines.extend(["", result.tips_text.strip()])
@@ -1015,11 +1008,15 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                 source_for_review = bundle.source
                 if bundle.analysis_lines:
                     publish({"kind": "lines", "lines": bundle.analysis_lines})
+                if bundle.selection_error:
+                    raise RuntimeError(_format_agent_llm_failure(bundle.selection_error))
                 analysis = resolve_auto_parameters(bundle.source, use_llm=True)
             else:
                 analysis = resolve_auto_parameters(auto_prompt, use_llm=True)
             if analysis.analysis_lines:
                 publish({"kind": "lines", "lines": analysis.analysis_lines})
+            if config.agent and analysis.llm_error:
+                raise RuntimeError(_format_agent_llm_failure(analysis.llm_error))
             if analysis.error:
                 if config.agent:
                     agent_project = agent_project or PureWafProjectAgent(cwd=Path.cwd())
@@ -1030,6 +1027,8 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                     review_lines = _format_agent_review_lines(review)
                     if review_lines:
                         publish({"kind": "lines", "lines": review_lines})
+                    if review.error:
+                        raise RuntimeError(_format_agent_llm_failure(review.error))
                     if review.fallback_payload:
                         publish(
                             {
@@ -1037,11 +1036,12 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                                 "result": {
                                     "shortest_root": "N/A",
                                     "shortest_flag": review.fallback_payload,
+                                    "final_payload": review.fallback_payload,
                                     "root_passed_payloads": [],
                                     "flag_passed_payloads": [review.fallback_payload],
                                     "tips_text": "\n".join(review_lines),
                                     "log_text": "\n".join(review_lines),
-                                    "result_text": "\n".join(review_lines),
+                                    "result_text": f"[+] Final Payload: {review.fallback_payload}",
                                 },
                             }
                         )
@@ -1070,6 +1070,8 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
             review_lines = _format_agent_review_lines(review)
             if review_lines:
                 publish({"kind": "lines", "lines": review_lines})
+            if review.error:
+                raise RuntimeError(_format_agent_llm_failure(review.error))
             _append_agent_review_to_result(result, review)
         flush_lines()
         publish({"kind": "result", "result": _serialize_result(result)})

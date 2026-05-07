@@ -57,6 +57,7 @@ _PREPROCESSOR_CALLS = {
     "urldecode",
     "rawurldecode",
     "base64_decode",
+    "iconv",
 }
 _SANITIZER_CALLS = {
     "escapeshellcmd",
@@ -284,22 +285,45 @@ def analyze_php_auto(source: str, use_llm: bool = False) -> AutoAnalysisResult:
         _collect_auto_context_metadata(result, global_text, sink, input_refs, assignments)
         return result
 
-    if len(input_refs) > 1:
+    if len(input_refs) > 1 and sink.kind != "file_read_path":
         result.error = "multiple filtered inputs cannot be mapped to one PureWaf model"
         return result
+    if len(input_refs) > 1:
+        result.analysis_lines.append(
+            "[*] AUTO: multiple input refs preserved for file_read_path => "
+            + ",".join(sorted(input_refs))
+        )
 
     target_filter_expr = sink.target_var or sink.target_expr.strip()
     if not target_filter_expr:
         result.error = "no supported sink/filter pattern detected; use FILTER mode instead"
         return result
 
-    filters = _collect_filters_for_variable(global_text, target_filter_expr)
-    wrapper_filters = _collect_filters_from_wrapper_calls(
-        global_text,
-        target_filter_expr,
-        functions,
-    )
-    filters.merge(wrapper_filters)
+    filter_targets = _resolve_filter_target_vars(target_filter_expr, assignments)
+    filters = _FilterAccumulator()
+    sanitizers: List[str] = []
+    preprocessors: List[str] = []
+    for filter_target in filter_targets:
+        target_filters = _collect_filters_for_variable(global_text, filter_target)
+        wrapper_filters = _collect_filters_from_wrapper_calls(
+            global_text,
+            filter_target,
+            functions,
+        )
+        target_filters.merge(wrapper_filters)
+        filters.merge(target_filters)
+
+        san_acc = _collect_sanitizers_and_preprocessors(
+            global_text, filter_target, assignments, functions
+        )
+        for san in san_acc["sanitizers"]:
+            if san not in sanitizers:
+                sanitizers.append(san)
+        for preprocessor in san_acc["preprocessors"]:
+            if preprocessor not in preprocessors:
+                preprocessors.append(preprocessor)
+        for ch in san_acc["extra_chars"]:
+            filters.add_char(ch)
 
     if filters.errors:
         result.error = filters.errors[0]
@@ -307,11 +331,8 @@ def analyze_php_auto(source: str, use_llm: bool = False) -> AutoAnalysisResult:
 
     # Also accumulate any preprocessor/sanitizer side-effects into filters
     # (e.g. addslashes => adds `' " \` chars).
-    san_acc = _collect_sanitizers_and_preprocessors(
-        global_text, target_filter_expr, assignments, functions
-    )
-    result.sanitizers = list(san_acc["sanitizers"])
-    result.preprocessors = list(san_acc["preprocessors"])
+    result.sanitizers = sanitizers
+    result.preprocessors = preprocessors
     if result.sanitizers:
         result.analysis_lines.append(
             f"[*] AUTO: sanitizers => {','.join(result.sanitizers)}"
@@ -320,9 +341,6 @@ def analyze_php_auto(source: str, use_llm: bool = False) -> AutoAnalysisResult:
         result.analysis_lines.append(
             f"[*] AUTO: preprocessors => {','.join(result.preprocessors)}"
         )
-    for ch in san_acc["extra_chars"]:
-        filters.add_char(ch)
-
     if (
         not filters.has_filters()
         and not result.sanitizers
@@ -396,7 +414,7 @@ def _collect_auto_context_metadata(
     input_refs: Set[str],
     assignments: Dict[str, List[str]],
 ):
-    refs = sorted(input_refs)
+    refs = sorted(input_refs, key=_input_ref_sort_key)
     if not refs and sink.input_slots:
         # Multi-input mode: resolve each slot's input ref.
         for slot in sink.input_slots:
@@ -404,6 +422,20 @@ def _collect_auto_context_metadata(
             refs.extend(sorted(slot_refs))
     result.input_refs = refs
     result.input_key = _extract_input_key(refs[0]) if refs else ""
+
+
+def _input_ref_sort_key(ref: str):
+    match = re.match(r"\$_([A-Z]+)", ref or "")
+    source = match.group(1) if match else ""
+    priority = {
+        "GET": 0,
+        "POST": 1,
+        "REQUEST": 2,
+        "COOKIE": 3,
+        "FILES": 4,
+        "SERVER": 5,
+    }.get(source, 9)
+    return (priority, ref)
 
 
 def _detect_llm_sink(
@@ -1080,6 +1112,27 @@ def _resolve_input_refs(expr: str, assignments: Dict[str, List[str]], seen: Set[
         for rhs in rhs_list:
             resolved.update(_resolve_input_refs(rhs, assignments, seen | {var}))
     return resolved
+
+
+def _resolve_filter_target_vars(expr: str, assignments: Dict[str, List[str]]) -> List[str]:
+    ordered: List[str] = []
+
+    def add_var(var: str, seen: Set[str]):
+        if not re.fullmatch(r"\$[A-Za-z_]\w*", var):
+            return
+        if var.startswith("$_") or var in seen:
+            return
+        if var not in ordered:
+            ordered.append(var)
+        for rhs in assignments.get(var, []):
+            for nested in _VAR_RE.findall(rhs or ""):
+                add_var(nested, seen | {var})
+
+    for var in _VAR_RE.findall(expr or ""):
+        add_var(var, set())
+    if not ordered and re.fullmatch(r"\$[A-Za-z_]\w*", (expr or "").strip()):
+        ordered.append(expr.strip())
+    return ordered
 
 
 def _collect_filters_from_wrapper_calls(

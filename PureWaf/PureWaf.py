@@ -259,6 +259,16 @@ def _choose_shortest_payload(passed_payloads, upload: bool, prefer_order=False):
     return min(passed_payloads, key=len)
 
 
+def _choose_final_payload(shortest_flag: str, shortest_root: str = "N/A"):
+    flag_payload = str(shortest_flag or "").strip()
+    if flag_payload and flag_payload != "N/A":
+        return flag_payload
+    root_payload = str(shortest_root or "").strip()
+    if root_payload and root_payload != "N/A":
+        return root_payload
+    return "N/A"
+
+
 def _normalize_php_version(phpv, logger):
     try:
         return float(phpv)
@@ -513,8 +523,7 @@ def _execute_purewaf(
 
     logger.info("")
     logger.info("-" * 40)
-    logger.info(f"[+] Shortest Root Payload : {shortest_root}")
-    logger.info(f"[+] Shortest Flag Payload : {shortest_flag}")
+    logger.info(f"[+] Final Payload: {_choose_final_payload(shortest_flag, shortest_root)}")
     logger.info("-" * 40)
     logger.info("")
 
@@ -557,27 +566,61 @@ def _build_agent_auto_execution_config(config: PureWafConfig, analysis):
 def _format_agent_review_lines(review):
     lines = []
     if review.used:
-        lines.append(f"[*] AGENT: payload review => valid={str(review.valid).lower()}")
+        if review.valid:
+            status = "accepted"
+        elif review.fallback_payload:
+            status = "fallback_required"
+        else:
+            status = "rejected"
+        lines.append(f"[*] AGENT: payload review => {status}")
     if review.error:
         lines.append(f"[*] AGENT: payload review skipped => {review.error}")
     if review.notes:
         lines.append(f"[*] AGENT: review notes => {review.notes}")
     if review.fallback_payload:
-        lines.append(f"[+] LLM Fallback Payload : {review.fallback_payload}")
+        lines.append(f"[+] Final Payload: {review.fallback_payload}")
     return lines
+
+
+def _format_agent_llm_failure(error: str):
+    detail = str(error or "").strip()
+    return f"LLM调用失败: {detail}" if detail else "LLM调用失败"
+
+
+def _replace_final_payload_line(log_text: str, final_payload: str):
+    line = f"[+] Final Payload: {final_payload}"
+    lines = []
+    replaced = False
+    for raw_line in (log_text or "").splitlines():
+        if raw_line.startswith("[+] Final Payload:"):
+            if not replaced:
+                lines.append(line)
+                replaced = True
+            continue
+        lines.append(raw_line)
+    if not replaced:
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _append_agent_review_to_result(result: PureWafExecutionResult, review):
     lines = _format_agent_review_lines(review)
     if not lines:
         return result
-    if review.fallback_payload and result.shortest_flag == "N/A":
+    if review.fallback_payload and (result.shortest_flag == "N/A" or not review.valid):
         result.shortest_flag = review.fallback_payload
         result.flag_passed_payloads = [review.fallback_payload]
-    suffix = "\n".join(lines)
-    result.log_text = (result.log_text.rstrip() + "\n" + suffix).strip()
+    result.log_text = _replace_final_payload_line(
+        result.log_text,
+        _choose_final_payload(result.shortest_flag, result.shortest_root),
+    )
+    suffix_lines = [line for line in lines if not line.startswith("[+] Final Payload:")]
+    suffix = "\n".join(suffix_lines)
+    if suffix:
+        result.log_text = (result.log_text.rstrip() + "\n" + suffix).strip()
     if review.notes or review.fallback_payload:
-        result.tips_text = (result.tips_text.rstrip() + "\n" + suffix).strip()
+        tips_suffix = "\n".join(lines)
+        result.tips_text = (result.tips_text.rstrip() + "\n" + tips_suffix).strip()
     return result
 
 
@@ -594,11 +637,15 @@ def _execute_agent_auto_from_project(
     if output_logger:
         for line in bundle.analysis_lines:
             output_logger.info(line)
+    if bundle.selection_error:
+        return _format_agent_llm_failure(bundle.selection_error)
 
     analysis = resolve_auto_parameters(bundle.source, use_llm=True)
     if output_logger and analysis.analysis_lines:
         for line in analysis.analysis_lines:
             output_logger.info(line)
+    if analysis.llm_error:
+        return _format_agent_llm_failure(analysis.llm_error)
 
     if analysis.error:
         review = project_agent.review_payloads(
@@ -608,6 +655,8 @@ def _execute_agent_auto_from_project(
         if output_logger:
             for line in _format_agent_review_lines(review):
                 output_logger.info(line)
+        if review.error:
+            return _format_agent_llm_failure(review.error)
         return review.fallback_payload or analysis.error
 
     execution_config = _build_agent_auto_execution_config(config, analysis)
@@ -629,6 +678,8 @@ def _execute_agent_auto_from_project(
     if output_logger:
         for line in _format_agent_review_lines(review):
             output_logger.info(line)
+    if review.error:
+        return _format_agent_llm_failure(review.error)
     return result.shortest_flag
 
 

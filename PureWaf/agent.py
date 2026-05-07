@@ -61,6 +61,7 @@ class ProjectSourceBundle:
     selected_paths: List[str] = field(default_factory=list)
     source: str = ""
     analysis_lines: List[str] = field(default_factory=list)
+    selection_error: str = ""
 
 
 @dataclass
@@ -169,8 +170,10 @@ class PureWafLlmSinkAgent:
             {
                 "role": "system",
                 "content": (
-                    "You are the PureWaf AUTO sink analyzer. PureWaf is a CTF and "
-                    "education-oriented PHP RCE/WAF-bypass payload generator, not a scanner. "
+                    "You are a CTF Web expert assisting PureWaf AUTO sink analysis. PureWaf is "
+                    "a CTF and education-oriented PHP RCE/WAF-bypass payload generator, not a scanner. "
+                    "The primary CTF objective is to identify how user-controlled data can reach "
+                    "a sink that may help get FLAG. "
                     "AUTO mode analyzes one PHP source file to identify the sink, input source, "
                     "filters, and execution context, then PureWaf's local payload engine generates "
                     "and filters candidates. Allowed sink kinds are only: command_exec, "
@@ -346,6 +349,24 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
     """Project-level LLM helper for PureWaf agent AUTO mode."""
 
     def scan_project_files(self, project_dir: Path) -> List[ProjectSourceFile]:
+        files = self._scan_project_files_by_extension(
+            project_dir,
+            PHP_PROJECT_EXTENSIONS,
+            MAX_PROJECT_FILES,
+            MAX_PROJECT_FILE_BYTES,
+        )
+
+        if not files:
+            raise ValueError("no PHP files found in project")
+        return files
+
+    @staticmethod
+    def _scan_project_files_by_extension(
+        project_dir: Path,
+        extensions: Set[str],
+        max_files: int,
+        max_bytes: int,
+    ) -> List[ProjectSourceFile]:
         root = Path(project_dir).resolve()
         if not root.is_dir():
             raise ValueError("project directory not found")
@@ -357,14 +378,14 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             rel_parts = path.relative_to(root).parts
             if any(part in PROJECT_SKIP_DIRS for part in rel_parts[:-1]):
                 continue
-            if path.suffix.lower() not in PHP_PROJECT_EXTENSIONS:
+            if path.suffix.lower() not in extensions:
                 continue
 
             size = path.stat().st_size
             with path.open("rb") as handle:
-                raw = handle.read(MAX_PROJECT_FILE_BYTES + 1)
-            truncated = len(raw) > MAX_PROJECT_FILE_BYTES
-            content = raw[:MAX_PROJECT_FILE_BYTES].decode("utf-8", "replace")
+                raw = handle.read(max_bytes + 1)
+            truncated = len(raw) > max_bytes
+            content = raw[:max_bytes].decode("utf-8", "replace")
             files.append(
                 ProjectSourceFile(
                     path=path.relative_to(root).as_posix(),
@@ -373,11 +394,8 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                     truncated=truncated,
                 )
             )
-            if len(files) >= MAX_PROJECT_FILES:
+            if len(files) >= max_files:
                 break
-
-        if not files:
-            raise ValueError("no PHP files found in project")
         return files
 
     def build_project_source(self, project_dir: Path) -> ProjectSourceBundle:
@@ -405,9 +423,13 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             selected_paths=selected_paths,
             source=source,
             analysis_lines=lines,
+            selection_error=selection_error,
         )
 
-    def select_project_files(self, files: Sequence[ProjectSourceFile]) -> Tuple[List[str], str]:
+    def select_project_files(
+        self,
+        files: Sequence[ProjectSourceFile],
+    ) -> Tuple[List[str], str]:
         settings, error = self._load_settings()
         if error:
             return [], error
@@ -428,7 +450,8 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         return selected, ""
 
     def build_project_selection_messages(
-        self, files: Sequence[ProjectSourceFile]
+        self,
+        files: Sequence[ProjectSourceFile],
     ) -> List[Dict[str, str]]:
         file_blocks = []
         for file in files:
@@ -441,7 +464,8 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             {
                 "role": "system",
                 "content": (
-                    "You are selecting PHP files for PureWaf agent AUTO analysis. "
+                    "You are a CTF Web expert selecting PHP files for PureWaf agent AUTO analysis. "
+                    "The primary objective is to understand the path to getting FLAG. "
                     "Choose only project files that are relevant to user input, filtering, "
                     "routing, and dangerous sink reachability. Return only JSON shaped as "
                     "{\"selected_files\":[\"relative/path.php\"],\"reason\":\"short reason\"}. "
@@ -450,7 +474,8 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             },
             {
                 "role": "user",
-                "content": "Project PHP file inventory:\n\n" + "\n\n---\n\n".join(file_blocks),
+                "content": "Project PHP file inventory:\n\n"
+                + "\n\n---\n\n".join(file_blocks),
             },
         ]
 
@@ -541,7 +566,9 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         root_payloads: Sequence[str],
         flag_payloads: Sequence[str],
     ) -> List[Dict[str, str]]:
+        final_payload = shortest_flag if shortest_flag and shortest_flag != "N/A" else ""
         payload_summary = {
+            "purewaf_final_payload": final_payload or "N/A",
             "shortest_root": shortest_root,
             "shortest_flag": shortest_flag,
             "root_payloads": list(root_payloads[:8]),
@@ -552,11 +579,15 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             {
                 "role": "system",
                 "content": (
-                    "You are reviewing PureWaf-generated payloads for a CTF/education PHP "
-                    "RCE/WAF-bypass scenario. Use only the supplied source and PureWaf output. "
-                    "If PureWaf produced a usable payload, statically judge whether it fits the "
-                    "detected sink/filter context. If PureWaf produced no usable payload, you may "
-                    "provide one fallback payload. Return only JSON shaped as "
+                    "You are a CTF Web expert reviewing PureWaf-generated payloads for a PHP "
+                    "RCE/WAF-bypass challenge. Your primary objective is reading /flag. Use only "
+                    "the supplied source and PureWaf output. First identify whether the detected "
+                    "sink/filter context can execute a payload that reads /flag. If PureWaf produced "
+                    "a usable /flag payload, set valid=true and leave fallback_payload empty. If "
+                    "PureWaf produced no usable /flag payload, or the provided payload does not fit "
+                    "the detected sink/filter context, set valid=false and provide exactly one "
+                    "fallback_payload that attempts to read /flag through the detected sink. Do not "
+                    "give exploitation steps or prose outside JSON. Return only JSON shaped as "
                     "{\"valid\":true,\"fallback_payload\":\"\",\"notes\":\"short source-based note\"}."
                 ),
             },
