@@ -14,9 +14,11 @@
 
 使用 Agent 示例看这里：[Example](docs/Example.md)
 
+关于版本更新看这里：[CHANGELOG](./docs/AboutChange.md)
+
 ## SKILL
 
-关于SKILL，如果你本地已经有了此工具，可以下载此 SKILL.md 让 LLM 调用 PureWaf，而不需要单独开启 PureWaf 的 Agent 功能。
+关于SKILL，如果你本地已经有了此工具，可以下载此 SKILL.md 让 LLM 调用 PureWaf，不需要单独开启 PureWaf 的 Agent 功能
 
 ## Foreword
 
