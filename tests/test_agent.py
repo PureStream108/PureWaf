@@ -1,10 +1,12 @@
 import json
+import io
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib import error
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -12,7 +14,12 @@ sys.path.insert(0, ROOT)
 
 from PureWaf.agent import PureWafLlmSinkAgent
 from PureWaf.agent import PureWafProjectAgent
+from PureWaf.agent import ProjectSourceFile
 from PureWaf.agent import MAX_PROJECT_FILE_BYTES
+from PureWaf.agent import AGENT_ORIGINAL_TASK
+from PureWaf.agent import AGENT_STATE_FILENAME
+from PureWaf.agent import AgentStepLimitExceeded
+from PureWaf.agent import PureWafAgentSession
 
 
 class _FakeResponse:
@@ -133,6 +140,34 @@ class LlmSinkAgentTests(unittest.TestCase):
         self.assertIn("LLM response invalid", result.error)
         self.assertEqual(result.candidates, [])
 
+    def test_http_error_includes_sanitized_response_details(self):
+        body = b'{"error":{"message":"model denied for test-key"}}'
+
+        def fake_urlopen(_req, timeout=None):
+            raise error.HTTPError(
+                url="https://llm.example/v1/chat/completions",
+                code=403,
+                msg="Forbidden",
+                hdrs=None,
+                fp=io.BytesIO(body),
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, ".env").write_text(
+                "API_KEY=test-key\nBASE_URL=https://llm.example/v1\nMODEL=my-model\n",
+                encoding="utf-8",
+            )
+            agent = PureWafLlmSinkAgent(cwd=Path(tmp))
+            with patch("PureWaf.agent.request.urlopen", side_effect=fake_urlopen):
+                result = agent.analyze_php("<?php run_cmd($_GET['x']);")
+
+        self.assertTrue(result.used)
+        self.assertIn("HTTP 403 Forbidden", result.error)
+        self.assertIn("endpoint=https://llm.example/v1/chat/completions", result.error)
+        self.assertIn("model=my-model", result.error)
+        self.assertIn("[REDACTED_API_KEY]", result.error)
+        self.assertNotIn("test-key", result.error)
+
     def test_invalid_candidates_are_dropped(self):
         payload = {
             "sinks": [
@@ -244,6 +279,124 @@ class LlmSinkAgentTests(unittest.TestCase):
         self.assertIn("primary objective is reading /flag", prompt)
         self.assertIn("provide exactly one", prompt)
         self.assertIn("fallback_payload", prompt)
+
+    def test_agent_session_writes_bounded_state_without_env_secret(self):
+        response_body = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "sinks": [
+                                    {
+                                        "function": "system",
+                                        "kind": "command_exec",
+                                        "payload_context": "shell_command",
+                                        "argument_index": 0,
+                                        "confidence": 0.95,
+                                        "evidence": "system receives user input",
+                                    }
+                                ]
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            root.joinpath(".env").write_text(
+                "API_KEY=test-key\nBASE_URL=https://llm.example/v1\nMODEL=my-model\n",
+                encoding="utf-8",
+            )
+            session = PureWafAgentSession(cwd=root)
+            agent = PureWafLlmSinkAgent(cwd=root, session=session)
+            with patch(
+                "PureWaf.agent.request.urlopen",
+                return_value=_FakeResponse(json.dumps(response_body).encode("utf-8")),
+            ):
+                result = agent.analyze_php("<?php system($_GET['x']);")
+
+            state_text = root.joinpath(AGENT_STATE_FILENAME).read_text(encoding="utf-8")
+            state = json.loads(state_text)
+
+        self.assertTrue(result.used)
+        self.assertEqual(state["max_steps"], 10)
+        self.assertEqual(state["current_step"], 1)
+        self.assertLessEqual(len(state["history"]), 24)
+        self.assertNotIn("test-key", state_text)
+        self.assertIn("llm_sink_analysis", state_text)
+
+    def test_agent_session_enforces_step_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = PureWafAgentSession(cwd=Path(tmp), max_steps=1)
+            session.step("phase", "first")
+            with self.assertRaises(AgentStepLimitExceeded):
+                session.step("phase", "second")
+            state = json.loads(Path(tmp, AGENT_STATE_FILENAME).read_text(encoding="utf-8"))
+
+        self.assertEqual(state["current_step"], 1)
+        self.assertEqual(state["status"], "step_limit_exceeded")
+
+    def test_llm_prompts_include_immutable_agent_context(self):
+        file = PureWafProjectAgent().build_project_selection_messages(
+            [ProjectSourceFile("index.php", "<?php system($_GET['x']);", 24)]
+        )
+        sink = PureWafLlmSinkAgent().build_messages("<?php system($_GET['x']);")
+        review = PureWafProjectAgent().build_payload_review_messages(
+            source="<?php system($_GET['cmd']);",
+            analysis_lines=["[*] AUTO: detected sink => command_exec"],
+            shortest_root="N/A",
+            shortest_flag="N/A",
+            root_payloads=[],
+            flag_payloads=[],
+        )
+        combined = "\n".join(
+            message["content"]
+            for message_group in (file, sink, review)
+            for message in message_group
+            if message["role"] == "system"
+        )
+
+        self.assertIn(AGENT_ORIGINAL_TASK, combined)
+        self.assertIn("Security boundary", combined)
+        self.assertIn("Max loop/step budget", combined)
+
+    def test_payload_validation_php_code_and_file_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = PureWafProjectAgent(cwd=Path(tmp))
+            php_code = agent.validate_payloads(
+                ["echo file_get_contents('/flag');"],
+                sink_kind="command_exec",
+                payload_context="php_code",
+            )[0]
+            file_read = agent.validate_payloads(
+                ["php://filter/read=convert.base64-encode/resource=/flag"],
+                sink_kind="file_read_path",
+                payload_context="any",
+            )[0]
+
+        if php_code.skipped or file_read.skipped:
+            self.assertIn("php CLI not found", php_code.reason + file_read.reason)
+        else:
+            self.assertTrue(php_code.attempted)
+            self.assertTrue(php_code.passed)
+            self.assertTrue(file_read.attempted)
+            self.assertTrue(file_read.passed)
+
+    def test_payload_validation_skips_when_php_cli_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = PureWafProjectAgent(cwd=Path(tmp))
+            with patch("PureWaf.agent.shutil.which", return_value=None):
+                result = agent.validate_payloads(
+                    ["echo file_get_contents('/flag');"],
+                    sink_kind="command_exec",
+                    payload_context="php_code",
+                )[0]
+
+        self.assertTrue(result.skipped)
+        self.assertIn("php CLI not found", result.reason)
 
 
 if __name__ == "__main__":

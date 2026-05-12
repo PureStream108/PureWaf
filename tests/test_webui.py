@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import ANY
 from unittest.mock import patch
 
 
@@ -21,6 +22,7 @@ from PureWaf.auto import AutoAnalysisResult
 from PureWaf.agent import ProjectSourceBundle
 from PureWaf.agent import ProjectSourceFile
 from PureWaf.agent import LlmPayloadReview
+from PureWaf.agent import AGENT_STATE_FILENAME
 
 try:
     from PureWaf.webui import _build_result_text
@@ -56,6 +58,7 @@ class WebUiTests(unittest.TestCase):
         self.assertIn("payload stream", body)
         self.assertIn("result summary", body)
         self.assertIn('id="result_output"', body)
+        self.assertIn('id="runtime_clock"', body)
         self.assertIn('id="mode_filter"', body)
         self.assertIn('id="mode_auto"', body)
         self.assertIn('id="panel_filter"', body)
@@ -66,6 +69,7 @@ class WebUiTests(unittest.TestCase):
         self.assertIn('id="agent_toggle"', body)
         self.assertIn("AGENT OFF", body)
         self.assertIn("未开始agent功能", body)
+        self.assertIn("Worked for : 00 m 00 s", body)
         self.assertIn("waf_words", body)
         self.assertNotIn('id="root_result"', body)
         self.assertNotIn('id="flag_result"', body)
@@ -74,6 +78,7 @@ class WebUiTests(unittest.TestCase):
         self.assertIn(".app{height:100vh;min-height:0", body)
         self.assertIn(".main{min-width:0;height:100vh;min-height:0", body)
         self.assertIn("grid-template-rows:auto minmax(0,1.95fr) minmax(0,.95fr)", body)
+        self.assertIn("function formatRuntime(ms)", body)
         self.assertNotIn("html,body{margin:0;height:100%;overflow:hidden", body)
         self.assertIn("PROCESS_PLAYBACK_LINES_PER_TICK = 80", body)
 
@@ -454,11 +459,16 @@ class WebUiTests(unittest.TestCase):
                 self.assertEqual(run_response.status_code, 200)
                 job_id = run_response.get_json()["job_id"]
                 body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
+                state_path = Path(tmp, AGENT_STATE_FILENAME)
+                self.assertTrue(state_path.exists())
+                state = json.loads(state_path.read_text(encoding="utf-8"))
 
-        resolve_mock.assert_called_once_with(fake_bundle.source, use_llm=True)
+        resolve_mock.assert_called_once_with(fake_bundle.source, use_llm=True, agent_session=ANY)
         payloads = self._extract_sse_payloads(body)
         first_lines = payloads[0]["lines"]
         self.assertIn("[*] AGENT: selected PHP files => 1", first_lines)
+        self.assertEqual(state["max_steps"], 10)
+        self.assertIn("purewaf_generation", state["memory"])
 
     @unittest.skipIf(create_app is None, "Flask webui module not available")
     def test_webui_agent_auto_stops_when_sink_llm_fails(self):
@@ -472,17 +482,19 @@ class WebUiTests(unittest.TestCase):
             llm_error="LLM request failed: timeout",
         )
 
-        with (
-            patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis),
-            patch("PureWaf.webui._execute_purewaf") as execute_mock,
-        ):
-            run_response = client.post(
-                "/api/run",
-                json={"mode": "auto", "auto_prompt": "<?php system($_GET['x']); ?>", "agent": True},
-            )
-            self.assertEqual(run_response.status_code, 200)
-            job_id = run_response.get_json()["job_id"]
-            body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("PureWaf.webui.Path.cwd", return_value=Path(tmp)),
+                patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis),
+                patch("PureWaf.webui._execute_purewaf") as execute_mock,
+            ):
+                run_response = client.post(
+                    "/api/run",
+                    json={"mode": "auto", "auto_prompt": "<?php system($_GET['x']); ?>", "agent": True},
+                )
+                self.assertEqual(run_response.status_code, 200)
+                job_id = run_response.get_json()["job_id"]
+                body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
 
         execute_mock.assert_not_called()
         payloads = self._extract_sse_payloads(body)
@@ -555,21 +567,23 @@ class WebUiTests(unittest.TestCase):
             log_text="[+] Final Payload: flag-ok",
         )
 
-        with (
-            patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis),
-            patch("PureWaf.webui._execute_purewaf", return_value=fake_result) as execute_mock,
-            patch(
-                "PureWaf.webui.PureWafProjectAgent.review_payloads",
-                return_value=LlmPayloadReview(used=True, error="LLM request failed: timeout"),
-            ),
-        ):
-            run_response = client.post(
-                "/api/run",
-                json={"mode": "auto", "auto_prompt": "<?php system($_GET['x']); ?>", "agent": True},
-            )
-            self.assertEqual(run_response.status_code, 200)
-            job_id = run_response.get_json()["job_id"]
-            body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("PureWaf.webui.Path.cwd", return_value=Path(tmp)),
+                patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis),
+                patch("PureWaf.webui._execute_purewaf", return_value=fake_result) as execute_mock,
+                patch(
+                    "PureWaf.webui.PureWafProjectAgent.review_payloads",
+                    return_value=LlmPayloadReview(used=True, error="LLM request failed: timeout"),
+                ),
+            ):
+                run_response = client.post(
+                    "/api/run",
+                    json={"mode": "auto", "auto_prompt": "<?php system($_GET['x']); ?>", "agent": True},
+                )
+                self.assertEqual(run_response.status_code, 200)
+                job_id = run_response.get_json()["job_id"]
+                body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
 
         execute_mock.assert_called_once()
         payloads = self._extract_sse_payloads(body)
