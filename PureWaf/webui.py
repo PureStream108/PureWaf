@@ -26,6 +26,8 @@ from .agent import MAX_PROJECT_FILE_BYTES
 from .agent import MAX_PROJECT_FILES
 from .agent import PHP_PROJECT_EXTENSIONS
 from .agent import PROJECT_SKIP_DIRS
+from .agent import AgentStepLimitExceeded
+from .agent import PureWafAgentSession
 from .agent import PureWafProjectAgent
 from .auto import resolve_auto_parameters
 from .PureWaf import PureWafConfig
@@ -33,6 +35,7 @@ from .PureWaf import _append_agent_review_to_result
 from .PureWaf import _choose_final_payload
 from .PureWaf import _format_agent_llm_failure
 from .PureWaf import _format_agent_review_lines
+from .PureWaf import _format_agent_validation_lines
 from .PureWaf import _execute_purewaf
 from .PureWaf import version
 
@@ -104,6 +107,7 @@ PAGE_TEMPLATE = """
     .toolbar-meta{font:500 12px/1.4 "Cascadia Code","JetBrains Mono",monospace;color:#6f6f6f}
     .toolbar-actions{display:flex;align-items:center;gap:8px}
     .pill{padding:5px 8px;border:1px solid var(--line);border-radius:999px;font:600 11px/1 "Cascadia Code","JetBrains Mono",monospace;color:#9b9b9b;background:#111}
+    .runtime-pill{min-width:180px;text-align:center;color:#d7e8ff;border-color:#264c73;background:#0f1823}
     pre{margin:0;white-space:pre-wrap;word-break:break-word}
     .console-wrap{position:relative;flex:1 1 auto;min-height:0;background:
       linear-gradient(180deg,rgba(255,255,255,.03),transparent 18%),
@@ -214,6 +218,7 @@ PAGE_TEMPLATE = """
             <span class="toolbar-title">payload stream</span>
           </div>
           <div class="toolbar-actions">
+            <span id="runtime_clock" class="pill runtime-pill">Worked for : 00 m 00 s</span>
             <span class="pill">local only</span>
             <span class="pill">sse log</span>
           </div>
@@ -254,9 +259,11 @@ PAGE_TEMPLATE = """
     const resetButton = document.getElementById("reset");
     const agentToggleButton = document.getElementById("agent_toggle");
     const agentToggleText = document.getElementById("agent_toggle_text");
+    const runtimeEl = document.getElementById("runtime_clock");
     const processTextNode = document.createTextNode("");
     const PROCESS_PLAYBACK_INTERVAL_MS = 20;
     const PROCESS_PLAYBACK_LINES_PER_TICK = 80;
+    const RUNTIME_IDLE_TEXT = "Worked for : 00 m 00 s";
     let stream = null;
     let reconnectTimer = null;
     let terminalEventReceived = false;
@@ -265,6 +272,8 @@ PAGE_TEMPLATE = """
     let pendingResult = null;
     let pendingError = null;
     let uploadedProjectId = "";
+    let runtimeTimer = null;
+    let runtimeStartedAt = 0;
 
     processEl.textContent = "";
     processEl.appendChild(processTextNode);
@@ -335,6 +344,32 @@ PAGE_TEMPLATE = """
     function setResultText(text){
       resultEl.textContent = text;
       resultEl.scrollTop = 0;
+    }
+    function formatRuntime(ms){
+      const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return `Worked for : ${String(minutes).padStart(2,"0")} m ${String(seconds).padStart(2,"0")} s`;
+    }
+    function renderRuntime(){
+      if(!runtimeEl) return;
+      runtimeEl.textContent = runtimeStartedAt ? formatRuntime(Date.now() - runtimeStartedAt) : RUNTIME_IDLE_TEXT;
+    }
+    function stopRuntimeClock(reset=false){
+      if(runtimeTimer !== null){
+        clearInterval(runtimeTimer);
+        runtimeTimer = null;
+      }
+      if(reset){
+        runtimeStartedAt = 0;
+      }
+      renderRuntime();
+    }
+    function startRuntimeClock(){
+      stopRuntimeClock(true);
+      runtimeStartedAt = Date.now();
+      renderRuntime();
+      runtimeTimer = setInterval(renderRuntime, 1000);
     }
     function clearReconnectTimer(){
       if(reconnectTimer){
@@ -429,12 +464,14 @@ PAGE_TEMPLATE = """
       clearReconnectTimer();
       setProcessText("[*] Running");
       setResultText("[*] 等待结果...");
+      startRuntimeClock();
     }
     function resetOutput(){
       terminalEventReceived = false;
       clearReconnectTimer();
       setProcessText("[*] 还没有运行任务。");
       setResultText("[*] 这里显示结果~");
+      stopRuntimeClock(true);
     }
     function appendLine(text){
       appendLines([text]);
@@ -552,6 +589,7 @@ PAGE_TEMPLATE = """
         }
         if(payload.kind === "result"){
           terminalEventReceived = true;
+          stopRuntimeClock(false);
           pendingResult = payload.result;
           pendingError = null;
           appendLine("[+] 任务完成。");
@@ -562,6 +600,7 @@ PAGE_TEMPLATE = """
         }
         if(payload.kind === "error"){
           terminalEventReceived = true;
+          stopRuntimeClock(false);
           pendingResult = null;
           pendingError = payload.error;
           appendLine(`[!] ${payload.error}`);
@@ -581,6 +620,7 @@ PAGE_TEMPLATE = """
         clearReconnectTimer();
         reconnectTimer = setTimeout(() => {
           if(!stream || terminalEventReceived) return;
+          stopRuntimeClock(false);
           appendLine("[!] 实时连接已断开。");
           statusEl.textContent = "连接中断";
           runButton.disabled = false;
@@ -621,6 +661,7 @@ PAGE_TEMPLATE = """
         const data = await startRun(buildPayload());
         attach(data.job_id);
       }catch(err){
+        stopRuntimeClock(true);
         appendLine(`[!] ${err.message}`);
         statusEl.textContent = "启动失败";
         runButton.disabled = false;
@@ -994,6 +1035,7 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
         execution_config = config
         source_for_review = auto_prompt
         agent_project = None
+        agent_session = PureWafAgentSession(cwd=Path.cwd()) if config.auto and config.agent else None
         if config.auto:
             if config.agent and upload_id:
                 if not (Path.cwd() / ".env").exists():
@@ -1003,23 +1045,65 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                 project_path = upload_store.get_path(upload_id)
                 if project_path is None:
                     raise RuntimeError("uploaded project not found")
-                agent_project = PureWafProjectAgent(cwd=Path.cwd())
+                agent_project = PureWafProjectAgent(cwd=Path.cwd(), session=agent_session)
                 bundle = agent_project.build_project_source(project_path)
                 source_for_review = bundle.source
                 if bundle.analysis_lines:
                     publish({"kind": "lines", "lines": bundle.analysis_lines})
                 if bundle.selection_error:
                     raise RuntimeError(_format_agent_llm_failure(bundle.selection_error))
-                analysis = resolve_auto_parameters(bundle.source, use_llm=True)
+                if agent_session:
+                    agent_session.start_phase(
+                        "stage_1_sink_analysis",
+                        {"source": "uploaded_project", "source_bytes": len(bundle.source)},
+                    )
+                analysis = resolve_auto_parameters(
+                    bundle.source,
+                    use_llm=True,
+                    agent_session=agent_session,
+                )
             else:
-                analysis = resolve_auto_parameters(auto_prompt, use_llm=True)
+                if agent_session:
+                    agent_session.start_phase(
+                        "stage_1_sink_analysis",
+                        {"source": "webui_auto_prompt", "source_bytes": len(auto_prompt)},
+                    )
+                    analysis = resolve_auto_parameters(
+                        auto_prompt,
+                        use_llm=True,
+                        agent_session=agent_session,
+                    )
+                else:
+                    analysis = resolve_auto_parameters(auto_prompt, use_llm=True)
+            if agent_session:
+                agent_session.remember(
+                    "sink_analysis",
+                    {
+                        "sink_kind": analysis.sink_kind,
+                        "sink_function": analysis.sink_function,
+                        "payload_context": analysis.payload_context,
+                        "waf_words": analysis.waf_words,
+                        "waf_chars": analysis.waf_chars,
+                        "waf_regex": analysis.waf_regex,
+                        "error": analysis.error,
+                        "llm_error": analysis.llm_error,
+                    },
+                )
             if analysis.analysis_lines:
                 publish({"kind": "lines", "lines": analysis.analysis_lines})
             if config.agent and analysis.llm_error:
                 raise RuntimeError(_format_agent_llm_failure(analysis.llm_error))
             if analysis.error:
                 if config.agent:
-                    agent_project = agent_project or PureWafProjectAgent(cwd=Path.cwd())
+                    if agent_session:
+                        agent_session.start_phase(
+                            "stage_3_agent_fallback",
+                            {"analysis_error": analysis.error},
+                        )
+                    agent_project = agent_project or PureWafProjectAgent(
+                        cwd=Path.cwd(),
+                        session=agent_session,
+                    )
                     review = agent_project.review_payloads(
                         source_for_review,
                         analysis.analysis_lines + [analysis.error],
@@ -1030,6 +1114,8 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                     if review.error:
                         raise RuntimeError(_format_agent_llm_failure(review.error))
                     if review.fallback_payload:
+                        if agent_session:
+                            agent_session.finish({"fallback_payload": review.fallback_payload})
                         publish(
                             {
                                 "kind": "result",
@@ -1048,6 +1134,11 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                         return
                 raise RuntimeError(analysis.error)
             publish({"kind": "lines", "lines": ["[*] AUTO: executing payload generation"]})
+            if agent_session:
+                agent_session.start_phase(
+                    "stage_2_purewaf_generation",
+                    {"sink_kind": analysis.sink_kind},
+                )
             execution_config = _build_auto_execution_config(config, analysis)
 
         result = _execute_purewaf(
@@ -1058,7 +1149,42 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
             event_callback=event_callback,
         )
         if config.auto and config.agent:
-            agent_project = agent_project or PureWafProjectAgent(cwd=Path.cwd())
+            if agent_session:
+                agent_session.remember(
+                    "purewaf_generation",
+                    {
+                        "shortest_root": result.shortest_root,
+                        "shortest_flag": result.shortest_flag,
+                        "root_payload_count": len(result.root_passed_payloads),
+                        "flag_payload_count": len(result.flag_passed_payloads),
+                    },
+                )
+            agent_project = agent_project or PureWafProjectAgent(
+                cwd=Path.cwd(),
+                session=agent_session,
+            )
+            validation_payloads = []
+            if result.shortest_flag and result.shortest_flag != "N/A":
+                validation_payloads.append(result.shortest_flag)
+            for payload in result.flag_passed_payloads:
+                if payload not in validation_payloads:
+                    validation_payloads.append(payload)
+                if len(validation_payloads) >= 3:
+                    break
+            validation_results = agent_project.validate_payloads(
+                validation_payloads,
+                sink_kind=analysis.sink_kind,
+                payload_context=analysis.payload_context,
+                flagfile=execution_config.flagfile,
+            )
+            validation_lines = _format_agent_validation_lines(validation_results)
+            if validation_lines:
+                publish({"kind": "lines", "lines": validation_lines})
+            if agent_session:
+                agent_session.start_phase(
+                    "stage_2_payload_review",
+                    {"validation_count": len(validation_results)},
+                )
             review = agent_project.review_payloads(
                 source_for_review,
                 analysis.analysis_lines,
@@ -1066,6 +1192,7 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                 shortest_flag=result.shortest_flag,
                 root_payloads=result.root_passed_payloads,
                 flag_payloads=result.flag_passed_payloads,
+                validation_results=validation_results,
             )
             review_lines = _format_agent_review_lines(review)
             if review_lines:
@@ -1073,9 +1200,24 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
             if review.error:
                 raise RuntimeError(_format_agent_llm_failure(review.error))
             _append_agent_review_to_result(result, review)
+            if agent_session:
+                agent_session.finish(
+                    {
+                        "shortest_flag": result.shortest_flag,
+                        "review_valid": review.valid,
+                        "fallback_payload": review.fallback_payload,
+                    }
+                )
         flush_lines()
         publish({"kind": "result", "result": _serialize_result(result)})
+    except AgentStepLimitExceeded as exc:
+        if "agent_session" in locals() and agent_session:
+            agent_session.fail(str(exc))
+        flush_lines()
+        publish({"kind": "error", "error": str(exc)})
     except Exception as exc:
+        if "agent_session" in locals() and agent_session:
+            agent_session.fail(str(exc))
         flush_lines()
         publish({"kind": "error", "error": str(exc)})
     finally:

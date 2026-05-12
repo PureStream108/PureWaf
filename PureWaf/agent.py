@@ -1,11 +1,34 @@
+import base64
 import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib import error
 from urllib import request
 
 
+AGENT_STATE_FILENAME = "purewaf_agent_state.json"
+AGENT_MAX_STEPS = 10
+AGENT_ORIGINAL_TASK = (
+    "PureWaf agent AUTO must run in three stages: identify sinks/vulnerability "
+    "points, hand structured analysis to PureWaf for local payload generation, "
+    "then verify/review generated payloads and provide one fallback payload only "
+    "when local generation cannot produce a usable answer."
+)
+AGENT_SECURITY_BOUNDARY = (
+    "PureWaf is a CTF and education-oriented PHP RCE/WAF-bypass payload generator, "
+    "not a scanner, target prober, or interactive shell. Use only supplied project "
+    "source and PureWaf outputs. Do not read secrets from .env except LLM config, "
+    "do not write payloads into the local library, and do not use arbitrary user "
+    "tools outside the payload validation sandbox."
+)
 ALLOWED_SINK_KINDS = {"command_exec", "file_read_path", "file_write_upload"}
 ALLOWED_PAYLOAD_CONTEXTS = {"shell_command", "php_code", "any"}
 MIN_CONFIDENCE = 0.6
@@ -14,6 +37,150 @@ PROJECT_SKIP_DIRS = {".git", "__MACOSX", "node_modules", "vendor"}
 MAX_PROJECT_FILES = 80
 MAX_PROJECT_FILE_BYTES = 1024 * 1024
 MAX_PROJECT_SOURCE_BYTES = 2 * 1024 * 1024
+MAX_AGENT_HISTORY = 24
+MAX_AGENT_MEMORY_VALUE = 500
+MAX_AGENT_SUMMARY_VALUE = 320
+MAX_VALIDATION_PAYLOADS = 3
+VALIDATION_TIMEOUT_SECONDS = 5
+
+
+class AgentStepLimitExceeded(RuntimeError):
+    """Raised when an agent AUTO session reaches its bounded step budget."""
+
+
+def _now_epoch() -> float:
+    return round(time.time(), 3)
+
+
+def _compact_text(value, limit: int = MAX_AGENT_SUMMARY_VALUE) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 3, 0)] + "..."
+
+
+def _compact_value(value, limit: int = MAX_AGENT_SUMMARY_VALUE):
+    if isinstance(value, dict):
+        compacted = {}
+        for key, item in list(value.items())[:12]:
+            compacted[str(key)] = _compact_value(item, limit=limit)
+        return compacted
+    if isinstance(value, (list, tuple, set)):
+        return [_compact_value(item, limit=limit) for item in list(value)[:12]]
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return _compact_text(value, limit=limit)
+
+
+class PureWafAgentSession:
+    """Small persisted state/memory file for one bounded agent AUTO run."""
+
+    def __init__(
+        self,
+        cwd: Optional[Path] = None,
+        max_steps: int = AGENT_MAX_STEPS,
+        state_filename: str = AGENT_STATE_FILENAME,
+    ):
+        self.cwd = Path(cwd) if cwd is not None else Path.cwd()
+        self.max_steps = int(max_steps)
+        self.state_path = self.cwd / state_filename
+        self.session_id = uuid.uuid4().hex
+        self.current_step = 0
+        self.phase = "initialized"
+        self.status = "running"
+        self.history: List[Dict[str, object]] = []
+        self.memory: Dict[str, object] = {}
+        self.tool_results: List[Dict[str, object]] = []
+        self.error = ""
+        self.write_state()
+
+    def start_phase(self, phase: str, summary=None):
+        self.phase = str(phase or "").strip() or self.phase
+        self._append_history(
+            {
+                "step": self.current_step,
+                "phase": self.phase,
+                "action": "start_phase",
+                "summary": _compact_value(summary),
+                "time": _now_epoch(),
+            }
+        )
+        self.write_state()
+
+    def step(self, phase: str, action: str, summary=None) -> int:
+        if self.current_step >= self.max_steps:
+            self.status = "step_limit_exceeded"
+            self.error = f"agent step limit exceeded: {self.current_step}/{self.max_steps}"
+            self.write_state()
+            raise AgentStepLimitExceeded(self.error)
+        self.current_step += 1
+        self.phase = str(phase or "").strip() or self.phase
+        self._append_history(
+            {
+                "step": self.current_step,
+                "phase": self.phase,
+                "action": _compact_text(action, limit=80),
+                "summary": _compact_value(summary),
+                "time": _now_epoch(),
+            }
+        )
+        self.write_state()
+        return self.current_step
+
+    def remember(self, key: str, value):
+        clean_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(key or "").strip())[:80]
+        if not clean_key:
+            return
+        self.memory[clean_key] = _compact_value(value, limit=MAX_AGENT_MEMORY_VALUE)
+        self.write_state()
+
+    def record_tool_result(self, tool: str, summary):
+        self.tool_results.append(
+            {
+                "tool": _compact_text(tool, limit=80),
+                "summary": _compact_value(summary),
+                "time": _now_epoch(),
+            }
+        )
+        self.tool_results = self.tool_results[-MAX_AGENT_HISTORY:]
+        self.write_state()
+
+    def fail(self, error_text: str):
+        self.status = "failed"
+        self.error = _compact_text(error_text, limit=MAX_AGENT_MEMORY_VALUE)
+        self.write_state()
+
+    def finish(self, summary=None):
+        self.status = "completed"
+        self.remember("final_summary", summary or {})
+        self.write_state()
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "max_steps": self.max_steps,
+            "current_step": self.current_step,
+            "phase": self.phase,
+            "status": self.status,
+            "error": self.error,
+            "memory": self.memory,
+            "history": self.history[-MAX_AGENT_HISTORY:],
+            "tool_results": self.tool_results[-MAX_AGENT_HISTORY:],
+        }
+
+    def write_state(self):
+        self.cwd.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.state_path.with_name(self.state_path.name + ".tmp")
+        data = self.as_dict()
+        tmp_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, self.state_path)
+
+    def _append_history(self, item: Dict[str, object]):
+        self.history.append(item)
+        self.history = self.history[-MAX_AGENT_HISTORY:]
 
 
 @dataclass(frozen=True)
@@ -76,6 +243,30 @@ class LlmPayloadReview:
 
 
 @dataclass(frozen=True)
+class PayloadValidationResult:
+    payload: str
+    sink_kind: str = ""
+    payload_context: str = "any"
+    attempted: bool = False
+    passed: bool = False
+    skipped: bool = False
+    reason: str = ""
+    output_excerpt: str = ""
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "payload": _compact_text(self.payload, limit=180),
+            "sink_kind": self.sink_kind,
+            "payload_context": self.payload_context,
+            "attempted": self.attempted,
+            "passed": self.passed,
+            "skipped": self.skipped,
+            "reason": _compact_text(self.reason, limit=220),
+            "output_excerpt": _compact_text(self.output_excerpt, limit=220),
+        }
+
+
+@dataclass(frozen=True)
 class _LlmSettings:
     api_key: str
     base_url: str
@@ -85,14 +276,23 @@ class _LlmSettings:
 class PureWafLlmSinkAgent:
     """Optional LLM-assisted sink detection for PureWaf AUTO mode."""
 
-    def __init__(self, cwd: Optional[Path] = None, timeout: int = 20, skill_path: Optional[Path] = None):
+    def __init__(
+        self,
+        cwd: Optional[Path] = None,
+        timeout: int = 20,
+        skill_path: Optional[Path] = None,
+        session: Optional[PureWafAgentSession] = None,
+    ):
         self.cwd = Path(cwd) if cwd is not None else Path.cwd()
         self.timeout = timeout
         self.skill_path = Path(skill_path) if skill_path is not None else None
+        self.session = session
 
     def analyze_php(self, source: str) -> LlmSinkAnalysis:
         settings, error = self._load_settings()
         if error:
+            if self.session:
+                self.session.record_tool_result("llm_sink_analysis", {"error": error})
             return LlmSinkAnalysis(error=error)
 
         content, endpoint, chat_error = self._chat_completion(
@@ -101,6 +301,8 @@ class PureWafLlmSinkAgent:
             max_tokens=900,
         )
         if chat_error:
+            if self.session:
+                self.session.record_tool_result("llm_sink_analysis", {"error": chat_error})
             return LlmSinkAnalysis(
                 enabled=True,
                 used=True,
@@ -112,6 +314,8 @@ class PureWafLlmSinkAgent:
         try:
             candidates = self._parse_candidates(content)
         except Exception as exc:
+            if self.session:
+                self.session.record_tool_result("llm_sink_analysis", {"error": str(exc)})
             return LlmSinkAnalysis(
                 enabled=True,
                 used=True,
@@ -120,6 +324,15 @@ class PureWafLlmSinkAgent:
                 error=f"LLM response invalid: {exc}",
             )
 
+        if self.session:
+            self.session.record_tool_result(
+                "llm_sink_analysis",
+                {
+                    "model": settings.model,
+                    "candidate_count": len(candidates),
+                    "candidates": [candidate.as_dict() for candidate in candidates[:3]],
+                },
+            )
         return LlmSinkAnalysis(
             enabled=True,
             used=True,
@@ -135,6 +348,17 @@ class PureWafLlmSinkAgent:
         max_tokens: int,
     ) -> Tuple[str, str, str]:
         endpoint = self._normalize_chat_completions_url(settings.base_url)
+        if self.session:
+            self.session.step(
+                "llm_call",
+                "chat_completion",
+                {
+                    "model": settings.model,
+                    "endpoint": endpoint,
+                    "messages": len(messages),
+                    "max_tokens": max_tokens,
+                },
+            )
         body = {
             "model": settings.model,
             "messages": messages,
@@ -154,6 +378,8 @@ class PureWafLlmSinkAgent:
         try:
             with request.urlopen(req, timeout=self.timeout) as response:
                 raw = response.read().decode("utf-8", "replace")
+        except error.HTTPError as exc:
+            return "", endpoint, self._format_http_error(exc, endpoint, settings)
         except Exception as exc:
             return "", endpoint, f"LLM request failed: {exc}"
 
@@ -164,12 +390,47 @@ class PureWafLlmSinkAgent:
             return "", endpoint, f"LLM response invalid: {exc}"
         return str(content), endpoint, ""
 
+    @staticmethod
+    def _format_http_error(exc: error.HTTPError, endpoint: str, settings: "_LlmSettings") -> str:
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        body = re.sub(r"\s+", " ", body).strip()
+        if settings.api_key:
+            body = body.replace(settings.api_key, "[REDACTED_API_KEY]")
+        body = body[:700]
+        status = f"HTTP {getattr(exc, 'code', '')} {getattr(exc, 'reason', '')}".strip()
+        details = [status, f"endpoint={endpoint}", f"model={settings.model}"]
+        if body:
+            details.append(f"response={body}")
+        return "LLM request failed: " + " | ".join(details)
+
+    def _immutable_context(self, stage_goal: str) -> str:
+        step_text = f"Max loop/step budget: {AGENT_MAX_STEPS}."
+        if self.session:
+            step_text = (
+                f"Current bounded agent step: {self.session.current_step}/"
+                f"{self.session.max_steps}."
+            )
+        return (
+            "Immutable PureWaf agent context:\n"
+            f"- Original task: {AGENT_ORIGINAL_TASK}\n"
+            f"- Security boundary: {AGENT_SECURITY_BOUNDARY}\n"
+            f"- Current stage goal: {stage_goal}\n"
+            f"- {step_text}"
+        )
+
     def build_messages(self, source: str) -> List[Dict[str, str]]:
         skill_guide = self._load_skill_guide()
         return [
             {
                 "role": "system",
                 "content": (
+                    self._immutable_context(
+                        "Stage 1 sink and vulnerability-point identification only."
+                    )
+                    + "\n\n"
                     "You are a CTF Web expert assisting PureWaf AUTO sink analysis. PureWaf is "
                     "a CTF and education-oriented PHP RCE/WAF-bypass payload generator, not a scanner. "
                     "The primary CTF objective is to identify how user-controlled data can reach "
@@ -373,6 +634,8 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
 
         files: List[ProjectSourceFile] = []
         for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                continue
             if not path.is_file():
                 continue
             rel_parts = path.relative_to(root).parts
@@ -399,6 +662,11 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         return files
 
     def build_project_source(self, project_dir: Path) -> ProjectSourceBundle:
+        if self.session:
+            self.session.start_phase(
+                "stage_1_project_source",
+                {"project_dir": str(project_dir), "allowed_extensions": sorted(PHP_PROJECT_EXTENSIONS)},
+            )
         root = Path(project_dir).resolve()
         files = self.scan_project_files(root)
         selected_paths, selection_error = self.select_project_files(files)
@@ -417,6 +685,24 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         if selected_paths:
             lines.append(f"[*] AGENT: selected paths => {', '.join(selected_paths[:12])}")
 
+        if self.session:
+            self.session.remember(
+                "project_source",
+                {
+                    "scanned_php_files": len(files),
+                    "selected_php_files": len(selected_files),
+                    "selected_paths": selected_paths[:12],
+                    "selection_error": selection_error,
+                },
+            )
+            self.session.record_tool_result(
+                "project_source_bundle",
+                {
+                    "source_bytes": len(source.encode("utf-8", "replace")),
+                    "selected_php_files": len(selected_files),
+                },
+            )
+
         return ProjectSourceBundle(
             root=root,
             files=selected_files,
@@ -432,6 +718,8 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
     ) -> Tuple[List[str], str]:
         settings, error = self._load_settings()
         if error:
+            if self.session:
+                self.session.record_tool_result("llm_project_selection", {"error": error})
             return [], error
 
         content, _endpoint, chat_error = self._chat_completion(
@@ -440,13 +728,22 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             max_tokens=900,
         )
         if chat_error:
+            if self.session:
+                self.session.record_tool_result("llm_project_selection", {"error": chat_error})
             return [], chat_error
 
         valid_paths = {file.path for file in files}
         try:
             selected = self._parse_selected_paths(content, valid_paths)
         except Exception as exc:
+            if self.session:
+                self.session.record_tool_result("llm_project_selection", {"error": str(exc)})
             return [], f"LLM project selection invalid: {exc}"
+        if self.session:
+            self.session.record_tool_result(
+                "llm_project_selection",
+                {"selected_files": selected[:12], "available_files": len(files)},
+            )
         return selected, ""
 
     def build_project_selection_messages(
@@ -464,6 +761,10 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             {
                 "role": "system",
                 "content": (
+                    self._immutable_context(
+                        "Stage 1 project file selection for sink identification."
+                    )
+                    + "\n\n"
                     "You are a CTF Web expert selecting PHP files for PureWaf agent AUTO analysis. "
                     "The primary objective is to understand the path to getting FLAG. "
                     "Choose only project files that are relevant to user input, filtering, "
@@ -518,9 +819,12 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         shortest_flag: str = "N/A",
         root_payloads: Optional[Sequence[str]] = None,
         flag_payloads: Optional[Sequence[str]] = None,
+        validation_results: Optional[Sequence[PayloadValidationResult]] = None,
     ) -> LlmPayloadReview:
         settings, error = self._load_settings()
         if error:
+            if self.session:
+                self.session.record_tool_result("llm_payload_review", {"error": error})
             return LlmPayloadReview(error=error)
 
         content, endpoint, chat_error = self._chat_completion(
@@ -532,10 +836,13 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 shortest_flag=shortest_flag,
                 root_payloads=root_payloads or [],
                 flag_payloads=flag_payloads or [],
+                validation_results=validation_results or [],
             ),
             max_tokens=1000,
         )
         if chat_error:
+            if self.session:
+                self.session.record_tool_result("llm_payload_review", {"error": chat_error})
             return LlmPayloadReview(
                 used=True,
                 model=settings.model,
@@ -546,6 +853,8 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         try:
             review = self._parse_payload_review(content)
         except Exception as exc:
+            if self.session:
+                self.session.record_tool_result("llm_payload_review", {"error": str(exc)})
             return LlmPayloadReview(
                 used=True,
                 model=settings.model,
@@ -555,6 +864,15 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         review.used = True
         review.model = settings.model
         review.endpoint = endpoint
+        if self.session:
+            self.session.record_tool_result(
+                "llm_payload_review",
+                {
+                    "valid": review.valid,
+                    "has_fallback": bool(review.fallback_payload),
+                    "notes": review.notes,
+                },
+            )
         return review
 
     def build_payload_review_messages(
@@ -565,6 +883,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         shortest_flag: str,
         root_payloads: Sequence[str],
         flag_payloads: Sequence[str],
+        validation_results: Sequence[PayloadValidationResult] = (),
     ) -> List[Dict[str, str]]:
         final_payload = shortest_flag if shortest_flag and shortest_flag != "N/A" else ""
         payload_summary = {
@@ -574,15 +893,21 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             "root_payloads": list(root_payloads[:8]),
             "flag_payloads": list(flag_payloads[:8]),
             "analysis_lines": list(analysis_lines[-20:]),
+            "validation_results": [item.as_dict() for item in list(validation_results)[:8]],
         }
         return [
             {
                 "role": "system",
                 "content": (
+                    self._immutable_context(
+                        "Stage 2 generated-payload review, and Stage 3 fallback only if needed."
+                    )
+                    + "\n\n"
                     "You are a CTF Web expert reviewing PureWaf-generated payloads for a PHP "
                     "RCE/WAF-bypass challenge. Your primary objective is reading /flag. Use only "
-                    "the supplied source and PureWaf output. First identify whether the detected "
-                    "sink/filter context can execute a payload that reads /flag. If PureWaf produced "
+                    "the supplied source, PureWaf output, and validation summary. First identify "
+                    "whether the detected sink/filter context can execute a payload that reads /flag. "
+                    "If PureWaf produced "
                     "a usable /flag payload, set valid=true and leave fallback_payload empty. If "
                     "PureWaf produced no usable /flag payload, or the provided payload does not fit "
                     "the detected sink/filter context, set valid=false and provide exactly one "
@@ -601,6 +926,224 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 ),
             },
         ]
+
+    def validate_payloads(
+        self,
+        payloads: Sequence[str],
+        sink_kind: str = "",
+        payload_context: str = "any",
+        flagfile: str = "/flag",
+    ) -> List[PayloadValidationResult]:
+        candidates = [
+            str(payload or "").strip()
+            for payload in payloads
+            if str(payload or "").strip() and str(payload or "").strip() != "N/A"
+        ][:MAX_VALIDATION_PAYLOADS]
+        if self.session:
+            self.session.step(
+                "payload_validation",
+                "php_cli_sandbox",
+                {
+                    "candidate_count": len(candidates),
+                    "sink_kind": sink_kind,
+                    "payload_context": payload_context,
+                    "network_php_allowed": True,
+                },
+            )
+
+        if not candidates:
+            result = PayloadValidationResult(
+                payload="",
+                sink_kind=sink_kind,
+                payload_context=payload_context,
+                skipped=True,
+                reason="no payload candidates to validate",
+            )
+            self._record_validation_results([result])
+            return [result]
+
+        php_bin = shutil.which("php")
+        if not php_bin:
+            results = [
+                PayloadValidationResult(
+                    payload=payload,
+                    sink_kind=sink_kind,
+                    payload_context=payload_context,
+                    skipped=True,
+                    reason="php CLI not found",
+                )
+                for payload in candidates
+            ]
+            self._record_validation_results(results)
+            return results
+
+        results: List[PayloadValidationResult] = []
+        with tempfile.TemporaryDirectory(prefix="purewaf-agent-") as tmp:
+            sandbox = Path(tmp)
+            flag_path = sandbox / "flag"
+            flag_marker = "PUREWAF_AGENT_FLAG_OK"
+            flag_path.write_text(flag_marker, encoding="utf-8")
+            for payload in candidates:
+                results.append(
+                    self._validate_one_payload(
+                        php_bin=php_bin,
+                        sandbox=sandbox,
+                        payload=payload,
+                        sink_kind=sink_kind,
+                        payload_context=payload_context,
+                        flagfile=flagfile,
+                        sandbox_flag=flag_path,
+                        flag_marker=flag_marker,
+                    )
+                )
+
+        self._record_validation_results(results)
+        return results
+
+    def _record_validation_results(self, results: Sequence[PayloadValidationResult]):
+        if self.session:
+            self.session.record_tool_result(
+                "php_cli_payload_validation",
+                {
+                    "attempted": sum(1 for item in results if item.attempted),
+                    "passed": sum(1 for item in results if item.passed),
+                    "skipped": sum(1 for item in results if item.skipped),
+                    "results": [item.as_dict() for item in list(results)[:5]],
+                },
+            )
+
+    def _validate_one_payload(
+        self,
+        php_bin: str,
+        sandbox: Path,
+        payload: str,
+        sink_kind: str,
+        payload_context: str,
+        flagfile: str,
+        sandbox_flag: Path,
+        flag_marker: str,
+    ) -> PayloadValidationResult:
+        normalized_context = (payload_context or "any").strip()
+        normalized_kind = (sink_kind or "").strip()
+        validation_mode = self._choose_validation_mode(payload, normalized_kind, normalized_context)
+        if not validation_mode:
+            return PayloadValidationResult(
+                payload=payload,
+                sink_kind=sink_kind,
+                payload_context=payload_context,
+                skipped=True,
+                reason="payload context is not supported by PHP CLI sandbox validation",
+            )
+
+        sandbox_payload = self._sandbox_flag_payload(payload, flagfile, sandbox_flag)
+        script = self._build_validation_script(validation_mode, sandbox_payload)
+        script_path = sandbox / f"validate-{uuid.uuid4().hex}.php"
+        script_path.write_text(script, encoding="utf-8")
+
+        try:
+            proc = subprocess.run(
+                [php_bin, str(script_path)],
+                cwd=str(sandbox),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=VALIDATION_TIMEOUT_SECONDS,
+            )
+            output = proc.stdout.decode("utf-8", "replace")
+        except subprocess.TimeoutExpired:
+            return PayloadValidationResult(
+                payload=payload,
+                sink_kind=sink_kind,
+                payload_context=payload_context,
+                attempted=True,
+                reason=f"validation timed out after {VALIDATION_TIMEOUT_SECONDS}s",
+            )
+        except Exception as exc:
+            return PayloadValidationResult(
+                payload=payload,
+                sink_kind=sink_kind,
+                payload_context=payload_context,
+                skipped=True,
+                reason=f"validation failed to start: {exc}",
+            )
+
+        expected_b64 = base64.b64encode(flag_marker.encode("utf-8")).decode("ascii")
+        passed = flag_marker in output or expected_b64 in output
+        reason = "payload produced sandbox flag marker" if passed else "sandbox output did not contain flag marker"
+        return PayloadValidationResult(
+            payload=payload,
+            sink_kind=sink_kind,
+            payload_context=payload_context,
+            attempted=True,
+            passed=passed,
+            reason=reason,
+            output_excerpt=output,
+        )
+
+    @staticmethod
+    def _choose_validation_mode(payload: str, sink_kind: str, payload_context: str) -> str:
+        lowered = (payload or "").strip().lower()
+        if sink_kind == "file_read_path":
+            return "file_read_path"
+        if payload_context == "php_code":
+            return "php_code"
+        if payload_context == "shell_command" and os.name != "nt":
+            return "shell_command"
+        if payload_context == "any":
+            if lowered.startswith(("php://", "file://", "data://")) or "/flag" in lowered:
+                return "file_read_path"
+            if lowered.startswith(("<?", "system(", "echo ", "$", "eval(", "assert(")):
+                return "php_code"
+        return ""
+
+    @staticmethod
+    def _sandbox_flag_payload(payload: str, flagfile: str, sandbox_flag: Path) -> str:
+        flag_path = sandbox_flag.as_posix()
+        rewritten = str(payload or "")
+        configured_flag = flagfile or ""
+        if configured_flag and configured_flag in rewritten:
+            return rewritten.replace(configured_flag, flag_path)
+        if "/flag" in rewritten:
+            rewritten = rewritten.replace("/flag", flag_path)
+        return rewritten
+
+    @staticmethod
+    def _build_validation_script(mode: str, payload: str) -> str:
+        encoded_payload = base64.b64encode(payload.encode("utf-8", "replace")).decode("ascii")
+        if mode == "file_read_path":
+            runner = """
+$path = base64_decode($payload_b64);
+$out = @file_get_contents($path);
+if ($out !== false) {
+    echo $out;
+}
+"""
+        elif mode == "shell_command":
+            runner = """
+$cmd = base64_decode($payload_b64);
+ob_start();
+system($cmd);
+$out = ob_get_clean();
+echo $out;
+"""
+        else:
+            runner = """
+$payload = base64_decode($payload_b64);
+$candidate = __DIR__ . DIRECTORY_SEPARATOR . 'candidate-' . bin2hex(random_bytes(4)) . '.php';
+if (!preg_match('/^\\s*<\\?(php|=)?/i', $payload)) {
+    $payload = "<?php\\n" . $payload;
+}
+file_put_contents($candidate, $payload);
+ob_start();
+try {
+    include $candidate;
+} catch (Throwable $e) {
+    echo "PUREWAF_AGENT_VALIDATION_ERROR:" . $e->getMessage();
+}
+$out = ob_get_clean();
+echo $out;
+"""
+        return "<?php\n$payload_b64 = '" + encoded_payload + "';\n" + runner
 
     @staticmethod
     def _parse_payload_review(content: str) -> LlmPayloadReview:

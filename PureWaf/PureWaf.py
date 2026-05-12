@@ -15,7 +15,7 @@ from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "2.0.0"
+version = "2.0.1"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
@@ -582,6 +582,33 @@ def _format_agent_review_lines(review):
     return lines
 
 
+def _format_agent_validation_lines(validation_results):
+    lines = []
+    if not validation_results:
+        return lines
+    passed = sum(1 for item in validation_results if getattr(item, "passed", False))
+    attempted = sum(1 for item in validation_results if getattr(item, "attempted", False))
+    skipped = sum(1 for item in validation_results if getattr(item, "skipped", False))
+    if passed:
+        status = "passed"
+    elif attempted:
+        status = "failed"
+    else:
+        status = "skipped"
+    lines.append(
+        "[*] AGENT: payload validation => "
+        f"{status} attempted={attempted} passed={passed} skipped={skipped}"
+    )
+    first_reason = ""
+    for item in validation_results:
+        first_reason = getattr(item, "reason", "") or ""
+        if first_reason:
+            break
+    if first_reason:
+        lines.append(f"[*] AGENT: validation notes => {first_reason}")
+    return lines
+
+
 def _format_agent_llm_failure(error: str):
     detail = str(error or "").strip()
     return f"LLM调用失败: {detail}" if detail else "LLM调用失败"
@@ -629,58 +656,123 @@ def _execute_agent_auto_from_project(
     output_logger=None,
     show_progress=True,
 ):
+    from .agent import AgentStepLimitExceeded
+    from .agent import PureWafAgentSession
     from .agent import PureWafProjectAgent
     from .auto import resolve_auto_parameters
 
-    project_agent = PureWafProjectAgent(cwd=Path.cwd())
-    bundle = project_agent.build_project_source(Path.cwd() / "pure")
-    if output_logger:
-        for line in bundle.analysis_lines:
-            output_logger.info(line)
-    if bundle.selection_error:
-        return _format_agent_llm_failure(bundle.selection_error)
+    session = PureWafAgentSession(cwd=Path.cwd())
+    try:
+        project_agent = PureWafProjectAgent(cwd=Path.cwd(), session=session)
+        bundle = project_agent.build_project_source(Path.cwd() / "pure")
+        if output_logger:
+            for line in bundle.analysis_lines:
+                output_logger.info(line)
+        if bundle.selection_error:
+            session.fail(bundle.selection_error)
+            return _format_agent_llm_failure(bundle.selection_error)
 
-    analysis = resolve_auto_parameters(bundle.source, use_llm=True)
-    if output_logger and analysis.analysis_lines:
-        for line in analysis.analysis_lines:
-            output_logger.info(line)
-    if analysis.llm_error:
-        return _format_agent_llm_failure(analysis.llm_error)
+        session.start_phase("stage_1_sink_analysis", {"source_bytes": len(bundle.source)})
+        analysis = resolve_auto_parameters(bundle.source, use_llm=True, agent_session=session)
+        session.remember(
+            "sink_analysis",
+            {
+                "sink_kind": analysis.sink_kind,
+                "sink_function": analysis.sink_function,
+                "payload_context": analysis.payload_context,
+                "waf_words": analysis.waf_words,
+                "waf_chars": analysis.waf_chars,
+                "waf_regex": analysis.waf_regex,
+                "error": analysis.error,
+                "llm_error": analysis.llm_error,
+            },
+        )
+        if output_logger and analysis.analysis_lines:
+            for line in analysis.analysis_lines:
+                output_logger.info(line)
+        if analysis.llm_error:
+            session.fail(analysis.llm_error)
+            return _format_agent_llm_failure(analysis.llm_error)
 
-    if analysis.error:
+        if analysis.error:
+            session.start_phase("stage_3_agent_fallback", {"analysis_error": analysis.error})
+            review = project_agent.review_payloads(
+                bundle.source,
+                analysis.analysis_lines + [analysis.error],
+            )
+            if output_logger:
+                for line in _format_agent_review_lines(review):
+                    output_logger.info(line)
+            if review.error:
+                session.fail(review.error)
+                return _format_agent_llm_failure(review.error)
+            session.finish({"fallback_payload": review.fallback_payload, "analysis_error": analysis.error})
+            return review.fallback_payload or analysis.error
+
+        session.start_phase("stage_2_purewaf_generation", {"sink_kind": analysis.sink_kind})
+        execution_config = _build_agent_auto_execution_config(config, analysis)
+        result = _execute_purewaf(
+            execution_config,
+            output_logger=output_logger,
+            show_progress=show_progress,
+            sleep_before_run=False,
+        )
+        session.remember(
+            "purewaf_generation",
+            {
+                "shortest_root": result.shortest_root,
+                "shortest_flag": result.shortest_flag,
+                "root_payload_count": len(result.root_passed_payloads),
+                "flag_payload_count": len(result.flag_passed_payloads),
+            },
+        )
+
+        validation_payloads = []
+        if result.shortest_flag and result.shortest_flag != "N/A":
+            validation_payloads.append(result.shortest_flag)
+        for payload in result.flag_passed_payloads:
+            if payload not in validation_payloads:
+                validation_payloads.append(payload)
+            if len(validation_payloads) >= 3:
+                break
+        validation_results = project_agent.validate_payloads(
+            validation_payloads,
+            sink_kind=analysis.sink_kind,
+            payload_context=analysis.payload_context,
+            flagfile=execution_config.flagfile,
+        )
+        if output_logger:
+            for line in _format_agent_validation_lines(validation_results):
+                output_logger.info(line)
+
+        session.start_phase("stage_2_payload_review", {"validation_count": len(validation_results)})
         review = project_agent.review_payloads(
             bundle.source,
-            analysis.analysis_lines + [analysis.error],
+            analysis.analysis_lines,
+            shortest_root=result.shortest_root,
+            shortest_flag=result.shortest_flag,
+            root_payloads=result.root_passed_payloads,
+            flag_payloads=result.flag_passed_payloads,
+            validation_results=validation_results,
         )
+        _append_agent_review_to_result(result, review)
         if output_logger:
             for line in _format_agent_review_lines(review):
                 output_logger.info(line)
         if review.error:
+            session.fail(review.error)
             return _format_agent_llm_failure(review.error)
-        return review.fallback_payload or analysis.error
-
-    execution_config = _build_agent_auto_execution_config(config, analysis)
-    result = _execute_purewaf(
-        execution_config,
-        output_logger=output_logger,
-        show_progress=show_progress,
-        sleep_before_run=False,
-    )
-    review = project_agent.review_payloads(
-        bundle.source,
-        analysis.analysis_lines,
-        shortest_root=result.shortest_root,
-        shortest_flag=result.shortest_flag,
-        root_payloads=result.root_passed_payloads,
-        flag_payloads=result.flag_passed_payloads,
-    )
-    _append_agent_review_to_result(result, review)
-    if output_logger:
-        for line in _format_agent_review_lines(review):
-            output_logger.info(line)
-    if review.error:
-        return _format_agent_llm_failure(review.error)
-    return result.shortest_flag
+        session.finish(
+            {
+                "shortest_flag": result.shortest_flag,
+                "review_valid": review.valid,
+                "fallback_payload": review.fallback_payload,
+            }
+        )
+        return result.shortest_flag
+    except AgentStepLimitExceeded as exc:
+        session.fail(str(exc))
+        return str(exc)
 
 
 def _launch_webui(config: PureWafConfig):

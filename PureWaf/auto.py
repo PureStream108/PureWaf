@@ -211,7 +211,7 @@ class _FilterAccumulator:
         return bool(self.words or self.chars or self.regexes or self.limit_length is not None)
 
 
-def analyze_php_auto(source: str, use_llm: bool = False) -> AutoAnalysisResult:
+def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None) -> AutoAnalysisResult:
     result = AutoAnalysisResult()
     result.analysis_lines.append("[*] AUTO: analyzing PHP source")
 
@@ -237,7 +237,11 @@ def analyze_php_auto(source: str, use_llm: bool = False) -> AutoAnalysisResult:
     if result.php_version_hint is not None:
         result.analysis_lines.append(f"[*] AUTO: php_version_hint => {result.php_version_hint}")
 
-    sink = _detect_llm_sink(source, global_text, assignments, result) if use_llm else None
+    sink = (
+        _detect_llm_sink(source, global_text, assignments, result, agent_session=agent_session)
+        if use_llm
+        else None
+    )
     if sink is None:
         sink = _detect_sink(global_text, assignments, array_sources)
     if sink is None:
@@ -443,6 +447,7 @@ def _detect_llm_sink(
     global_text: str,
     assignments: Dict[str, List[str]],
     result: AutoAnalysisResult,
+    agent_session=None,
 ) -> Optional[_SinkInfo]:
     try:
         from .agent import PureWafLlmSinkAgent
@@ -451,7 +456,7 @@ def _detect_llm_sink(
         result.analysis_lines.append(f"[*] AUTO: {result.llm_error}")
         return None
 
-    analysis = PureWafLlmSinkAgent().analyze_php(source)
+    analysis = PureWafLlmSinkAgent(session=agent_session).analyze_php(source)
     result.llm_used = analysis.used
     result.llm_error = analysis.error
     result.llm_sink_candidates = [candidate.as_dict() for candidate in analysis.candidates]
@@ -510,8 +515,8 @@ def _sink_from_llm_candidate(
     return None
 
 
-def resolve_auto_parameters(source: str, use_llm: bool = False) -> AutoAnalysisResult:
-    result = analyze_php_auto(source, use_llm=use_llm)
+def resolve_auto_parameters(source: str, use_llm: bool = False, agent_session=None) -> AutoAnalysisResult:
+    result = analyze_php_auto(source, use_llm=use_llm, agent_session=agent_session)
     if result.error:
         return result
 
