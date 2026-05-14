@@ -1,9 +1,12 @@
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple
 
 from . import bypass
 from . import utils
+
+if TYPE_CHECKING:
+    from .agent import LlmWafExtraction
 
 _COMMAND_SINKS = {
     "assert",
@@ -46,7 +49,7 @@ _REGEX_FILTER_CALLS = {"preg_match", "preg_match_all"}
 _IN_ARRAY_CALLS = {"in_array", "array_search"}
 _USER_INPUT_RE = re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|FILES|SERVER)(?:\s*\[[^\]]+\])?")
 _VAR_RE = re.compile(r"\$[A-Za-z_]\w*")
-_LEN_FILTER_RE_TEMPLATE = r"(?:strlen|mb_strlen)\s*\(\s*{target}\s*\)\s*(>=|>)\s*(\d+)"
+_LEN_FILTER_RE_TEMPLATE = r"(?:strlen|mb_strlen)\s*\(\s*{target}\s*\)\s*(>=|>|<=|<)\s*(\d+)"
 _REPLACE_FILTER_CALLS = {"str_replace", "str_ireplace"}
 _PREPROCESSOR_CALLS = {
     "strtolower",
@@ -120,6 +123,7 @@ class AutoAnalysisResult:
     llm_used: bool = False
     llm_error: str = ""
     llm_sink_candidates: List[Dict[str, object]] = field(default_factory=list)
+    llm_waf_extraction: Optional["LlmWafExtraction"] = None
 
     def to_context(self) -> AutoContext:
         return AutoContext(
@@ -211,7 +215,7 @@ class _FilterAccumulator:
         return bool(self.words or self.chars or self.regexes or self.limit_length is not None)
 
 
-def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None) -> AutoAnalysisResult:
+def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, precomputed_llm_analysis=None) -> AutoAnalysisResult:
     result = AutoAnalysisResult()
     result.analysis_lines.append("[*] AUTO: analyzing PHP source")
 
@@ -237,11 +241,13 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None) -> 
     if result.php_version_hint is not None:
         result.analysis_lines.append(f"[*] AUTO: php_version_hint => {result.php_version_hint}")
 
-    sink = (
-        _detect_llm_sink(source, global_text, assignments, result, agent_session=agent_session)
-        if use_llm
-        else None
-    )
+    sink = None
+    if precomputed_llm_analysis is not None:
+        sink = _apply_precomputed_llm_analysis(
+            precomputed_llm_analysis, source, global_text, assignments, result
+        )
+    if sink is None and use_llm:
+        sink = _detect_llm_sink(source, global_text, assignments, result, agent_session=agent_session)
     if sink is None:
         sink = _detect_sink(global_text, assignments, array_sources)
     if sink is None:
@@ -286,6 +292,7 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None) -> 
         for acc in slot_filters.values():
             union.merge(acc)
         _assign_result_filters(result, union, allow_regex_merge=True)
+        _merge_llm_waf_into_result(result)
         _collect_auto_context_metadata(result, global_text, sink, input_refs, assignments)
         return result
 
@@ -355,9 +362,38 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None) -> 
         return result
 
     _assign_result_filters(result, filters, allow_regex_merge=True)
+    _merge_llm_waf_into_result(result)
     _collect_auto_context_metadata(result, global_text, sink, input_refs, assignments)
 
     return result
+
+
+def _merge_llm_waf_into_result(result: AutoAnalysisResult):
+    ext = result.llm_waf_extraction
+    if ext is None:
+        return
+    existing_words = set(result.waf_words.split("|")) if result.waf_words else set()
+    for word in ext.waf_words:
+        existing_words.add(word)
+    existing_words.discard("")
+    result.waf_words = "|".join(sorted(existing_words))
+
+    existing_chars = set(result.waf_chars)
+    for ch in ext.waf_chars:
+        existing_chars.add(ch)
+    result.waf_chars = "".join(sorted(existing_chars))
+
+    if ext.waf_regex:
+        if not result.waf_regex:
+            result.waf_regex = ext.waf_regex[0]
+        else:
+            all_regexes = [result.waf_regex] + ext.waf_regex
+            result.waf_regex = _merge_regex_literals_or(all_regexes)
+
+    if ext.limit_length is not None:
+        result.limit_length = min(result.limit_length, ext.limit_length)
+
+    result.analysis_lines.append("[*] AUTO: merged LLM WAF extraction into filters")
 
 
 def _assign_result_filters(
@@ -442,6 +478,43 @@ def _input_ref_sort_key(ref: str):
     return (priority, ref)
 
 
+def _apply_precomputed_llm_analysis(
+    llm_analysis,
+    source: str,
+    global_text: str,
+    assignments: Dict[str, List[str]],
+    result: AutoAnalysisResult,
+) -> Optional[_SinkInfo]:
+    """Use sink/WAF data already obtained from the combined project-selection LLM call."""
+    result.llm_used = llm_analysis.used
+    result.llm_error = llm_analysis.error
+    result.llm_sink_candidates = [c.as_dict() for c in llm_analysis.candidates]
+    result.llm_waf_extraction = llm_analysis.waf_extraction
+
+    if llm_analysis.used:
+        result.analysis_lines.append(
+            f"[*] AUTO: precomputed LLM sink analysis => model={llm_analysis.model}"
+        )
+    if llm_analysis.error:
+        result.analysis_lines.append(f"[*] AUTO: {llm_analysis.error}")
+
+    for candidate in llm_analysis.candidates:
+        result.analysis_lines.append(
+            "[*] AUTO: LLM sink candidate => "
+            f"{candidate.kind}:{candidate.function}[{candidate.argument_index}] "
+            f"context={candidate.payload_context} confidence={candidate.confidence:.2f}"
+        )
+
+    for candidate in llm_analysis.candidates:
+        sink = _sink_from_llm_candidate(candidate, global_text, assignments)
+        if sink is not None:
+            return sink
+
+    if llm_analysis.candidates:
+        result.analysis_lines.append("[*] AUTO: no usable precomputed LLM sink candidate matched source calls")
+    return None
+
+
 def _detect_llm_sink(
     source: str,
     global_text: str,
@@ -460,6 +533,7 @@ def _detect_llm_sink(
     result.llm_used = analysis.used
     result.llm_error = analysis.error
     result.llm_sink_candidates = [candidate.as_dict() for candidate in analysis.candidates]
+    result.llm_waf_extraction = analysis.waf_extraction
 
     if analysis.used:
         result.analysis_lines.append(f"[*] AUTO: LLM sink analysis => model={analysis.model}")
@@ -515,8 +589,8 @@ def _sink_from_llm_candidate(
     return None
 
 
-def resolve_auto_parameters(source: str, use_llm: bool = False, agent_session=None) -> AutoAnalysisResult:
-    result = analyze_php_auto(source, use_llm=use_llm, agent_session=agent_session)
+def resolve_auto_parameters(source: str, use_llm: bool = False, agent_session=None, precomputed_llm_analysis=None) -> AutoAnalysisResult:
+    result = analyze_php_auto(source, use_llm=use_llm, agent_session=agent_session, precomputed_llm_analysis=precomputed_llm_analysis)
     if result.error:
         return result
 
@@ -589,6 +663,7 @@ def _probe_strategy(
         waf_words_list,
         waf_chars_set,
         waf_regex_obj,
+        payload_context=payload_context,
     )
     passed_payloads = bypass.filter_payloads(
         targeted_payloads,
@@ -932,8 +1007,11 @@ def _detect_sink(
         return None
 
     unique = {(sink.kind, sink.payload_context, sink.target_expr) for sink in sinks}
-    if len(unique) > 1:
-        return None
+    if len(unique) == 1:
+        return sinks[0]
+
+    priority = {"command_exec": 0, "file_write_upload": 1, "file_read_path": 2}
+    sinks.sort(key=lambda s: priority.get(s.kind, 9))
     return sinks[0]
 
 
@@ -1221,7 +1299,14 @@ def _collect_filters_for_variable(text: str, target_var: str) -> _FilterAccumula
     for match in len_pattern.finditer(text):
         op = match.group(1)
         bound = int(match.group(2))
-        acc.add_limit(bound if op == ">" else max(bound - 1, 0))
+        if op == ">":
+            acc.add_limit(bound)
+        elif op == ">=":
+            acc.add_limit(max(bound - 1, 0))
+        elif op == "<":
+            acc.add_limit(max(bound - 1, 0))
+        elif op == "<=":
+            acc.add_limit(bound)
 
     for rhs in assignments.get(target_var, []):
         replaced_tokens = _extract_replace_search_tokens(rhs, target_var)

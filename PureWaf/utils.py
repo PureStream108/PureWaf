@@ -3,6 +3,14 @@ import re
 import urllib.parse
 
 
+def _strip_trailing_regex_flags(text: str) -> str:
+    """Strip trailing regex flags like /i, /is from the end of a waf_words string."""
+    m = re.search(r'/[ism]{1,3}$', text)
+    if m:
+        return text[:m.start()]
+    return text
+
+
 def parse_waf_words(waf_words: str):
     """
     解析 WAF 过滤字符串
@@ -11,13 +19,14 @@ def parse_waf_words(waf_words: str):
     """
     if not waf_words:
         return []
-    parts = [p.strip() for p in waf_words.split("|") if p.strip()]
-    cleaned = []
-    for token in parts:
-        token = _strip_regex_delimiters(token)
-        if token:
-            cleaned.append(token)
-    return cleaned
+    raw = waf_words.strip()
+    if raw.startswith("/") and raw.count("/") >= 2:
+        last = raw.rfind("/")
+        raw = raw[1:last]
+    else:
+        raw = _strip_trailing_regex_flags(raw)
+    parts = [p.strip() for p in raw.split("|") if p.strip()]
+    return parts
 
 
 def parse_waf_chars(waf_chars: str):
@@ -139,19 +148,14 @@ def generate_php_chr(text: str):
     return ".".join(f"chr({byte})" for byte in data)
 
 
-def generate_php_xor(text: str):
-    """
-    PHP 异或
-    Example: ('%xx'^'%xx')...
-    """
-    xor_str1 = ""
-    xor_str2 = ""
-    for char in text:
-        found = False
-        # 寻找两个非字母数字字符，使其异或结果等于目标字符
+_XOR_LOOKUP = {}
+
+
+def _build_xor_lookup():
+    if _XOR_LOOKUP:
+        return
+    for target in range(256):
         for i in range(256):
-            if found:
-                break
             c1 = chr(i)
             if c1.isalnum():
                 continue
@@ -159,15 +163,28 @@ def generate_php_xor(text: str):
                 c2 = chr(j)
                 if c2.isalnum():
                     continue
-                if (ord(c1) ^ ord(c2)) == ord(char):
-                    xor_str1 += "%" + hex(i)[2:].zfill(2)
-                    xor_str2 += "%" + hex(j)[2:].zfill(2)
-                    found = True
+                if (i ^ j) == target:
+                    _XOR_LOOKUP[target] = (i, j)
                     break
+            if target in _XOR_LOOKUP:
+                break
 
-    if len(xor_str1) // 3 != len(text):
-        return None 
-    
+
+def generate_php_xor(text: str):
+    """
+    PHP 异或
+    Example: ('%xx'^'%xx')...
+    """
+    _build_xor_lookup()
+    xor_str1 = ""
+    xor_str2 = ""
+    for char in text:
+        pair = _XOR_LOOKUP.get(ord(char))
+        if pair is None:
+            return None
+        xor_str1 += "%" + hex(pair[0])[2:].zfill(2)
+        xor_str2 += "%" + hex(pair[1])[2:].zfill(2)
+
     return f"('{xor_str1}'^'{xor_str2}')"
 
 
@@ -180,9 +197,6 @@ def generate_php_not(text: str):
     for char in text:
         byte_val = ord(char)
         not_val = (~byte_val) & 0xFF
-        not_char = chr(not_val)
-        if not_char.isalnum():
-            pass
         not_str += "%" + hex(not_val)[2:].zfill(2)
     return f"(~'{not_str}')"
 
@@ -271,14 +285,10 @@ def obfuscate_filename_escape(path: str):
         return path
 
     parts = list(path)
-
-    # 随机插入
-    if len(parts) > 3:
-        import random
-
-        idx = random.randint(1, len(parts) - 1)
-        if parts[idx].isalnum():
+    for idx in range(len(parts) - 1, 0, -1):
+        if parts[idx].isalpha():
             parts.insert(idx, "\\")
+            break
 
     return "".join(parts)
 
@@ -292,17 +302,15 @@ def obfuscate_filename_quotes(path: str):
         return path
 
     parts = list(path)
-    if len(parts) > 3:
-        import random
-
-        idx = random.randint(1, len(parts) - 1)
-        if parts[idx].isalnum():
+    for idx in range(len(parts) - 1, 0, -1):
+        if parts[idx].isalpha():
             parts.insert(idx, "''")
+            break
 
     return "".join(parts)
 
 
-def _split_string_to_vars(text: str):
+def _split_string_to_vars(text: str, exclude_vars=None):
     """
     随机拆分字符串并分配给随机变量
     主要和变量拆分绕过适配
@@ -314,6 +322,8 @@ def _split_string_to_vars(text: str):
 
     if not text:
         return "", ""
+
+    excluded = set(exclude_vars or [])
 
     # 生成随机切分点
     length = len(text)
@@ -338,7 +348,7 @@ def _split_string_to_vars(text: str):
 
     for part in splits:
         var_name = random.choice(available_chars)
-        while var_name in vars_used:
+        while var_name in vars_used or var_name in excluded:
             var_name = random.choice(available_chars) + random.choice(available_chars)
 
         vars_used.append(var_name)
