@@ -30,6 +30,7 @@ from .agent import AgentStepLimitExceeded
 from .agent import PureWafAgentSession
 from .agent import PureWafProjectAgent
 from .auto import resolve_auto_parameters
+from . import utils as _utils
 from .PureWaf import PureWafConfig
 from .PureWaf import _append_agent_review_to_result
 from .PureWaf import _choose_final_payload
@@ -199,6 +200,14 @@ PAGE_TEMPLATE = """
               </div>
               <div id="upload_status" class="upload-status">未开始agent功能</div>
             </div>
+            <div id="custom_cmd_box" class="upload-box">
+              <label for="custom_cmd">Command</label>
+              <div class="upload-row">
+                <input id="custom_cmd" type="text" placeholder="例如: cat /flag, ls /, whoami" disabled>
+                <button id="run_custom_cmd" class="btn reset" type="button" disabled>BYPASS</button>
+              </div>
+              <div id="custom_cmd_status" class="upload-status">需要检测为RCE</div>
+            </div>
           </section>
         </div>
 
@@ -322,6 +331,15 @@ PAGE_TEMPLATE = """
         setResultText(buildResultSummary(pendingResult));
         statusEl.textContent = "运行完成";
         runButton.disabled = false;
+        if(pendingResult.sink_kind === "command_exec"){
+          $("custom_cmd").disabled = false;
+          $("run_custom_cmd").disabled = false;
+          $("custom_cmd_status").textContent = "检测到RCE sink，可输入自定义命令";
+        } else {
+          $("custom_cmd").disabled = true;
+          $("run_custom_cmd").disabled = true;
+          $("custom_cmd_status").textContent = "当前sink非RCE类型，不可用";
+        }
         pendingResult = null;
       }
     }
@@ -639,6 +657,39 @@ PAGE_TEMPLATE = """
       syncAgentUpload();
     });
     $("upload_project").addEventListener("click", uploadProjectZip);
+    $("run_custom_cmd").addEventListener("click", async () => {
+      const cmd = $("custom_cmd").value.trim();
+      if(!cmd){
+        $("custom_cmd_status").textContent = "请输入命令";
+        return;
+      }
+      $("run_custom_cmd").disabled = true;
+      $("custom_cmd_status").textContent = "正在生成bypass payload...";
+      clearOutput();
+      statusEl.textContent = "正在运行";
+      startRuntimeClock();
+      try{
+        const res = await fetch("/api/custom_command",{
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({
+            command: cmd,
+            upload_id: uploadedProjectId,
+            auto_prompt: $("auto_prompt").value
+          })
+        });
+        if(!res.ok) throw new Error(await res.text() || "请求失败");
+        const data = await res.json();
+        attach(data.job_id);
+      }catch(err){
+        stopRuntimeClock(true);
+        appendLine(`[!] ${err.message}`);
+        $("custom_cmd_status").textContent = `[!] ${err.message}`;
+        statusEl.textContent = "运行失败";
+      }finally{
+        $("run_custom_cmd").disabled = false;
+      }
+    });
     document.querySelectorAll("[data-mode-switch]").forEach((button) => {
       button.addEventListener("click", () => setMode(button.dataset.modeSwitch));
     });
@@ -649,6 +700,10 @@ PAGE_TEMPLATE = """
       setMode("filter");
       syncAgentUpload();
       resetOutput();
+      $("custom_cmd").value = "";
+      $("custom_cmd").disabled = true;
+      $("run_custom_cmd").disabled = true;
+      $("custom_cmd_status").textContent = "需要检测为RCE";
       statusEl.textContent = "已恢复初始参数";
       runButton.disabled = false;
     });
@@ -1057,10 +1112,12 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                         "stage_1_sink_analysis",
                         {"source": "uploaded_project", "source_bytes": len(bundle.source)},
                     )
+                combined_analysis = agent_project.get_combined_sink_analysis()
                 analysis = resolve_auto_parameters(
                     bundle.source,
                     use_llm=True,
                     agent_session=agent_session,
+                    precomputed_llm_analysis=combined_analysis,
                 )
             else:
                 if agent_session:
@@ -1107,6 +1164,7 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                     review = agent_project.review_payloads(
                         source_for_review,
                         analysis.analysis_lines + [analysis.error],
+                        waf_extraction=getattr(analysis, 'llm_waf_extraction', None),
                     )
                     review_lines = _format_agent_review_lines(review)
                     if review_lines:
@@ -1114,20 +1172,29 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                     if review.error:
                         raise RuntimeError(_format_agent_llm_failure(review.error))
                     if review.fallback_payload:
+                        fallback = review.fallback_payload
+                        waf_ext = getattr(analysis, 'llm_waf_extraction', None)
+                        if waf_ext:
+                            waf_words_list = _utils.parse_waf_words("|".join(waf_ext.waf_words))
+                            waf_chars_set = _utils.parse_waf_chars("".join(waf_ext.waf_chars))
+                            waf_regex_obj = _utils.parse_waf_regex(waf_ext.waf_regex[0] if waf_ext.waf_regex else "")
+                            if not _utils.is_payload_allowed(fallback, waf_words_list, waf_chars_set, waf_regex_obj, waf_ext.limit_length):
+                                publish({"kind": "lines", "lines": ["[!] AGENT: fallback payload blocked by WAF constraints, may need manual adjustment"]})
                         if agent_session:
-                            agent_session.finish({"fallback_payload": review.fallback_payload})
+                            agent_session.finish({"fallback_payload": fallback})
                         publish(
                             {
                                 "kind": "result",
                                 "result": {
                                     "shortest_root": "N/A",
-                                    "shortest_flag": review.fallback_payload,
-                                    "final_payload": review.fallback_payload,
+                                    "shortest_flag": fallback,
+                                    "final_payload": fallback,
                                     "root_passed_payloads": [],
-                                    "flag_passed_payloads": [review.fallback_payload],
+                                    "flag_passed_payloads": [fallback],
                                     "tips_text": "\n".join(review_lines),
                                     "log_text": "\n".join(review_lines),
-                                    "result_text": f"[+] Final Payload: {review.fallback_payload}",
+                                    "result_text": f"[+] Final Payload: {fallback}",
+                                    "sink_kind": analysis.sink_kind if hasattr(analysis, "sink_kind") else "",
                                 },
                             }
                         )
@@ -1193,6 +1260,7 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                 root_payloads=result.root_passed_payloads,
                 flag_payloads=result.flag_passed_payloads,
                 validation_results=validation_results,
+                waf_extraction=getattr(analysis, 'llm_waf_extraction', None),
             )
             review_lines = _format_agent_review_lines(review)
             if review_lines:
@@ -1209,19 +1277,86 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                     }
                 )
         flush_lines()
-        publish({"kind": "result", "result": _serialize_result(result)})
+        serialized = _serialize_result(result)
+        if config.auto and "analysis" in locals() and hasattr(analysis, "sink_kind"):
+            serialized["sink_kind"] = analysis.sink_kind
+        publish({"kind": "result", "result": serialized})
     except AgentStepLimitExceeded as exc:
-        if "agent_session" in locals() and agent_session:
+        if agent_session:
             agent_session.fail(str(exc))
         flush_lines()
         publish({"kind": "error", "error": str(exc)})
     except Exception as exc:
-        if "agent_session" in locals() and agent_session:
+        if agent_session:
             agent_session.fail(str(exc))
         flush_lines()
         publish({"kind": "error", "error": str(exc)})
     finally:
         flush_lines()
+        with job["condition"]:
+            job["done"] = True
+            job["finished_at"] = time.monotonic()
+            job["condition"].notify_all()
+
+
+def _run_custom_command_job(job, command, auto_prompt="", upload_store=None, upload_id=""):
+    def publish(item):
+        with job["condition"]:
+            job["events"].append(item)
+            job["condition"].notify_all()
+
+    def event_line(text):
+        publish({"kind": "lines", "lines": [text]})
+
+    try:
+        event_line(f"[*] Custom command bypass: command = {command}")
+
+        source = auto_prompt
+        if upload_id and upload_store:
+            project_path = upload_store.get_path(upload_id)
+            if project_path:
+                event_line("[*] Custom command bypass: loading project source from upload")
+                agent = PureWafProjectAgent(cwd=Path.cwd())
+                bundle = agent.build_project_source(project_path)
+                source = bundle.source
+
+        if not source.strip():
+            raise RuntimeError("no PHP source available for analysis")
+
+        event_line("[*] Custom command bypass: calling LLM for bypass generation")
+        agent = PureWafProjectAgent(cwd=Path.cwd())
+        result = agent.generate_custom_command_bypass(
+            source=source,
+            command=command,
+            event_callback=event_line,
+        )
+
+        if result.get("error"):
+            raise RuntimeError(result["error"])
+
+        payload = result.get("payload", "")
+        notes = result.get("notes", "")
+        event_line(f"[+] Bypass payload generated")
+        if notes:
+            event_line(f"[*] Notes: {notes}")
+
+        publish({
+            "kind": "result",
+            "result": {
+                "shortest_root": "N/A",
+                "shortest_flag": payload,
+                "final_payload": payload,
+                "root_passed_payloads": [],
+                "flag_passed_payloads": [payload] if payload else [],
+                "tips_text": notes,
+                "log_text": "",
+                "result_text": f"[+] Custom Command Bypass:\n{payload}\n\n{notes}",
+                "sink_kind": "command_exec",
+            },
+        })
+    except Exception as exc:
+        publish({"kind": "error", "error": str(exc)})
+    finally:
         with job["condition"]:
             job["done"] = True
             job["finished_at"] = time.monotonic()
@@ -1320,6 +1455,26 @@ def create_app(initial_config: PureWafConfig):
                 "Connection": "keep-alive",
             },
         )
+
+    @app.post("/api/custom_command")
+    def custom_command():
+        payload = request.get_json(silent=True) or {}
+        command = str(payload.get("command") or "").strip()
+        if not command:
+            return Response("command required", status=400)
+        if len(command) > 500:
+            return Response("command too long (max 500 chars)", status=400)
+
+        upload_id = str(payload.get("upload_id") or "")
+        auto_prompt = str(payload.get("auto_prompt") or "")
+
+        job_id, job = job_store.create()
+        threading.Thread(
+            target=_run_custom_command_job,
+            args=(job, command, auto_prompt, upload_store, upload_id),
+            daemon=True,
+        ).start()
+        return jsonify({"job_id": job_id})
 
     return app
 
