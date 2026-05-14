@@ -463,7 +463,7 @@ class WebUiTests(unittest.TestCase):
                 self.assertTrue(state_path.exists())
                 state = json.loads(state_path.read_text(encoding="utf-8"))
 
-        resolve_mock.assert_called_once_with(fake_bundle.source, use_llm=True, agent_session=ANY)
+        resolve_mock.assert_called_once_with(fake_bundle.source, use_llm=True, agent_session=ANY, precomputed_llm_analysis=ANY)
         payloads = self._extract_sse_payloads(body)
         first_lines = payloads[0]["lines"]
         self.assertIn("[*] AGENT: selected PHP files => 1", first_lines)
