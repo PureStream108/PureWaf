@@ -1,136 +1,124 @@
 ---
 name: purewaf-usage
-description: Standalone guidance for correctly using PureWaf's local CTF/education PHP RCE WAF-bypass payload generator, including FILTER mode, single-source AUTO reasoning, sink/filter interpretation, payload context selection, and code-maintenance boundaries. Use when Codex needs to analyze PHP challenge source, choose PureWaf parameters, interpret PureWaf payload output, or modify the PureWaf repo. Do not use this skill to open WebUI, invoke PureWaf agent mode, read or create `.env`, or read or create `pure/`.
+description: PureWaf 原生功能专用指南。PureWaf 是面向 CTF/教学场景的 PHP RCE WAF-bypass payload 生成器。用于手工分析 PHP 挑战源码，将 filter 和 sink 映射到 PureWaf 原始 FILTER 风格 API，直接调用 `purewaf()` 或 `PureWaf.bypass`，或在不使用 PureWaf AUTO、WebUI、Agent、LLM、`.env`、`pure/`、`purewaf_agent_state.json` 工作流的前提下解释原生 `Final Payload` 输出。
 ---
 
-# PureWaf Usage
+## 规则
 
-Use this skill as a standalone operating guide for PureWaf. It is not bundled with a target challenge and must not assume hidden files, writeups, API credentials, or an agent runtime.
+- 不要使用 `auto=True`、`webui=True`、`agent=True`、`PureWaf.auto`、`PureWaf.agent`、`run_webui.py`、上传 zip 项目、`.env`、`pure/` 或 `purewaf_agent_state.json`。
+- 不要依赖 LLM sink metadata、项目文件选择、agent review、dataflow validation、fallback repair 或 WebUI 输出字段。
+- 将 PureWaf 视为 CTF/教学用途的 payload 生成器
+- 以 PHP 挑战源码和用户明确给出的过滤规则为准。除非用户明确要求分析文档，否则不要把 writeup、README、`.md` 或 `.txt` 笔记当作 payload 真相来源。
+- 保持源码推理路径：识别 sink，提取 filter，选择 `payload_context`，生成候选，本地过滤，解释最终 payload。
 
-## Hard Rules
+## 工作流
 
-- Treat PureWaf as a CTF and education-oriented PHP RCE/WAF-bypass payload generator.
-- Do not treat PureWaf as a scanner, crawler, target probe, exploitation framework, reverse shell manager, or credential tool.
-- Do not open, start, or instruct the user to open the WebUI.
-- Do not invoke `agent=True` or rely on PureWaf agent mode.
-- Do not read, create, modify, or require `.env`.
-- Do not read, create, modify, or require `pure/`.
-- Do not use writeups, README files, `.md`, or `.txt` notes as ground truth for a challenge payload unless the user explicitly asks to analyze those documents as documents.
-- Do not claim a payload works against a live target unless execution evidence is provided by the user.
-- Prefer source-based reasoning: PHP code, known filters, known sink, PHP version, payload context, and PureWaf output.
+1. 阅读 PHP 源码或用户提供的 WAF 约束。
+2. 手工提取被拦截的词、字符、正则、长度限制、PHP 版本、目标文件和 sink 类型。
+3. 选择尽可能窄的 `payload_context`。
+4. 通过默认原生路径调用 `purewaf()`；不要传入 `auto`、`webui` 或 `agent` 参数。
+5. 如果需要 technique metadata 或自定义排序，直接使用 `PureWaf.bypass.BypassOptions`、`generate_candidates()`、`generate_candidate_records()`、`infer_payload_techniques()`、`filter_payloads()` 和 `PureWaf.utils.parse_*`。
+6. 只表达原生 payload 语义：`Final Payload` 就是要放进漏洞输入点的候选字符串。
 
-## Workflow
+## 映射
 
-1. Identify the user goal.
-   - If filters are known, use FILTER mode.
-   - If PHP source is provided, perform local single-source AUTO reasoning.
-   - If the task is repository maintenance, inspect the local code before changing behavior.
+提取约束：
 
-2. Classify the sink.
-   - `command_exec`: shell command sinks such as `system`, `passthru`, `shell_exec`, `exec`, `popen`, `proc_open`, and wrappers that forward to them.
-   - `php_code`: PHP code execution contexts such as `eval`, `assert`, dangerous callback dispatch, or include-like PHP execution.
-   - `file_read_path`: path sinks such as `file_get_contents`, `readfile`, `highlight_file`, and `show_source`.
-   - `file_write_upload`: write/upload sinks such as `file_put_contents`, `move_uploaded_file`, and upload-to-webroot flows.
+- 黑名单词：来自 `preg_match`、`stripos`、`strpos`、`strstr`、`in_array`、switch/case filter 或自定义 substring 检查的 token。
+- 被拦截字符：来自正则、`str_replace`、字符循环或 allowlist 反推的显式字符。
+- 正则：保留实际作为 WAF 的 PHP regex；可行时以 `/.../flags` 形式传入。
+- 长度：最大 payload 长度映射到 `limit_length`。
+- PHP 版本：版本映射到 `phpv`。
+- 目标：读 flag 用 `flagfile="/flag"`，根目录枚举用 `flagfile="/"`，读环境变量用 `read_env=True`，phpinfo 用 `phpinfo=True`，只有 sink 期待 PHP/upload wrapper 内容时才用 `upload=True`。
 
-3. Extract constraints.
-   - Words: blacklist tokens from `preg_match`, `stripos`, `strpos`, `strstr`, `in_array`, and custom wrapper filters.
-   - Characters: explicit blocked characters from regexes or replacements.
-   - Regex: preserve the original PHP regex when available.
-   - Sanitizers: `escapeshellarg`, `escapeshellcmd`, `addslashes`, `htmlspecialchars`, `htmlentities`.
-   - Preprocessors: `urldecode`, `rawurldecode`, `base64_decode`, `strtolower`, `strtoupper`, `trim`, `iconv`.
-   - Environment hints: PHP version, `open_basedir`, disabled functions, fixed command prefixes.
+按 sink 选择 `payload_context`：
 
-4. Choose payload context.
-   - Use `shell_command` when user input is executed by a shell command sink.
-   - Use `php_code` when user input is evaluated as PHP code.
-   - Use `any` for path reads, uploads, ambiguous contexts, or when the source cannot prove a narrower context.
+- `shell_command`：`system`、`passthru`、`shell_exec`、`exec`、`popen`、`proc_open`、反引号或用户可控命令参数。
+- `php_code`：`eval`、`assert`、PHP callback/code execution、短标签上传 wrapper，或必须是合法 PHP 代码的 payload。
+- `file_path`：`file_get_contents`、`readfile`、`highlight_file`、`show_source`、`include`、`require` 或路径类输入。
+- `url_query_value`：只在用户明确需要从原生候选池得到 URL-safe query 参数值候选时使用。
+- `any`：只有源码无法证明更窄上下文时才使用。
 
-5. Generate or interpret PureWaf output.
-   - Prefer `/flag` payloads when the CTF objective is flag read.
-   - Use root discovery payloads only when the task is directory enumeration or `/flag` is not yet known.
-   - Present the selected result as `Final Payload: ...`.
-   - If PureWaf output conflicts with the PHP source constraints, explain the conflict and re-check sink context instead of blindly trusting the shortest string.
+不要因为 `file_path` sink 就使用 `cat /flag` 这类 shell 命令；这类场景应优先使用 `/flag` 或 stream wrapper 这类路径/资源字符串。
 
-## FILTER Mode
+## 优先使用 Public API
 
-Use the public `purewaf()` API when the filter constraints are already known:
+当任务是“给定这些过滤规则，找一个 payload”时，优先使用 `purewaf()`：
 
 ```python
 from PureWaf import purewaf
 
-result = purewaf(
-    waf_words=["cat", "flag"],
-    waf_chars=[" ", "/"],
-    waf_regex=[],
+payload = purewaf(
+    waf_words="cat|flag",
+    waf_chars=" /",
+    waf_regex="",
     payload_context="shell_command",
+    limit_length=999999,
+    flagfile="/flag",
+    read_env=False,
+    reflect_shell=False,
+    phpinfo=False,
+    upload=False,
     phpv=7.4,
-    log_level="INFO",
+    total_payload=False,
 )
 ```
 
-Common parameters:
+原生 `purewaf()` 返回选中的 flag payload 字符串，并只记录一个兼容输出：
 
-- `waf_words`: blocked words or substrings.
-- `waf_chars`: blocked single characters.
-- `waf_regex`: blocked regex patterns.
-- `payload_context`: `shell_command`, `php_code`, or `any`.
-- `read_env`: prefer environment-reading payloads.
-- `upload`: prefer upload wrapper payloads.
-- `phpv`: PHP version for version-gated payloads.
-- `total_payload`: evaluate more candidates when needed.
+```text
+[+] Final Payload: <payload>
+```
 
-## Single-Source AUTO Reasoning
+如果没有 flag payload 通过，可能退回根目录枚举 payload 或返回 `N/A`。原生模式不要期待 `Final Payload Value`、`Final Request`、`Final Cookie` 或 `Final Header`。
 
-When PHP source is provided and WebUI/agent mode is not allowed, use local AUTO analysis only:
+## API
+
+需要候选记录、自定义排序或 technique label 时，直接使用 `PureWaf.bypass`：
 
 ```python
-from PureWaf.auto import resolve_auto_parameters
-from PureWaf import bypass
+from PureWaf import bypass, utils
 
-source = """<?php system($_GET['cmd']);"""
-analysis = resolve_auto_parameters(source, use_llm=False)
+options = bypass.BypassOptions(
+    flagfile="/flag",
+    read_env=False,
+    reflect_shell=False,
+    ip="127.0.0.1",
+    port=4444,
+    phpinfo=False,
+    php_version=7.4,
+    upload=False,
+    payload_context="shell_command",
+)
 
-if analysis.error:
-    raise RuntimeError(analysis.error)
+records = bypass.generate_candidate_records(options)
+waf_words = utils.parse_waf_words("cat|flag")
+waf_chars = utils.parse_waf_chars(" /")
+waf_regex = utils.parse_waf_regex("")
 
-records = bypass.generate_candidate_records(
-    bypass.BypassOptions(
-        flagfile="/flag",
-        read_env=analysis.read_env,
-        reflect_shell=False,
-        ip="127.0.0.1",
-        port=4444,
-        phpinfo=False,
-        php_version=analysis.php_version_hint or 7.0,
-        payload_context=analysis.payload_context,
-        auto_context=analysis.to_context(),
-    )
+passed = bypass.filter_payloads(
+    [record.payload for record in records],
+    waf_words,
+    waf_chars,
+    waf_regex,
+    limit_length=999999,
+    show_progress=False,
 )
 ```
 
-Use this path to understand sink metadata, preprocessors, and payload techniques. Do not use it as proof of live exploitability.
+只需要 `List[str]` 兼容输出时使用 `generate_candidates()`。需要解释 payload 技术来源时使用 `generate_candidate_records()` 或 `infer_payload_techniques()`。
 
-## Payload Review Rules
+## Payload Review
 
-- Validate payloads against the PHP source path from input to sink.
-- Check whether filters happen before or after preprocessing.
-- For `file_read_path`, distinguish wrapper payloads such as `php://filter` from literal path payloads.
-- For `command_exec`, distinguish shell syntax from PHP code syntax.
-- For `php_code`, reject shell-only strings unless they are wrapped in valid PHP execution syntax.
-- For uploads, reason about extension checks, MIME/content checks, destination path, and whether the written file is executable.
-- If multiple inputs are concatenated, keep all relevant input refs; select the controllable key that best explains the final path or command.
+- 用 `utils.is_payload_allowed()` 或 `bypass.filter_payloads()` 按手工提取的 filter 规则验证候选。
+- 按 context 检查语法：`shell_command` 用 shell 语法，`php_code` 用 PHP 语法，`file_path` 用路径/资源语法。
+- 目标是读 flag 时优先 `/flag` payload；只有 flag 路径未知时才使用根目录枚举。
+- 如果最短候选和源码 context 冲突，选择 context 正确的候选，不要盲信长度。
+- 如果用户输入在到达 sink 前被转换，手工推理并把显式 WAF 约束编码进 PureWaf 参数；不要切换到 AUTO。
 
-## Code Maintenance Rules
+## Tamper 和编码
 
-- Keep `generate_candidates()` returning `List[str]` for compatibility.
-- Use `generate_candidate_records()` and `infer_payload_techniques()` when technique metadata is needed.
-- Prefer adding payload templates to `PureWaf/bypass_data.py`.
-- Prefer tamper plugins in `PureWaf/tamper.py` over hardcoded transformations in `PureWaf/bypass.py`.
-- Keep AUTO source analysis in `PureWaf/auto.py`.
-- Add focused tests for every regression or new payload family.
-- Do not copy GPL payload/code from external tools; localize ideas only when license-safe.
-- Run the full suite before claiming completion:
-
-```powershell
-python -m unittest discover -s tests -v
-```
+- 常规 targeted replacement 和 encoding fallback 交给 public `purewaf()` 处理。
+- 只有明确需要底层流程时才用 `bypass.apply_encodings()`。
+- 除非源码证明存在 shell 解释，否则不要把 shell-only tamper 用到 `php_code` 或 `file_path`。
+- backslash split 和 randomcase 这类 manual-only tamper 是 sink-dependent，不是默认选择。
