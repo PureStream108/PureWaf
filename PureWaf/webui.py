@@ -956,10 +956,21 @@ def _build_runtime_config(payload, base_config: PureWafConfig):
 
 
 def _serialize_result(result):
+    final_payload = (
+        getattr(result, "final_request_path", "")
+        or getattr(result, "final_payload_value", "")
+        or _choose_final_payload(result.shortest_flag, result.shortest_root)
+    )
     return {
         "shortest_root": result.shortest_root,
         "shortest_flag": result.shortest_flag,
-        "final_payload": _choose_final_payload(result.shortest_flag, result.shortest_root),
+        "final_payload": final_payload,
+        "payload_value": getattr(result, "final_payload_value", "") or result.shortest_flag,
+        "request_path": getattr(result, "final_request_path", ""),
+        "request_headers": getattr(result, "final_request_headers", None) or {},
+        "request_cookies": getattr(result, "final_request_cookies", None) or {},
+        "payload_source": getattr(result, "final_payload_source", ""),
+        "payload_evidence": getattr(result, "final_payload_evidence", ""),
         "root_passed_payloads": result.root_passed_payloads,
         "flag_passed_payloads": result.flag_passed_payloads,
         "tips_text": result.tips_text,
@@ -969,9 +980,25 @@ def _serialize_result(result):
 
 
 def _build_result_text(result):
+    final_payload = (
+        getattr(result, "final_request_path", "")
+        or getattr(result, "final_payload_value", "")
+        or _choose_final_payload(result.shortest_flag, result.shortest_root)
+    )
     lines = [
-        f"[+] Final Payload: {_choose_final_payload(result.shortest_flag, result.shortest_root)}",
+        f"[+] Final Payload: {final_payload}",
     ]
+    if getattr(result, "final_payload_value", ""):
+        lines.append(f"[+] Final Payload Value: {result.final_payload_value}")
+    if getattr(result, "final_request_path", ""):
+        lines.append(f"[+] Final Request: {result.final_request_path}")
+    for name, value in (getattr(result, "final_request_cookies", None) or {}).items():
+        lines.append(f"[+] Final Cookie: {name}={value}")
+    request_cookies = getattr(result, "final_request_cookies", None) or {}
+    for name, value in (getattr(result, "final_request_headers", None) or {}).items():
+        if name.lower() == "cookie" and request_cookies:
+            continue
+        lines.append(f"[+] Final Header: {name}: {value}")
     if result.tips_text:
         lines.extend(["", result.tips_text.strip()])
     return "\n".join(lines).strip()
@@ -1165,6 +1192,10 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                         source_for_review,
                         analysis.analysis_lines + [analysis.error],
                         waf_extraction=getattr(analysis, 'llm_waf_extraction', None),
+                        transform_chain=getattr(analysis, 'agent_transform_chain', None),
+                        sink_kind=getattr(analysis, 'sink_kind', ''),
+                        payload_context=getattr(analysis, 'payload_context', 'any'),
+                        flagfile="/flag",
                     )
                     review_lines = _format_agent_review_lines(review)
                     if review_lines:
@@ -1173,27 +1204,46 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                         raise RuntimeError(_format_agent_llm_failure(review.error))
                     if review.fallback_payload:
                         fallback = review.fallback_payload
+                        payload_value = review.payload_value or fallback
+                        request_path = review.request_path
+                        request_headers = getattr(review, "request_headers", {}) or {}
+                        request_cookies = getattr(review, "request_cookies", {}) or {}
+                        final_payload = request_path or payload_value
                         waf_ext = getattr(analysis, 'llm_waf_extraction', None)
                         if waf_ext:
                             waf_words_list = _utils.parse_waf_words("|".join(waf_ext.waf_words))
                             waf_chars_set = _utils.parse_waf_chars("".join(waf_ext.waf_chars))
                             waf_regex_obj = _utils.parse_waf_regex(waf_ext.waf_regex[0] if waf_ext.waf_regex else "")
-                            if not _utils.is_payload_allowed(fallback, waf_words_list, waf_chars_set, waf_regex_obj, waf_ext.limit_length):
+                            if not _utils.is_payload_allowed(payload_value, waf_words_list, waf_chars_set, waf_regex_obj, waf_ext.limit_length):
                                 publish({"kind": "lines", "lines": ["[!] AGENT: fallback payload blocked by WAF constraints, may need manual adjustment"]})
                         if agent_session:
-                            agent_session.finish({"fallback_payload": fallback})
+                            agent_session.finish(
+                                {
+                                    "payload_value": payload_value,
+                                    "request_path": request_path,
+                                    "request_headers": request_headers,
+                                    "request_cookies": request_cookies,
+                                    "fallback_payload": fallback,
+                                }
+                            )
                         publish(
                             {
                                 "kind": "result",
                                 "result": {
                                     "shortest_root": "N/A",
-                                    "shortest_flag": fallback,
-                                    "final_payload": fallback,
+                                    "shortest_flag": payload_value,
+                                    "final_payload": final_payload,
+                                    "payload_value": payload_value,
+                                    "request_path": request_path,
+                                    "request_headers": request_headers,
+                                    "request_cookies": request_cookies,
+                                    "payload_source": review.source,
+                                    "payload_evidence": review.evidence,
                                     "root_passed_payloads": [],
-                                    "flag_passed_payloads": [fallback],
+                                    "flag_passed_payloads": [payload_value],
                                     "tips_text": "\n".join(review_lines),
                                     "log_text": "\n".join(review_lines),
-                                    "result_text": f"[+] Final Payload: {fallback}",
+                                    "result_text": f"[+] Final Payload: {final_payload}",
                                     "sink_kind": analysis.sink_kind if hasattr(analysis, "sink_kind") else "",
                                 },
                             }
@@ -1243,6 +1293,8 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                 sink_kind=analysis.sink_kind,
                 payload_context=analysis.payload_context,
                 flagfile=execution_config.flagfile,
+                transform_chain=getattr(analysis, 'agent_transform_chain', None),
+                waf_extraction=getattr(analysis, 'llm_waf_extraction', None),
             )
             validation_lines = _format_agent_validation_lines(validation_results)
             if validation_lines:
@@ -1261,6 +1313,10 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                 flag_payloads=result.flag_passed_payloads,
                 validation_results=validation_results,
                 waf_extraction=getattr(analysis, 'llm_waf_extraction', None),
+                transform_chain=getattr(analysis, 'agent_transform_chain', None),
+                sink_kind=analysis.sink_kind,
+                payload_context=analysis.payload_context,
+                flagfile=execution_config.flagfile,
             )
             review_lines = _format_agent_review_lines(review)
             if review_lines:
@@ -1274,6 +1330,8 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                         "shortest_flag": result.shortest_flag,
                         "review_valid": review.valid,
                         "fallback_payload": review.fallback_payload,
+                        "request_headers": getattr(review, "request_headers", {}),
+                        "request_cookies": getattr(review, "request_cookies", {}),
                     }
                 )
         flush_lines()

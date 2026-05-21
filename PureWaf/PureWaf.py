@@ -7,15 +7,16 @@ import sys
 import time
 import urllib.parse
 from dataclasses import dataclass
+from dataclasses import field
 from dataclasses import replace
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "2.1.0"
+version = "2.1.1"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
@@ -57,6 +58,12 @@ class PureWafExecutionResult:
     flag_passed_payloads: List[str]
     tips_text: str
     log_text: str
+    final_payload_value: str = ""
+    final_request_path: str = ""
+    final_request_headers: Dict[str, str] = field(default_factory=dict)
+    final_request_cookies: Dict[str, str] = field(default_factory=dict)
+    final_payload_source: str = ""
+    final_payload_evidence: str = ""
 
 
 def banner(version_text):
@@ -575,10 +582,29 @@ def _format_agent_review_lines(review):
         lines.append(f"[*] AGENT: payload review => {status}")
     if review.error:
         lines.append(f"[*] AGENT: payload review skipped => {review.error}")
+    if getattr(review, "source", ""):
+        lines.append(f"[*] AGENT: selected source => {review.source}")
+    if getattr(review, "evidence", ""):
+        lines.append(f"[*] AGENT: evidence => {review.evidence}")
     if review.notes:
         lines.append(f"[*] AGENT: review notes => {review.notes}")
-    if review.fallback_payload:
-        lines.append(f"[+] Final Payload: {review.fallback_payload}")
+    payload_value = getattr(review, "payload_value", "") or review.fallback_payload
+    request_path = getattr(review, "request_path", "")
+    if payload_value:
+        lines.append(f"[+] Final Payload Value: {payload_value}")
+    if request_path:
+        lines.append(f"[+] Final Request: {request_path}")
+    request_headers = getattr(review, "request_headers", {}) or {}
+    request_cookies = getattr(review, "request_cookies", {}) or {}
+    for name, value in request_cookies.items():
+        lines.append(f"[+] Final Cookie: {name}={value}")
+    for name, value in request_headers.items():
+        if name.lower() == "cookie" and request_cookies:
+            continue
+        lines.append(f"[+] Final Header: {name}: {value}")
+    final_display = request_path or payload_value or review.fallback_payload
+    if final_display:
+        lines.append(f"[+] Final Payload: {final_display}")
     return lines
 
 
@@ -634,18 +660,33 @@ def _append_agent_review_to_result(result: PureWafExecutionResult, review):
     lines = _format_agent_review_lines(review)
     if not lines:
         return result
-    if review.fallback_payload and (result.shortest_flag == "N/A" or not review.valid):
-        result.shortest_flag = review.fallback_payload
-        result.flag_passed_payloads = [review.fallback_payload]
+    payload_value = getattr(review, "payload_value", "") or review.fallback_payload
+    request_path = getattr(review, "request_path", "")
+    final_display = request_path or payload_value or review.fallback_payload
+    if payload_value:
+        result.final_payload_value = payload_value
+    if request_path:
+        result.final_request_path = request_path
+    if getattr(review, "request_headers", None):
+        result.final_request_headers = dict(review.request_headers)
+    if getattr(review, "request_cookies", None):
+        result.final_request_cookies = dict(review.request_cookies)
+    if getattr(review, "source", ""):
+        result.final_payload_source = review.source
+    if getattr(review, "evidence", ""):
+        result.final_payload_evidence = review.evidence
+    if payload_value and (result.shortest_flag == "N/A" or not review.valid):
+        result.shortest_flag = payload_value
+        result.flag_passed_payloads = [payload_value]
     result.log_text = _replace_final_payload_line(
         result.log_text,
-        _choose_final_payload(result.shortest_flag, result.shortest_root),
+        final_display or _choose_final_payload(result.shortest_flag, result.shortest_root),
     )
     suffix_lines = [line for line in lines if not line.startswith("[+] Final Payload:")]
     suffix = "\n".join(suffix_lines)
     if suffix:
         result.log_text = (result.log_text.rstrip() + "\n" + suffix).strip()
-    if review.notes or review.fallback_payload:
+    if review.notes or payload_value or request_path or getattr(review, "evidence", ""):
         tips_suffix = "\n".join(lines)
         result.tips_text = (result.tips_text.rstrip() + "\n" + tips_suffix).strip()
     return result
@@ -699,6 +740,11 @@ def _execute_agent_auto_from_project(
             review = project_agent.review_payloads(
                 bundle.source,
                 analysis.analysis_lines + [analysis.error],
+                waf_extraction=analysis.llm_waf_extraction,
+                transform_chain=analysis.agent_transform_chain,
+                sink_kind=analysis.sink_kind,
+                payload_context=analysis.payload_context,
+                flagfile="/flag",
             )
             if output_logger:
                 for line in _format_agent_review_lines(review):
@@ -706,8 +752,17 @@ def _execute_agent_auto_from_project(
             if review.error:
                 session.fail(review.error)
                 return _format_agent_llm_failure(review.error)
-            session.finish({"fallback_payload": review.fallback_payload, "analysis_error": analysis.error})
-            return review.fallback_payload or analysis.error
+            session.finish(
+                {
+                    "payload_value": review.payload_value or review.fallback_payload,
+                    "request_path": review.request_path,
+                    "request_headers": getattr(review, "request_headers", {}),
+                    "request_cookies": getattr(review, "request_cookies", {}),
+                    "fallback_payload": review.fallback_payload,
+                    "analysis_error": analysis.error,
+                }
+            )
+            return review.request_path or review.payload_value or review.fallback_payload or analysis.error
 
         session.start_phase("stage_2_purewaf_generation", {"sink_kind": analysis.sink_kind})
         execution_config = _build_agent_auto_execution_config(config, analysis)
@@ -740,6 +795,8 @@ def _execute_agent_auto_from_project(
             sink_kind=analysis.sink_kind,
             payload_context=analysis.payload_context,
             flagfile=execution_config.flagfile,
+            transform_chain=analysis.agent_transform_chain,
+            waf_extraction=analysis.llm_waf_extraction,
         )
         if output_logger:
             for line in _format_agent_validation_lines(validation_results):
@@ -754,6 +811,11 @@ def _execute_agent_auto_from_project(
             root_payloads=result.root_passed_payloads,
             flag_payloads=result.flag_passed_payloads,
             validation_results=validation_results,
+            waf_extraction=analysis.llm_waf_extraction,
+            transform_chain=analysis.agent_transform_chain,
+            sink_kind=analysis.sink_kind,
+            payload_context=analysis.payload_context,
+            flagfile=execution_config.flagfile,
         )
         _append_agent_review_to_result(result, review)
         if output_logger:
@@ -766,10 +828,14 @@ def _execute_agent_auto_from_project(
             {
                 "shortest_flag": result.shortest_flag,
                 "review_valid": review.valid,
+                "payload_value": review.payload_value or review.fallback_payload,
+                "request_path": review.request_path,
+                "request_headers": getattr(review, "request_headers", {}),
+                "request_cookies": getattr(review, "request_cookies", {}),
                 "fallback_payload": review.fallback_payload,
             }
         )
-        return result.shortest_flag
+        return result.final_request_path or result.final_payload_value or result.shortest_flag
     except AgentStepLimitExceeded as exc:
         session.fail(str(exc))
         return str(exc)

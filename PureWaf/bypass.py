@@ -265,13 +265,78 @@ def _normalize_payload_context(payload_context: str):
         return "php_code"
     if normalized in {"shell", "shell_cmd", "shell_command", "command"}:
         return "shell_command"
+    if normalized in {"file", "path", "file_path", "file_read_path"}:
+        return "file_path"
+    if normalized in {"query", "query_value", "url_query", "url_query_value"}:
+        return "url_query_value"
     return "any"
+
+
+def _is_file_path_payload(payload: str):
+    stripped = payload.strip()
+    lowered = stripped.lower()
+    if not stripped:
+        return False
+    if _is_upload_wrapper_like_payload(stripped) or _is_php_style_payload(stripped):
+        return False
+    command_prefixes = (
+        "cat ",
+        "tac ",
+        "nl ",
+        "more ",
+        "less ",
+        "head ",
+        "tail ",
+        "sort ",
+        "od ",
+        "strings ",
+        "paste ",
+        "grep ",
+        "sed ",
+        "rev ",
+        "uniq ",
+        "base64 ",
+        "awk ",
+        "dd ",
+        "perl ",
+        "busybox ",
+        "vi ",
+        "shuf ",
+        "xargs ",
+        "cut ",
+        "column ",
+        "pr ",
+        "xxd ",
+        "file ",
+        "env ",
+        "bash ",
+        "tar ",
+    )
+    if lowered.startswith(command_prefixes):
+        return False
+    shell_tokens = ("`", "$(", "${ifs}", "$ifs", "&&", "||", "|", ";")
+    if any(token in lowered for token in shell_tokens):
+        return False
+    if " " in stripped:
+        return False
+    return bool(
+        stripped.startswith(("/", "./", "../"))
+        or "://" in lowered
+        or "%" in stripped
+        or "\x00" in stripped
+        or re.fullmatch(r"[A-Za-z0-9._%+\\/-]+", stripped)
+    )
 
 
 def _filter_payloads_for_context(payloads, payload_context: str):
     normalized = _normalize_payload_context(payload_context)
     if normalized == "any":
         return utils.dedupe_preserve_order(payloads)
+
+    if normalized in {"file_path", "url_query_value"}:
+        return utils.dedupe_preserve_order(
+            [payload for payload in payloads if _is_file_path_payload(payload)]
+        )
 
     matcher = _is_eval_safe_php_payload if normalized == "php_code" else _is_shell_style_payload
     filtered = [payload for payload in payloads if matcher(payload)]
