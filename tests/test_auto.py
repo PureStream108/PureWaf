@@ -179,8 +179,9 @@ echo file_get_contents($_GET['f']);
 
         self.assertEqual(result.error, "")
         self.assertEqual(result.sink_kind, "file_read_path")
+        self.assertEqual(result.payload_context, "file_path")
 
-    def test_iconv_file_read_preserves_multi_input_and_upstream_filters(self):
+    def test_file_read_preserves_multi_input_and_upstream_filters(self):
         source = """<?php
 $user = null;
 if (isset($_COOKIE['user'])) {
@@ -191,7 +192,7 @@ $rawPath = $user->basePath . $f;
 if (preg_match('/flag|\\/flag|\\.\\.|php:|data:|expect:/i', $rawPath)) {
     die('blocked');
 }
-$convertedPath = @iconv($user->encoding, "UTF-8//IGNORE", $rawPath);
+$convertedPath = $rawPath;
 echo file_get_contents($convertedPath);
 """
 
@@ -199,12 +200,29 @@ echo file_get_contents($convertedPath);
 
         self.assertEqual(result.error, "")
         self.assertEqual(result.sink_kind, "file_read_path")
-        self.assertIn("iconv", result.preprocessors)
         self.assertIn("$_COOKIE['user']", result.input_refs)
         self.assertIn("$_GET['f']", result.input_refs)
         self.assertEqual(result.sink_function, "file_get_contents")
-        self.assertEqual(result.payload_context, "any")
+        self.assertEqual(result.payload_context, "file_path")
         self.assertEqual(result.input_key, "f")
+
+    def test_file_read_records_encoding_preprocessor_chain(self):
+        source = """<?php
+$f = (string)($_GET['f'] ?? "");
+$rawPath = "/var/www/html/" . $f;
+if (preg_match('/flag|\\/flag|php:|data:/i', $rawPath)) {
+    die('blocked');
+}
+$convertedPath = @iconv("UTF-16", "UTF-8//IGNORE", $rawPath);
+echo file_get_contents($convertedPath);
+"""
+
+        result = analyze_php_auto(source)
+
+        self.assertEqual(result.error, "")
+        self.assertEqual(result.sink_kind, "file_read_path")
+        self.assertEqual(result.payload_context, "file_path")
+        self.assertIn("iconv", result.preprocessors)
 
     def test_analyze_file_read_family_variants(self):
         for func in ("readfile", "highlight_file", "show_source"):
@@ -586,6 +604,26 @@ system("file " . $a);
             "php://filter/convert.iconv.utf-8.utf-16le/resource=/flag",
             candidates_auto,
         )
+        options_file_path = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=7.0,
+            upload=False,
+            payload_context="file_path",
+            auto_context=ctx,
+        )
+        file_path_candidates = bypass.generate_candidates(options_file_path)
+        self.assertIn("/flag", file_path_candidates)
+        self.assertIn(
+            "php://filter/read=convert.base64-encode/resource=/flag",
+            file_path_candidates,
+        )
+        self.assertNotIn("nl /f???", file_path_candidates)
+        self.assertFalse(any(payload.startswith("cat ") for payload in file_path_candidates))
 
         options_filter = bypass.BypassOptions(
             flagfile="/flag",
