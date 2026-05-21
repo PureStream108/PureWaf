@@ -22,7 +22,7 @@ MODEL=your-model
 
 LLM 的工作流是：
 
-**先分析所给代码中的 sink -> 调用 PureWaf 所对应的触发器 -> PureWaf 生成 payload -> LLM 检测 payload 准确性 -> 给出结果**
+**先分析所给代码中的 sink / 漏洞点 -> 调用 PureWaf 所对应的触发器 -> PureWaf 生成 payload -> PHP CLI 临时沙箱验证 payload -> LLM 结合验证结果复核 payload -> 给出结果**
 
 若 PureWaf 无法给出正确的 payload，此时将由 LLM 自行给出 payload，结果将同步显示到终端
 
