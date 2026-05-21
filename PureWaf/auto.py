@@ -61,6 +61,7 @@ _PREPROCESSOR_CALLS = {
     "rawurldecode",
     "base64_decode",
     "iconv",
+    "mb_convert_encoding",
 }
 _SANITIZER_CALLS = {
     "escapeshellcmd",
@@ -79,6 +80,7 @@ _SANITIZER_CHAR_CONSTRAINTS = {
 
 @dataclass
 class AutoContext:
+    sink_kind: str = ""
     sink_function: str = ""
     input_refs: List[str] = field(default_factory=list)
     sanitizers: List[str] = field(default_factory=list)
@@ -94,6 +96,11 @@ class AutoContext:
     llm_used: bool = False
     llm_error: str = ""
     llm_sink_candidates: List[Dict[str, object]] = field(default_factory=list)
+    route_path: str = ""
+    route_method: str = ""
+    input_source: str = ""
+    strategy_hints: List[str] = field(default_factory=list)
+    agent_transform_chain: Optional[Dict[str, object]] = None
 
 
 @dataclass
@@ -124,9 +131,15 @@ class AutoAnalysisResult:
     llm_error: str = ""
     llm_sink_candidates: List[Dict[str, object]] = field(default_factory=list)
     llm_waf_extraction: Optional["LlmWafExtraction"] = None
+    route_path: str = ""
+    route_method: str = ""
+    input_source: str = ""
+    strategy_hints: List[str] = field(default_factory=list)
+    agent_transform_chain: Optional[Dict[str, object]] = None
 
     def to_context(self) -> AutoContext:
         return AutoContext(
+            sink_kind=self.sink_kind,
             sink_function=self.sink_function,
             input_refs=list(self.input_refs),
             sanitizers=list(self.sanitizers),
@@ -142,6 +155,11 @@ class AutoAnalysisResult:
             llm_used=self.llm_used,
             llm_error=self.llm_error,
             llm_sink_candidates=list(self.llm_sink_candidates),
+            route_path=self.route_path,
+            route_method=self.route_method,
+            input_source=self.input_source,
+            strategy_hints=list(self.strategy_hints),
+            agent_transform_chain=dict(self.agent_transform_chain) if isinstance(self.agent_transform_chain, dict) else None,
         )
 
 
@@ -294,6 +312,7 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, pre
         _assign_result_filters(result, union, allow_regex_merge=True)
         _merge_llm_waf_into_result(result)
         _collect_auto_context_metadata(result, global_text, sink, input_refs, assignments)
+        _apply_agent_transform_chain_metadata(result)
         return result
 
     if len(input_refs) > 1 and sink.kind != "file_read_path":
@@ -364,6 +383,7 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, pre
     _assign_result_filters(result, filters, allow_regex_merge=True)
     _merge_llm_waf_into_result(result)
     _collect_auto_context_metadata(result, global_text, sink, input_refs, assignments)
+    _apply_agent_transform_chain_metadata(result)
 
     return result
 
@@ -464,6 +484,40 @@ def _collect_auto_context_metadata(
     result.input_key = _extract_input_key(refs[0]) if refs else ""
 
 
+def _apply_agent_transform_chain_metadata(result: AutoAnalysisResult):
+    chain = result.agent_transform_chain
+    if not isinstance(chain, dict):
+        return
+
+    route = chain.get("route")
+    if isinstance(route, dict):
+        result.route_path = str(route.get("path", "") or "").strip()[:220]
+        result.route_method = str(route.get("method", "") or "").strip().upper()[:12]
+
+    input_ref = chain.get("input")
+    if isinstance(input_ref, dict):
+        result.input_source = str(input_ref.get("source", "") or "").strip().upper()[:24]
+        if not result.input_key:
+            result.input_key = str(input_ref.get("key", "") or "").strip()[:120]
+
+    hints = chain.get("strategy_hints")
+    if isinstance(hints, list):
+        result.strategy_hints = [
+            re.sub(r"\s+", " ", str(item or "")).strip()[:160]
+            for item in hints[:12]
+            if str(item or "").strip()
+        ]
+
+    if result.route_path:
+        result.analysis_lines.append(f"[*] AUTO: route_path => {result.route_path}")
+    if result.input_key:
+        result.analysis_lines.append(f"[*] AUTO: input_key => {result.input_key}")
+    if result.strategy_hints:
+        result.analysis_lines.append(
+            "[*] AUTO: strategy_hints => " + "; ".join(result.strategy_hints[:4])
+        )
+
+
 def _input_ref_sort_key(ref: str):
     match = re.match(r"\$_([A-Z]+)", ref or "")
     source = match.group(1) if match else ""
@@ -490,6 +544,8 @@ def _apply_precomputed_llm_analysis(
     result.llm_error = llm_analysis.error
     result.llm_sink_candidates = [c.as_dict() for c in llm_analysis.candidates]
     result.llm_waf_extraction = llm_analysis.waf_extraction
+    if getattr(llm_analysis, "transform_chain", None) is not None:
+        result.agent_transform_chain = llm_analysis.transform_chain.as_dict()
 
     if llm_analysis.used:
         result.analysis_lines.append(
@@ -534,6 +590,8 @@ def _detect_llm_sink(
     result.llm_error = analysis.error
     result.llm_sink_candidates = [candidate.as_dict() for candidate in analysis.candidates]
     result.llm_waf_extraction = analysis.waf_extraction
+    if getattr(analysis, "transform_chain", None) is not None:
+        result.agent_transform_chain = analysis.transform_chain.as_dict()
 
     if analysis.used:
         result.analysis_lines.append(f"[*] AUTO: LLM sink analysis => model={analysis.model}")
@@ -578,7 +636,9 @@ def _sink_from_llm_candidate(
 
         return _SinkInfo(
             kind=candidate.kind,
-            payload_context=candidate.payload_context,
+            payload_context="file_path"
+            if candidate.kind == "file_read_path" and candidate.payload_context == "any"
+            else candidate.payload_context,
             target_expr=target_expr,
             target_var=_extract_simple_var(target_expr),
             function_name=name.lower(),
@@ -974,7 +1034,7 @@ def _detect_sink(
         sinks.append(
             _SinkInfo(
                 kind="file_read_path",
-                payload_context="any",
+                payload_context="file_path",
                 target_expr=target_expr,
                 target_var=_extract_simple_var(target_expr),
                 function_name=name.lower(),

