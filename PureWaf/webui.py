@@ -33,6 +33,8 @@ from .auto import resolve_auto_parameters
 from . import utils as _utils
 from .PureWaf import PureWafConfig
 from .PureWaf import _append_agent_review_to_result
+from .PureWaf import _analysis_context_with_php_version
+from .PureWaf import _analysis_php_version_value
 from .PureWaf import _choose_final_payload
 from .PureWaf import _format_agent_llm_failure
 from .PureWaf import _format_agent_review_lines
@@ -83,6 +85,7 @@ PAGE_TEMPLATE = """
     .upload-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}
     .upload-status{color:var(--muted);font:500 12px/1.5 "Cascadia Code","JetBrains Mono",monospace}
     label{font:600 11px/1 "Cascadia Code","JetBrains Mono",monospace;color:#9a9a9a;letter-spacing:.06em}
+    .field-help{color:var(--muted);font:500 11px/1.45 "Cascadia Code","JetBrains Mono",monospace}
     input,textarea,select{width:100%;padding:10px 11px;border:1px solid var(--line-2);border-radius:6px;background:#e9eef8;color:#101010;outline:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.2)}
     textarea{min-height:60px;resize:none}
     input:focus,textarea:focus,select:focus{border-color:#8cb4ff}
@@ -160,7 +163,7 @@ PAGE_TEMPLATE = """
             <h3 class="group-title">TARGET</h3>
             <div class="row three">
               <div class="field"><label for="flagfile">flagfile</label><input id="flagfile" type="text"></div>
-              <div class="field"><label for="phpv">phpv</label><input id="phpv" type="number" step="0.1"></div>
+              <div class="field"><label for="phpv">phpv</label><input id="phpv" type="text"></div>
               <div class="field"><label for="log_level">log_level</label><select id="log_level"><option>INFO</option><option>DEBUG</option><option>QUIET</option></select></div>
             </div>
             <div class="field"><label for="payload_context">payload_context</label><select id="payload_context"><option value="any">any</option><option value="php_code">php_code</option><option value="shell_command">shell_command</option></select></div>
@@ -193,7 +196,7 @@ PAGE_TEMPLATE = """
               <textarea id="auto_prompt" placeholder="把你的一大坨代码全部放进来"></textarea>
             </div>
             <div class="upload-box">
-              <label for="auto_zip">upload_zip</label>
+              <label for="auto_zip">Upload_Zip</label>
               <div class="upload-row">
                 <input id="auto_zip" type="file" accept=".zip">
                 <button id="upload_project" class="btn reset" type="button">UPLOAD</button>
@@ -207,6 +210,11 @@ PAGE_TEMPLATE = """
                 <button id="run_custom_cmd" class="btn reset" type="button" disabled>BYPASS</button>
               </div>
               <div id="custom_cmd_status" class="upload-status">需要检测为RCE</div>
+            </div>
+            <div id="auto_phpv_lock_box" class="upload-box">
+              <label for="auto_phpv_lock">PHP Version</label>
+              <input id="auto_phpv_lock" type="text" placeholder="例如: 5.6, 7.4, 8.3.18">
+              <div class="field-help">锁定环境的php版本，不填默认不限</div>
             </div>
           </section>
         </div>
@@ -259,7 +267,7 @@ PAGE_TEMPLATE = """
 
   <script>
     const INITIAL_CONFIG = {{ initial_config | tojson }};
-    const ids = ["waf_words","waf_chars","waf_regex","payload_context","limit_length","flagfile","read_env","reflect_shell","ip","port","phpinfo","upload","log_level","total_payload","phpv","auto_prompt"];
+    const ids = ["waf_words","waf_chars","waf_regex","payload_context","limit_length","flagfile","read_env","reflect_shell","ip","port","phpinfo","upload","log_level","total_payload","phpv","auto_prompt","auto_phpv_lock"];
     let agentEnabled = !!INITIAL_CONFIG.agent;
     const processEl = document.getElementById("process");
     const resultEl = document.getElementById("result_output");
@@ -420,6 +428,18 @@ PAGE_TEMPLATE = """
       const lines = [
         `[+] Final Payload: ${result.final_payload || result.shortest_flag || result.shortest_root || "N/A"}`
       ];
+      if(result.payload_send_position){
+        lines.push(`[+] Send: ${result.payload_send_position}`);
+      }
+      if(result.payload_compatibility){
+        lines.push(`[*] PHP Compatibility: ${result.payload_compatibility}`);
+      }
+      if(result.payload_requirements){
+        lines.push(`[*] Requirements: ${result.payload_requirements}`);
+      }
+      if(result.payload_sink){
+        lines.push(`[*] Sink: ${result.payload_sink}`);
+      }
       const tipsText = (result.tips_text || "").trim();
       if(tipsText){
         lines.push("", tipsText);
@@ -443,6 +463,7 @@ PAGE_TEMPLATE = """
       $("log_level").value = cfg.log_level || "INFO";
       $("total_payload").checked = !!cfg.total_payload;
       $("phpv").value = cfg.phpv ?? 7.0;
+      $("auto_phpv_lock").value = cfg.auto_phpv_lock || "";
       uploadedProjectId = "";
       if($("auto_zip")) $("auto_zip").value = "";
       syncAgentUpload();
@@ -511,6 +532,7 @@ PAGE_TEMPLATE = """
           mode,
           auto_prompt: $("auto_prompt").value,
           upload_id: uploadedProjectId,
+          auto_phpv_lock: $("auto_phpv_lock").value.trim(),
           agent: agentEnabled
         };
       }
@@ -530,7 +552,7 @@ PAGE_TEMPLATE = """
         upload: $("upload").checked,
         log_level: $("log_level").value,
         total_payload: $("total_payload").checked,
-        phpv: Number($("phpv").value || 7.0),
+        phpv: $("phpv").value || "7.0",
         auto_prompt: $("auto_prompt").value
       };
     }
@@ -675,6 +697,7 @@ PAGE_TEMPLATE = """
           body:JSON.stringify({
             command: cmd,
             upload_id: uploadedProjectId,
+            auto_phpv_lock: $("auto_phpv_lock").value.trim(),
             auto_prompt: $("auto_prompt").value
           })
         });
@@ -902,6 +925,22 @@ def _coerce_float(value, default):
         return float(default)
 
 
+def _coerce_php_version(value, default):
+    text = str(value if value is not None else default).strip()
+    if re.match(r"^\d+(?:\.\d+){0,2}$", text):
+        return text if text.count(".") >= 2 else float(text)
+    return _utils.normalize_php_version_value(default)
+
+
+def _coerce_optional_php_version(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not re.fullmatch(r"\d+(?:\.\d+){0,2}", text):
+        raise ValueError("invalid php version lock")
+    return _utils.normalize_php_version_value(text)
+
+
 def _build_filter_runtime_config(payload, base_config: PureWafConfig):
     return PureWafConfig(
         waf_words=str(payload.get("waf_words", base_config.waf_words) or ""),
@@ -918,7 +957,7 @@ def _build_filter_runtime_config(payload, base_config: PureWafConfig):
         upload=_coerce_bool(payload.get("upload", base_config.upload)),
         log_level=str(payload.get("log_level", base_config.log_level) or "INFO").upper(),
         total_payload=_coerce_bool(payload.get("total_payload", base_config.total_payload)),
-        phpv=_coerce_float(payload.get("phpv"), base_config.phpv),
+        phpv=_coerce_php_version(payload.get("phpv"), base_config.phpv),
         auto=False,
         webui=True,
         agent=_coerce_bool(payload.get("agent", base_config.agent)),
@@ -926,6 +965,7 @@ def _build_filter_runtime_config(payload, base_config: PureWafConfig):
 
 
 def _build_auto_runtime_config(payload, base_config: PureWafConfig):
+    auto_phpv_lock = _coerce_optional_php_version(payload.get("auto_phpv_lock"))
     return PureWafConfig(
         waf_words="",
         waf_chars="",
@@ -945,6 +985,7 @@ def _build_auto_runtime_config(payload, base_config: PureWafConfig):
         auto=True,
         webui=True,
         agent=_coerce_bool(payload.get("agent", base_config.agent)),
+        auto_phpv_lock=auto_phpv_lock,
     )
 
 
@@ -971,6 +1012,11 @@ def _serialize_result(result):
         "request_cookies": getattr(result, "final_request_cookies", None) or {},
         "payload_source": getattr(result, "final_payload_source", ""),
         "payload_evidence": getattr(result, "final_payload_evidence", ""),
+        "payload_compatibility": getattr(result, "final_php_compatibility", ""),
+        "payload_requirements": getattr(result, "final_payload_requirements", ""),
+        "payload_send_position": getattr(result, "final_send_position", ""),
+        "payload_reason": getattr(result, "final_payload_reason", ""),
+        "payload_sink": getattr(result, "final_sink", ""),
         "root_passed_payloads": result.root_passed_payloads,
         "flag_passed_payloads": result.flag_passed_payloads,
         "tips_text": result.tips_text,
@@ -992,6 +1038,14 @@ def _build_result_text(result):
         lines.append(f"[+] Final Payload Value: {result.final_payload_value}")
     if getattr(result, "final_request_path", ""):
         lines.append(f"[+] Final Request: {result.final_request_path}")
+    if getattr(result, "final_send_position", ""):
+        lines.append(f"[+] Send: {result.final_send_position}")
+    if getattr(result, "final_php_compatibility", ""):
+        lines.append(f"[*] PHP Compatibility: {result.final_php_compatibility}")
+    if getattr(result, "final_payload_requirements", ""):
+        lines.append(f"[*] Requirements: {result.final_payload_requirements}")
+    if getattr(result, "final_sink", ""):
+        lines.append(f"[*] Sink: {result.final_sink}")
     for name, value in (getattr(result, "final_request_cookies", None) or {}).items():
         lines.append(f"[+] Final Cookie: {name}={value}")
     request_cookies = getattr(result, "final_request_cookies", None) or {}
@@ -1000,8 +1054,26 @@ def _build_result_text(result):
             continue
         lines.append(f"[+] Final Header: {name}: {value}")
     if result.tips_text:
-        lines.extend(["", result.tips_text.strip()])
+        tip_lines = [
+            line
+            for line in result.tips_text.strip().splitlines()
+            if not _is_structured_final_output_line(line)
+        ]
+        if tip_lines:
+            lines.extend(["", "\n".join(tip_lines)])
     return "\n".join(lines).strip()
+
+
+def _is_structured_final_output_line(line: str):
+    prefixes = (
+        "[+] Final Payload:",
+        "[+] Final Payload Value:",
+        "[+] Final Request:",
+        "[+] Final Cookie:",
+        "[+] Final Header:",
+        "[+] Send:",
+    )
+    return str(line or "").startswith(prefixes)
 
 
 def _should_forward_event(event, log_level):
@@ -1082,11 +1154,12 @@ def _build_auto_execution_config(base_config: PureWafConfig, analysis):
         upload=analysis.upload,
         log_level="INFO",
         total_payload=False,
-        phpv=7.0,
+        phpv=_analysis_php_version_value(base_config, analysis),
         auto=True,
         webui=True,
         agent=base_config.agent,
-        auto_context=analysis.to_context(),
+        auto_context=_analysis_context_with_php_version(base_config, analysis),
+        auto_phpv_lock=base_config.auto_phpv_lock,
     )
 
 
@@ -1140,25 +1213,33 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                         {"source": "uploaded_project", "source_bytes": len(bundle.source)},
                     )
                 combined_analysis = agent_project.get_combined_sink_analysis()
-                analysis = resolve_auto_parameters(
-                    bundle.source,
-                    use_llm=True,
-                    agent_session=agent_session,
-                    precomputed_llm_analysis=combined_analysis,
-                )
+                resolve_kwargs = {
+                    "use_llm": True,
+                    "agent_session": agent_session,
+                    "precomputed_llm_analysis": combined_analysis,
+                }
+                if config.auto_phpv_lock:
+                    resolve_kwargs["php_version_lock"] = config.auto_phpv_lock
+                analysis = resolve_auto_parameters(bundle.source, **resolve_kwargs)
             else:
                 if agent_session:
                     agent_session.start_phase(
                         "stage_1_sink_analysis",
                         {"source": "webui_auto_prompt", "source_bytes": len(auto_prompt)},
                     )
-                    analysis = resolve_auto_parameters(
-                        auto_prompt,
-                        use_llm=True,
-                        agent_session=agent_session,
-                    )
+                    resolve_kwargs = {"use_llm": True, "agent_session": agent_session}
+                    if config.auto_phpv_lock:
+                        resolve_kwargs["php_version_lock"] = config.auto_phpv_lock
+                    analysis = resolve_auto_parameters(auto_prompt, **resolve_kwargs)
                 else:
-                    analysis = resolve_auto_parameters(auto_prompt, use_llm=True)
+                    if config.auto_phpv_lock:
+                        analysis = resolve_auto_parameters(
+                            auto_prompt,
+                            use_llm=True,
+                            php_version_lock=config.auto_phpv_lock,
+                        )
+                    else:
+                        analysis = resolve_auto_parameters(auto_prompt, use_llm=True)
             if agent_session:
                 agent_session.remember(
                     "sink_analysis",
@@ -1196,6 +1277,7 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                         sink_kind=getattr(analysis, 'sink_kind', ''),
                         payload_context=getattr(analysis, 'payload_context', 'any'),
                         flagfile="/flag",
+                        php_version_lock=config.auto_phpv_lock,
                     )
                     review_lines = _format_agent_review_lines(review)
                     if review_lines:
@@ -1209,6 +1291,7 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                         request_headers = getattr(review, "request_headers", {}) or {}
                         request_cookies = getattr(review, "request_cookies", {}) or {}
                         final_payload = request_path or payload_value
+                        payload_send = request_path or (f"payload value only: {payload_value}" if payload_value else "")
                         waf_ext = getattr(analysis, 'llm_waf_extraction', None)
                         if waf_ext:
                             waf_words_list = _utils.parse_waf_words("|".join(waf_ext.waf_words))
@@ -1239,11 +1322,16 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                                     "request_cookies": request_cookies,
                                     "payload_source": review.source,
                                     "payload_evidence": review.evidence,
+                                    "payload_compatibility": "",
+                                    "payload_requirements": "",
+                                    "payload_send_position": payload_send,
+                                    "payload_reason": review.evidence,
+                                    "payload_sink": analysis.sink_kind if hasattr(analysis, "sink_kind") else "",
                                     "root_passed_payloads": [],
                                     "flag_passed_payloads": [payload_value],
                                     "tips_text": "\n".join(review_lines),
                                     "log_text": "\n".join(review_lines),
-                                    "result_text": f"[+] Final Payload: {final_payload}",
+                                    "result_text": f"[+] Final Payload: {final_payload}\n[+] Send: {payload_send}",
                                     "sink_kind": analysis.sink_kind if hasattr(analysis, "sink_kind") else "",
                                 },
                             }
@@ -1317,6 +1405,7 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                 sink_kind=analysis.sink_kind,
                 payload_context=analysis.payload_context,
                 flagfile=execution_config.flagfile,
+                php_version_lock=config.auto_phpv_lock,
             )
             review_lines = _format_agent_review_lines(review)
             if review_lines:
@@ -1357,7 +1446,7 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
             job["condition"].notify_all()
 
 
-def _run_custom_command_job(job, command, auto_prompt="", upload_store=None, upload_id=""):
+def _run_custom_command_job(job, command, auto_prompt="", upload_store=None, upload_id="", php_version_lock=""):
     def publish(item):
         with job["condition"]:
             job["events"].append(item)
@@ -1368,6 +1457,8 @@ def _run_custom_command_job(job, command, auto_prompt="", upload_store=None, upl
 
     try:
         event_line(f"[*] Custom command bypass: command = {command}")
+        if php_version_lock:
+            event_line(f"[*] Custom command bypass: php_version_lock = {php_version_lock}")
 
         source = auto_prompt
         if upload_id and upload_store:
@@ -1387,6 +1478,7 @@ def _run_custom_command_job(job, command, auto_prompt="", upload_store=None, upl
             source=source,
             command=command,
             event_callback=event_line,
+            php_version_lock=php_version_lock,
         )
 
         if result.get("error"):
@@ -1397,6 +1489,11 @@ def _run_custom_command_job(job, command, auto_prompt="", upload_store=None, upl
         event_line(f"[+] Bypass payload generated")
         if notes:
             event_line(f"[*] Notes: {notes}")
+        result_lines = ["[+] Custom Command Bypass:", payload]
+        if php_version_lock:
+            result_lines.append(f"[*] PHP Compatibility: PHP {php_version_lock} target")
+        if notes:
+            result_lines.extend(["", notes])
 
         publish({
             "kind": "result",
@@ -1408,7 +1505,8 @@ def _run_custom_command_job(job, command, auto_prompt="", upload_store=None, upl
                 "flag_passed_payloads": [payload] if payload else [],
                 "tips_text": notes,
                 "log_text": "",
-                "result_text": f"[+] Custom Command Bypass:\n{payload}\n\n{notes}",
+                "result_text": "\n".join(result_lines).strip(),
+                "payload_compatibility": f"PHP {php_version_lock} target" if php_version_lock else "",
                 "sink_kind": "command_exec",
             },
         })
@@ -1462,7 +1560,10 @@ def create_app(initial_config: PureWafConfig):
         mode = str(payload.get("mode") or "filter").strip().lower()
         if mode not in {"filter", "auto"}:
             return Response("invalid mode", status=400)
-        config = _build_runtime_config(payload, initial_config)
+        try:
+            config = _build_runtime_config(payload, initial_config)
+        except ValueError as exc:
+            return Response(str(exc), status=400)
         auto_prompt = str(payload.get("auto_prompt") or "")
         upload_id = str(payload.get("upload_id") or "")
         job_id, job = job_store.create()
@@ -1525,11 +1626,15 @@ def create_app(initial_config: PureWafConfig):
 
         upload_id = str(payload.get("upload_id") or "")
         auto_prompt = str(payload.get("auto_prompt") or "")
+        try:
+            php_version_lock = _coerce_optional_php_version(payload.get("auto_phpv_lock"))
+        except ValueError as exc:
+            return Response(str(exc), status=400)
 
         job_id, job = job_store.create()
         threading.Thread(
             target=_run_custom_command_job,
-            args=(job, command, auto_prompt, upload_store, upload_id),
+            args=(job, command, auto_prompt, upload_store, upload_id, php_version_lock),
             daemon=True,
         ).start()
         return jsonify({"job_id": job_id})
