@@ -329,7 +329,9 @@ N/A
 
 欢迎在 issues 中提供 PureWaf 无法解出的题目并附带对应的wp！
 
-供题者的 ID 将会出现在下一版本的 release 中！
+欢迎在 issues 中提供 PureWaf 运行中出现的错误！
+
+作为回报，你们的 ID 将会出现在下一版本的 release 中！
 
 ## Thanks & References
 
