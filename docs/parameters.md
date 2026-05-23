@@ -1,4 +1,4 @@
-# How to Use Parameters?
+# Parameters
 
 **waf_words**
 
