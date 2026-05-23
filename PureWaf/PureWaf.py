@@ -3,6 +3,7 @@
 import importlib
 import logging
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -16,7 +17,7 @@ from . import bypass
 from . import bypass_data
 from . import utils
 
-version = "2.1.1"
+version = "2.1.2"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
@@ -43,11 +44,12 @@ class PureWafConfig:
     upload: bool = False
     log_level: str = "INFO"
     total_payload: bool = False
-    phpv: float = 7.0
+    phpv: object = 7.0
     auto: bool = False
     webui: bool = False
     agent: bool = False
     auto_context: object = None
+    auto_phpv_lock: str = ""
 
 
 @dataclass
@@ -64,6 +66,11 @@ class PureWafExecutionResult:
     final_request_cookies: Dict[str, str] = field(default_factory=dict)
     final_payload_source: str = ""
     final_payload_evidence: str = ""
+    final_send_position: str = ""
+    final_php_compatibility: str = ""
+    final_payload_requirements: str = ""
+    final_payload_reason: str = ""
+    final_sink: str = ""
 
 
 def banner(version_text):
@@ -276,15 +283,151 @@ def _choose_final_payload(shortest_flag: str, shortest_root: str = "N/A"):
     return "N/A"
 
 
+def _format_payload_compatibility(payload: str, phpv, config: PureWafConfig = None):
+    explanation = bypass.describe_payload(
+        payload,
+        payload_context=(config.payload_context if config else "any"),
+        auto_context=(config.auto_context if config else None),
+    )
+    current = utils.format_php_version(phpv)
+    lower = explanation.min_php or "5.6"
+    upper = explanation.max_php or "8.5+"
+    if lower == "5.6" and upper == "8.5+":
+        text = f"PHP {current} target; compatible with PHP 5.6-8.5 unless environment disables required functions"
+    elif explanation.max_php:
+        text = f"PHP {current} target; payload applies to PHP {lower}-{upper}"
+    else:
+        text = f"PHP {current} target; payload requires PHP {lower}+"
+    if explanation.deprecated_from:
+        text += f"; deprecated from PHP {explanation.deprecated_from}"
+    return text
+
+
+def _format_payload_requirements(payload: str, config: PureWafConfig):
+    explanation = bypass.describe_payload(
+        payload,
+        payload_context=config.payload_context,
+        auto_context=config.auto_context,
+    )
+    requirements = list(explanation.requirements)
+    ctx = config.auto_context
+    disabled = [str(item) for item in getattr(ctx, "disable_functions", []) if str(item)]
+    if disabled:
+        requirements.append("disabled functions considered: " + ",".join(disabled))
+    if not requirements:
+        return "none detected"
+    return "; ".join(requirements)
+
+
+def _infer_input_source(ctx):
+    source = str(getattr(ctx, "input_source", "") or "").strip().upper()
+    if source:
+        return source
+    refs = getattr(ctx, "input_refs", []) or []
+    if not refs:
+        return ""
+    match = re.match(r"\$_([A-Z]+)", str(refs[0]))
+    return match.group(1) if match else ""
+
+
+def _format_send_position(payload: str, config: PureWafConfig):
+    ctx = config.auto_context
+    if ctx is None:
+        return "payload value only"
+    source = _infer_input_source(ctx)
+    key = str(getattr(ctx, "input_key", "") or "").strip()
+    route = str(getattr(ctx, "route_path", "") or "").strip()
+    method = str(getattr(ctx, "route_method", "") or "").strip().upper()
+    if not method:
+        method = "GET" if source in {"GET", "REQUEST"} else ("POST" if source == "POST" else source)
+    if source and key and route:
+        return f"{method or source} {route} with {source} parameter {key}={payload}"
+    if source and key:
+        return f"value for detected {source} input key {key}: {payload}"
+    if key:
+        return f"value for detected input key {key}: {payload}"
+    return "payload value only"
+
+
+def _format_sink(config: PureWafConfig):
+    ctx = config.auto_context
+    if ctx is None:
+        return "manual FILTER mode"
+    sink_kind = str(getattr(ctx, "sink_kind", "") or "").strip()
+    sink_function = str(getattr(ctx, "sink_function", "") or "").strip()
+    payload_context = str(getattr(ctx, "payload_context", "") or config.payload_context or "any").strip()
+    parts = []
+    if sink_kind:
+        parts.append(sink_kind)
+    if sink_function:
+        parts.append(sink_function)
+    if payload_context:
+        parts.append(f"context={payload_context}")
+    return " ".join(parts) if parts else "AUTO analysis"
+
+
+def _format_payload_reason(payload: str, config: PureWafConfig):
+    record = bypass.build_payload_record(
+        payload,
+        payload_context=config.payload_context,
+        auto_context=config.auto_context,
+    )
+    reason = ",".join(record.techniques)
+    ctx = config.auto_context
+    if ctx is not None and getattr(ctx, "engine_vulnerability_notes", None):
+        notes = "; ".join(ctx.engine_vulnerability_notes)
+        return f"{reason}; engine notes: {notes}" if reason else notes
+    return reason or "selected shortest passing payload"
+
+
+def _build_result_explanation(payload: str, config: PureWafConfig, phpv):
+    if not payload or payload == "N/A":
+        return {
+            "send": "no passing payload",
+            "compatibility": f"PHP {utils.format_php_version(phpv)} target",
+            "requirements": "none detected",
+            "reason": "no passing payload",
+            "sink": _format_sink(config),
+        }
+    return {
+        "send": _format_send_position(payload, config),
+        "compatibility": _format_payload_compatibility(payload, phpv, config),
+        "requirements": _format_payload_requirements(payload, config),
+        "reason": _format_payload_reason(payload, config),
+        "sink": _format_sink(config),
+    }
+
+
 def _normalize_php_version(phpv, logger):
-    try:
-        return float(phpv)
-    except (ValueError, TypeError):
+    normalized = utils.normalize_php_version_value(phpv)
+    if not normalized:
         logger.error(f"[!] Invalid php_version: {phpv}. Using default 7.0")
         return 7.0
+    if str(phpv).strip() and normalized == "7.0" and not re.match(r"^\d+(?:\.\d+){0,2}$", str(phpv).strip()):
+        logger.error(f"[!] Invalid php_version: {phpv}. Using default 7.0")
+    return normalized
 
 
-def _log_configuration(logger, config: PureWafConfig, phpv: float):
+def _analysis_php_version_value(config: PureWafConfig, analysis):
+    locked = str(getattr(config, "auto_phpv_lock", "") or "").strip()
+    if locked:
+        return locked
+    if getattr(analysis, "php_version_tuple_hint", None):
+        return utils.format_php_version(analysis.php_version_tuple_hint)
+    return analysis.php_version_hint or 7.0
+
+
+def _analysis_context_with_php_version(config: PureWafConfig, analysis):
+    ctx = analysis.to_context()
+    locked = str(getattr(config, "auto_phpv_lock", "") or "").strip()
+    if locked:
+        parsed = utils.parse_php_version(locked)
+        ctx.php_version_tuple_hint = parsed
+        ctx.php_version_hint = float(f"{parsed[0]}.{parsed[1]}")
+    return ctx
+
+
+def _log_configuration(logger, config: PureWafConfig, phpv):
     logger.info("")
     logger.info("-" * 40)
     logger.info("[*] Configuration:")
@@ -530,7 +673,13 @@ def _execute_purewaf(
 
     logger.info("")
     logger.info("-" * 40)
-    logger.info(f"[+] Final Payload: {_choose_final_payload(shortest_flag, shortest_root)}")
+    final_payload = _choose_final_payload(shortest_flag, shortest_root)
+    explanation = _build_result_explanation(final_payload, config, phpv)
+    logger.info(f"[+] Final Payload: {final_payload}")
+    logger.info(f"[+] Send: {explanation['send']}")
+    logger.info(f"[*] PHP Compatibility: {explanation['compatibility']}")
+    logger.info(f"[*] Requirements: {explanation['requirements']}")
+    logger.info(f"[*] Sink: {explanation['sink']}")
     logger.info("-" * 40)
     logger.info("")
 
@@ -545,6 +694,11 @@ def _execute_purewaf(
         flag_passed_payloads=flag_passed_payloads,
         tips_text="\n".join(tips_logger.messages),
         log_text="\n".join(logger.messages),
+        final_send_position=explanation["send"],
+        final_php_compatibility=explanation["compatibility"],
+        final_payload_requirements=explanation["requirements"],
+        final_payload_reason=explanation["reason"],
+        final_sink=explanation["sink"],
     )
 
 
@@ -562,11 +716,11 @@ def _build_agent_auto_execution_config(config: PureWafConfig, analysis):
         phpinfo=False,
         upload=analysis.upload,
         total_payload=False,
-        phpv=analysis.php_version_hint or 7.0,
+        phpv=_analysis_php_version_value(config, analysis),
         auto=True,
         webui=False,
         agent=True,
-        auto_context=analysis.to_context(),
+        auto_context=_analysis_context_with_php_version(config, analysis),
     )
 
 
@@ -656,6 +810,18 @@ def _replace_final_payload_line(log_text: str, final_payload: str):
     return "\n".join(lines).strip()
 
 
+def _is_structured_final_output_line(line: str):
+    prefixes = (
+        "[+] Final Payload:",
+        "[+] Final Payload Value:",
+        "[+] Final Request:",
+        "[+] Final Cookie:",
+        "[+] Final Header:",
+        "[+] Send:",
+    )
+    return str(line or "").startswith(prefixes)
+
+
 def _append_agent_review_to_result(result: PureWafExecutionResult, review):
     lines = _format_agent_review_lines(review)
     if not lines:
@@ -675,6 +841,11 @@ def _append_agent_review_to_result(result: PureWafExecutionResult, review):
         result.final_payload_source = review.source
     if getattr(review, "evidence", ""):
         result.final_payload_evidence = review.evidence
+        result.final_payload_reason = review.evidence
+    if request_path:
+        result.final_send_position = request_path
+    elif payload_value and not result.final_send_position:
+        result.final_send_position = f"payload value only: {payload_value}"
     if payload_value and (result.shortest_flag == "N/A" or not review.valid):
         result.shortest_flag = payload_value
         result.flag_passed_payloads = [payload_value]
@@ -687,7 +858,13 @@ def _append_agent_review_to_result(result: PureWafExecutionResult, review):
     if suffix:
         result.log_text = (result.log_text.rstrip() + "\n" + suffix).strip()
     if review.notes or payload_value or request_path or getattr(review, "evidence", ""):
-        tips_suffix = "\n".join(lines)
+        review_detail_lines = [
+            line for line in lines if not _is_structured_final_output_line(line)
+        ]
+        tips_suffix = "\n".join(review_detail_lines)
+    else:
+        tips_suffix = ""
+    if tips_suffix:
         result.tips_text = (result.tips_text.rstrip() + "\n" + tips_suffix).strip()
     return result
 
@@ -714,7 +891,10 @@ def _execute_agent_auto_from_project(
             return _format_agent_llm_failure(bundle.selection_error)
 
         session.start_phase("stage_1_sink_analysis", {"source_bytes": len(bundle.source)})
-        analysis = resolve_auto_parameters(bundle.source, use_llm=True, agent_session=session)
+        resolve_kwargs = {"use_llm": True, "agent_session": session}
+        if getattr(config, "auto_phpv_lock", ""):
+            resolve_kwargs["php_version_lock"] = config.auto_phpv_lock
+        analysis = resolve_auto_parameters(bundle.source, **resolve_kwargs)
         session.remember(
             "sink_analysis",
             {
@@ -745,6 +925,7 @@ def _execute_agent_auto_from_project(
                 sink_kind=analysis.sink_kind,
                 payload_context=analysis.payload_context,
                 flagfile="/flag",
+                php_version_lock=config.auto_phpv_lock,
             )
             if output_logger:
                 for line in _format_agent_review_lines(review):
@@ -816,6 +997,7 @@ def _execute_agent_auto_from_project(
             sink_kind=analysis.sink_kind,
             payload_context=analysis.payload_context,
             flagfile=execution_config.flagfile,
+            php_version_lock=config.auto_phpv_lock,
         )
         _append_agent_review_to_result(result, review)
         if output_logger:
