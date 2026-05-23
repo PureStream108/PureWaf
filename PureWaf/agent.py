@@ -30,7 +30,7 @@ AGENT_SECURITY_BOUNDARY = (
     "do not write payloads into the local library, and do not use arbitrary user "
     "tools outside the payload validation sandbox."
 )
-ALLOWED_SINK_KINDS = {"command_exec", "file_read_path", "file_write_upload"}
+ALLOWED_SINK_KINDS = {"command_exec", "file_read_path", "file_write_upload", "php_include"}
 ALLOWED_PAYLOAD_CONTEXTS = {"shell_command", "php_code", "file_path", "url_query_value", "any"}
 MIN_CONFIDENCE = 0.6
 PHP_PROJECT_EXTENSIONS = {".php", ".phtml", ".inc"}
@@ -544,11 +544,16 @@ class PureWafLlmSinkAgent:
                     "AUTO mode analyzes one PHP source file to identify the sink, input source, "
                     "filters, transformation/dataflow chain, and execution context, then PureWaf's local payload engine generates "
                     "and filters candidates. Allowed sink kinds are only: command_exec, "
-                    "file_read_path, file_write_upload. Allowed payload_context values are only: "
+                    "file_read_path, file_write_upload, php_include. Allowed payload_context values are only: "
                     "shell_command, php_code, file_path, url_query_value, any. For file_read_path "
                     "prefer file_path unless the answer must be a raw HTTP query value. Do not generate payloads. Do not provide exploit "
                     "steps. Do not use external project knowledge or web content. If the source is "
-                    "insufficient, return an empty sinks array.\n\n"
+                    "insufficient, return an empty sinks array. If you see PHP engine-level UAF "
+                    "preconditions such as untrusted unserialize(), Serializable::unserialize(), "
+                    "SoapServer request handling, disable_functions-driven UAF bypass hints, or "
+                    "vulnerable PHP 8 patch ranges, report them only as metadata labels in "
+                    "strategy_hints or evidence. Do not output UAF PoCs, memory-corruption payloads, "
+                    "or exploitation steps.\n\n"
                     "In addition to sinks, you MUST also extract WAF/filter constraints from the "
                     "source code. Identify blocked words (strings checked via strpos, stripos, "
                     "str_contains, in_array, etc.), blocked characters, regex patterns used for "
@@ -829,7 +834,7 @@ class PureWafLlmSinkAgent:
             return None
         if kind not in ALLOWED_SINK_KINDS:
             return None
-        if kind == "file_read_path" and payload_context == "any":
+        if kind in {"file_read_path", "php_include"} and payload_context == "any":
             payload_context = "file_path"
         if payload_context not in ALLOWED_PAYLOAD_CONTEXTS:
             return None
@@ -1052,14 +1057,19 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                     "1. Select project files relevant to user input, filtering, routing, and "
                     "dangerous sink reachability.\n"
                     "2. From the excerpts, identify sinks and WAF constraints if visible.\n\n"
-                    "Allowed sink kinds: command_exec, file_read_path, file_write_upload. "
+                    "Allowed sink kinds: command_exec, file_read_path, file_write_upload, php_include. "
                     "Allowed payload_context values: shell_command, php_code, file_path, "
                     "url_query_value, any. For file_read_path prefer file_path unless the "
                     "complete exploit must be an HTTP query value.\n\n"
                     "Also preserve project semantics: identify the route/path, the input "
                     "source/key, whether filters run before transforms, and any conversion "
                     "chain that changes the value before the sink. Do not collapse this into "
-                    "only sink_kind plus WAF words.\n\n"
+                    "only sink_kind plus WAF words. If PHP engine-level UAF preconditions appear "
+                    "(untrusted unserialize(), Serializable::unserialize(), SoapServer request "
+                    "handling, disable_functions-driven UAF bypass hints, or vulnerable PHP 8 "
+                    "patch ranges), report them only as metadata labels in strategy_hints or "
+                    "evidence. Do not output UAF PoCs, memory-corruption payloads, or exploitation "
+                    "steps.\n\n"
                     "Return only JSON shaped as:\n"
                     "{\"selected_files\":[\"relative/path.php\"],\"reason\":\"short reason\","
                     "\"route\":{\"path\":\"/preview.php\",\"method\":\"GET\"},"
@@ -1136,6 +1146,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         sink_kind: str = "",
         payload_context: str = "any",
         flagfile: str = "/flag",
+        php_version_lock: str = "",
     ) -> LlmPayloadReview:
         settings, error = self._load_settings()
         if error:
@@ -1155,6 +1166,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 validation_results=validation_results or [],
                 waf_extraction=waf_extraction,
                 transform_chain=transform_chain,
+                php_version_lock=php_version_lock,
             ),
             max_tokens=1000,
         )
@@ -1179,7 +1191,11 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 endpoint=endpoint,
                 error=f"LLM payload review invalid: {exc}",
             )
-        validation_error = self._payload_review_validation_error(review)
+        validation_error = self._payload_review_validation_error(
+            review,
+            php_version_lock=php_version_lock,
+            payload_context=payload_context,
+        )
         if validation_error:
             if self.session:
                 self.session.record_tool_result(
@@ -1243,6 +1259,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         validation_results: Sequence[PayloadValidationResult] = (),
         waf_extraction: Optional[LlmWafExtraction] = None,
         transform_chain: Optional[object] = None,
+        php_version_lock: str = "",
     ) -> List[Dict[str, str]]:
         final_payload = shortest_flag if shortest_flag and shortest_flag != "N/A" else ""
         payload_summary = {
@@ -1254,6 +1271,9 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             "analysis_lines": list(analysis_lines[-20:]),
             "validation_results": [item.as_dict() for item in list(validation_results)[:8]],
         }
+        php_version_lock = str(php_version_lock or "").strip()
+        if php_version_lock:
+            payload_summary["php_version_lock"] = php_version_lock
         fallback_required, fallback_reason = self._review_fallback_requirement(
             shortest_flag=shortest_flag,
             flag_payloads=flag_payloads,
@@ -1273,6 +1293,15 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 payload_summary["transform_chain"] = transform_chain.as_dict()
             elif isinstance(transform_chain, dict):
                 payload_summary["transform_chain"] = transform_chain
+        php_version_instruction = ""
+        if php_version_lock:
+            php_version_instruction = (
+                f" The payload and any fallback you return MUST be valid on PHP {php_version_lock}. "
+                "Do not use payload techniques removed before that version or introduced after it. "
+                "For example, avoid create_function/assert-string execution on PHP 8+, avoid "
+                "PHP 7+ expression calls on PHP 5.x, and avoid open_basedir '..' runtime "
+                "relaxation on PHP 8.3+."
+            )
         waf_constraint_instruction = ""
         if waf_extraction is not None:
             waf_constraint_instruction = (
@@ -1318,6 +1347,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                     "required request state such as a Cookie-controlled object/property, include "
                     "complete request_cookies or request_headers; otherwise the final request is "
                     "not directly usable."
+                    f"{php_version_instruction}"
                     f"{waf_constraint_instruction}"
                     " Do not "
                     "give exploitation steps or prose outside JSON. Return only JSON shaped as "
@@ -1365,13 +1395,37 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         return False, ""
 
     @staticmethod
-    def _payload_review_validation_error(review: LlmPayloadReview) -> str:
+    def _payload_review_validation_error(
+        review: LlmPayloadReview,
+        php_version_lock: str = "",
+        payload_context: str = "any",
+    ) -> str:
         candidate = review.payload_value or review.fallback_payload or review.request_path
         if not review.valid and not candidate:
             return "fallback_payload is required when valid=false"
         if candidate and PureWafProjectAgent._fallback_payload_looks_incomplete(candidate):
             return "fallback_payload must be a complete directly usable payload"
+        if candidate and php_version_lock and not PureWafProjectAgent._payload_compatible_with_php_lock(
+            candidate,
+            php_version_lock,
+            payload_context=payload_context,
+        ):
+            return f"payload is not compatible with PHP {php_version_lock}"
         return ""
+
+    @staticmethod
+    def _payload_compatible_with_php_lock(
+        payload: str,
+        php_version_lock: str,
+        payload_context: str = "any",
+    ) -> bool:
+        from . import bypass
+
+        return bypass._payload_matches_runtime(
+            payload,
+            php_version_lock,
+            payload_context=payload_context,
+        )
 
     def _finalize_payload_review(
         self,
@@ -1572,26 +1626,9 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
 
     @staticmethod
     def _build_iconv_ignore_interleaved_ascii_payload(text: str) -> str:
-        noise = [0xE4, 0xB8, 0xAF, 0xE6, 0x9C, 0x87]
-        chars = list(text)
-        if not chars:
-            return ""
-        counts = [1 for _ in chars]
-        extra = max(0, len(noise) - len(chars))
-        for idx in range(max(0, len(chars) - extra), len(chars)):
-            counts[idx] += 1
-        out: List[str] = []
-        noise_idx = 0
-        for idx, ch in enumerate(chars):
-            for _ in range(counts[idx]):
-                byte = noise[noise_idx % len(noise)]
-                out.append(f"%{byte:02X}")
-                noise_idx += 1
-            if re.fullmatch(r"[A-Za-z0-9._~-]", ch):
-                out.append(ch)
-            else:
-                out.append(urllib.parse.quote(ch, safe=""))
-        return "".join(out)
+        from . import utils
+
+        return utils.build_iconv_ignore_interleaved_ascii_payload(text)
 
     def _ensure_review_request_state(
         self,
@@ -2318,6 +2355,7 @@ echo $out;
         source: str,
         command: str,
         event_callback=None,
+        php_version_lock: str = "",
     ) -> Dict[str, str]:
         if event_callback:
             event_callback("[*] Custom command bypass: loading LLM settings")
@@ -2329,7 +2367,7 @@ echo $out;
             event_callback("[*] Custom command bypass: analyzing WAF constraints and generating payload")
         content, endpoint, chat_error = self._chat_completion(
             settings,
-            self.build_custom_command_messages(source, command),
+            self.build_custom_command_messages(source, command, php_version_lock=php_version_lock),
             max_tokens=1000,
         )
         if chat_error:
@@ -2339,8 +2377,18 @@ echo $out;
             event_callback(f"[*] Custom command bypass: LLM responded (model={settings.model})")
         try:
             parsed = self._load_json_content(content)
+            payload = str(parsed.get("payload", "") or "").strip()[:1000]
+            if php_version_lock and payload and not self._payload_compatible_with_php_lock(
+                payload,
+                php_version_lock,
+            ):
+                return {
+                    "payload": "",
+                    "notes": "",
+                    "error": f"LLM payload is not compatible with PHP {php_version_lock}",
+                }
             return {
-                "payload": str(parsed.get("payload", "") or "").strip()[:1000],
+                "payload": payload,
                 "notes": str(parsed.get("notes", "") or "").strip()[:500],
                 "error": "",
             }
@@ -2351,9 +2399,22 @@ echo $out;
         self,
         source: str,
         command: str,
+        php_version_lock: str = "",
     ) -> List[Dict[str, str]]:
         tamper_desc = self._describe_tamper_techniques()
         bypass_desc = self._describe_bypass_templates()
+        php_version_lock = str(php_version_lock or "").strip()
+        php_version_instruction = ""
+        php_version_context = "No PHP version lock was provided."
+        if php_version_lock:
+            php_version_context = f"PHP version lock: {php_version_lock}"
+            php_version_instruction = (
+                f" The returned payload MUST be valid on PHP {php_version_lock}. "
+                "Do not use techniques that are unavailable in that version, including "
+                "PHP 7+ expression calls on PHP 5.x, create_function/assert-string "
+                "execution on PHP 8+, preg_replace /e on PHP 7+, or PHP 8.3+ "
+                "open_basedir '..' runtime relaxation."
+            )
         return [
             {
                 "role": "system",
@@ -2373,7 +2434,8 @@ echo $out;
                     f"{bypass_desc}\n\n"
                     "4. Return a single payload that executes the equivalent of the user's command "
                     "while bypassing all detected WAF rules. The payload must fit the sink's "
-                    "execution context (shell_command or php_code).\n\n"
+                    "execution context (shell_command or php_code)."
+                    f"{php_version_instruction}\n\n"
                     "Return only JSON: {\"payload\":\"the_bypass_payload\","
                     "\"notes\":\"short explanation of what was bypassed and how\"}.\n"
                     "Do not include exploitation steps or prose outside JSON."
@@ -2384,6 +2446,7 @@ echo $out;
                 "content": (
                     f"PHP source:\n{source[:MAX_PROJECT_SOURCE_BYTES]}\n\n"
                     f"User command to execute: {command}\n\n"
+                    f"{php_version_context}\n\n"
                     "Generate a WAF-bypass payload for this command."
                 ),
             },

@@ -12,13 +12,17 @@ _COMMAND_SINKS = {
     "assert",
     "eval",
     "exec",
-    "include",
-    "include_once",
     "passthru",
-    "require",
-    "require_once",
+    "popen",
+    "proc_open",
     "shell_exec",
     "system",
+}
+_INCLUDE_SINKS = {
+    "include",
+    "include_once",
+    "require",
+    "require_once",
 }
 _CALLBACK_SINKS = {
     "array_filter",
@@ -33,6 +37,8 @@ _FACTORY_SINKS = {
     "preg_replace",
 }
 _FILE_READ_SINKS = {
+    "file",
+    "fopen",
     "file_get_contents",
     "readfile",
     "highlight_file",
@@ -91,6 +97,9 @@ class AutoContext:
     open_basedir: str = ""
     disable_functions: List[str] = field(default_factory=list)
     php_version_hint: Optional[float] = None
+    php_version_tuple_hint: Optional[Tuple[int, int, int]] = None
+    engine_uaf_contexts: List[str] = field(default_factory=list)
+    engine_vulnerability_notes: List[str] = field(default_factory=list)
     input_key: str = ""
     multi_input_filters: Dict[str, "_FilterAccumulator"] = field(default_factory=dict)
     llm_used: bool = False
@@ -125,6 +134,9 @@ class AutoAnalysisResult:
     open_basedir: str = ""
     disable_functions: List[str] = field(default_factory=list)
     php_version_hint: Optional[float] = None
+    php_version_tuple_hint: Optional[Tuple[int, int, int]] = None
+    engine_uaf_contexts: List[str] = field(default_factory=list)
+    engine_vulnerability_notes: List[str] = field(default_factory=list)
     input_key: str = ""
     multi_input_filters: Dict[str, "_FilterAccumulator"] = field(default_factory=dict)
     llm_used: bool = False
@@ -150,6 +162,9 @@ class AutoAnalysisResult:
             open_basedir=self.open_basedir,
             disable_functions=list(self.disable_functions),
             php_version_hint=self.php_version_hint,
+            php_version_tuple_hint=self.php_version_tuple_hint,
+            engine_uaf_contexts=list(self.engine_uaf_contexts),
+            engine_vulnerability_notes=list(self.engine_vulnerability_notes),
             input_key=self.input_key,
             multi_input_filters=dict(self.multi_input_filters),
             llm_used=self.llm_used,
@@ -250,6 +265,14 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, pre
     result.open_basedir = _detect_open_basedir(normalized)
     result.disable_functions = _detect_disable_functions(normalized)
     result.php_version_hint = _detect_php_version_hint(normalized)
+    version_tuple_hint = _detect_php_version_tuple_hint(normalized)
+    result.php_version_tuple_hint = version_tuple_hint
+    result.engine_uaf_contexts = _detect_engine_uaf_contexts(
+        normalized,
+        assignments,
+        version_tuple_hint,
+    )
+    result.engine_vulnerability_notes = _engine_vulnerability_notes(result.engine_uaf_contexts)
     if result.open_basedir:
         result.analysis_lines.append(f"[*] AUTO: open_basedir => {result.open_basedir}")
     if result.disable_functions:
@@ -258,6 +281,7 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, pre
         )
     if result.php_version_hint is not None:
         result.analysis_lines.append(f"[*] AUTO: php_version_hint => {result.php_version_hint}")
+    _append_engine_uaf_analysis_lines(result)
 
     sink = None
     if precomputed_llm_analysis is not None:
@@ -375,7 +399,7 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, pre
         not filters.has_filters()
         and not result.sanitizers
         and not result.preprocessors
-        and sink.kind != "file_read_path"
+        and sink.kind not in {"file_read_path", "php_include"}
     ):
         result.error = "no supported sink/filter pattern detected; use FILTER mode instead"
         return result
@@ -637,7 +661,7 @@ def _sink_from_llm_candidate(
         return _SinkInfo(
             kind=candidate.kind,
             payload_context="file_path"
-            if candidate.kind == "file_read_path" and candidate.payload_context == "any"
+            if candidate.kind in {"file_read_path", "php_include"} and candidate.payload_context == "any"
             else candidate.payload_context,
             target_expr=target_expr,
             target_var=_extract_simple_var(target_expr),
@@ -649,11 +673,30 @@ def _sink_from_llm_candidate(
     return None
 
 
-def resolve_auto_parameters(source: str, use_llm: bool = False, agent_session=None, precomputed_llm_analysis=None) -> AutoAnalysisResult:
+def _apply_php_version_lock(result: AutoAnalysisResult, php_version_lock: str):
+    locked = str(php_version_lock or "").strip()
+    if not locked:
+        return
+    parsed = utils.parse_php_version(locked)
+    result.php_version_tuple_hint = parsed
+    result.php_version_hint = float(f"{parsed[0]}.{parsed[1]}")
+    result.analysis_lines.append(
+        f"[*] AUTO: php_version_lock => {utils.format_php_version(parsed)}"
+    )
+
+
+def resolve_auto_parameters(
+    source: str,
+    use_llm: bool = False,
+    agent_session=None,
+    precomputed_llm_analysis=None,
+    php_version_lock: str = "",
+) -> AutoAnalysisResult:
     result = analyze_php_auto(source, use_llm=use_llm, agent_session=agent_session, precomputed_llm_analysis=precomputed_llm_analysis)
     if result.error:
         return result
 
+    _apply_php_version_lock(result, php_version_lock)
     auto_context = result.to_context()
     for label, read_env, upload in _iter_strategy_candidates(result.sink_kind):
         result.analysis_lines.append(f"[*] AUTO: strategy probe => {label}")
@@ -683,7 +726,7 @@ def _iter_strategy_candidates(sink_kind: str) -> Iterable[Tuple[str, bool, bool]
         yield ("upload=True", False, True)
         yield ("read_env=True, upload=True", True, True)
         return
-    if sink_kind == "file_read_path":
+    if sink_kind in {"file_read_path", "php_include"}:
         yield ("baseline", False, False)
         return
 
@@ -708,7 +751,11 @@ def _probe_strategy(
         ip="127.0.0.1",
         port=8080,
         phpinfo=False,
-        php_version=(auto_context.php_version_hint if auto_context and auto_context.php_version_hint else 7.0),
+        php_version=(
+            utils.format_php_version(auto_context.php_version_tuple_hint)
+            if auto_context and auto_context.php_version_tuple_hint
+            else (auto_context.php_version_hint if auto_context and auto_context.php_version_hint else 7.0)
+        ),
         upload=upload,
         payload_context=payload_context,
         auto_context=auto_context,
@@ -1021,6 +1068,12 @@ def _detect_sink(
             )
         )
 
+    for sink in _detect_backtick_sinks(text, assignments):
+        sinks.append(sink)
+
+    for sink in _detect_include_sinks(text, assignments):
+        sinks.append(sink)
+
     for sink in _detect_callback_sinks(text, assignments, array_sources):
         sinks.append(sink)
 
@@ -1038,8 +1091,11 @@ def _detect_sink(
                 target_expr=target_expr,
                 target_var=_extract_simple_var(target_expr),
                 function_name=name.lower(),
-            )
+                )
         )
+
+    for sink in _detect_spl_file_sinks(text, assignments):
+        sinks.append(sink)
 
     for name, args_text, _start, _end in _iter_named_calls(text, _WRITE_SINKS):
         args = _split_top_level(args_text)
@@ -1070,9 +1126,102 @@ def _detect_sink(
     if len(unique) == 1:
         return sinks[0]
 
-    priority = {"command_exec": 0, "file_write_upload": 1, "file_read_path": 2}
+    priority = {"command_exec": 0, "file_write_upload": 1, "php_include": 2, "file_read_path": 3}
     sinks.sort(key=lambda s: priority.get(s.kind, 9))
     return sinks[0]
+
+
+def _detect_backtick_sinks(
+    text: str,
+    assignments: Dict[str, List[str]],
+) -> List[_SinkInfo]:
+    sinks: List[_SinkInfo] = []
+    for match in re.finditer(r"`([^`]*)`", text, re.S):
+        target_expr = match.group(1).strip()
+        if not target_expr or not _expression_looks_input_related(target_expr):
+            continue
+        prefix, tail, slots = _parse_fixed_command_concat(target_expr, assignments)
+        sinks.append(
+            _SinkInfo(
+                kind="command_exec",
+                payload_context="shell_command",
+                target_expr=target_expr,
+                target_var=_extract_simple_var(target_expr),
+                function_name="backtick",
+                fixed_command_prefix=prefix,
+                fixed_command_tail=tail,
+                input_slots=slots,
+            )
+        )
+    return sinks
+
+
+def _detect_include_sinks(
+    text: str,
+    assignments: Dict[str, List[str]],
+) -> List[_SinkInfo]:
+    sinks: List[_SinkInfo] = []
+    seen = set()
+
+    def add(name: str, target_expr: str):
+        target = _unwrap_outer_parentheses(target_expr.strip())
+        key = (name.lower(), target)
+        if key in seen or not target or not _expression_looks_input_related(target):
+            return
+        seen.add(key)
+        sinks.append(
+            _SinkInfo(
+                kind="php_include",
+                payload_context="file_path",
+                target_expr=target,
+                target_var=_extract_simple_var(target),
+                function_name=name.lower(),
+            )
+        )
+
+    for name, args_text, _start, _end in _iter_named_calls(text, _INCLUDE_SINKS):
+        args = _split_top_level(args_text)
+        if args:
+            add(name, args[0])
+
+    statement_pattern = re.compile(
+        r"\b(include|include_once|require|require_once)\b\s+(.+?);",
+        re.I | re.S,
+    )
+    for match in statement_pattern.finditer(text):
+        target = match.group(2).strip()
+        if target.startswith("("):
+            continue
+        add(match.group(1), target)
+
+    return sinks
+
+
+def _detect_spl_file_sinks(
+    text: str,
+    assignments: Dict[str, List[str]],
+) -> List[_SinkInfo]:
+    sinks: List[_SinkInfo] = []
+    for match in re.finditer(r"\bnew\s+\\?SplFileObject\s*\(", text, re.I):
+        close = _find_matching(text, match.end() - 1, "(", ")")
+        if close == -1:
+            continue
+        args = _split_top_level(text[match.end() : close])
+        if not args:
+            continue
+        target_expr = args[0].strip()
+        if not _supports_file_read_target_expr(target_expr, assignments):
+            continue
+        sinks.append(
+            _SinkInfo(
+                kind="file_read_path",
+                payload_context="file_path",
+                target_expr=target_expr,
+                target_var=_extract_simple_var(target_expr),
+                function_name="splfileobject",
+            )
+        )
+    return sinks
 
 
 def _detect_callback_sinks(
@@ -1171,6 +1320,16 @@ def _command_sink_payload_context(name: str) -> str:
     if lowered in {"system", "exec", "shell_exec", "passthru", "popen", "proc_open"}:
         return "shell_command"
     return "any"
+
+
+def _unwrap_outer_parentheses(expr: str) -> str:
+    stripped = expr.strip()
+    while stripped.startswith("("):
+        close = _find_matching(stripped, 0, "(", ")")
+        if close != len(stripped) - 1:
+            break
+        stripped = stripped[1:-1].strip()
+    return stripped
 
 
 def _extract_simple_var(expr: str) -> Optional[str]:
@@ -1733,6 +1892,165 @@ def _detect_disable_functions(text: str) -> List[str]:
                 if part and part not in disabled:
                     disabled.append(part)
     return disabled
+
+
+def _append_engine_uaf_analysis_lines(result: AutoAnalysisResult):
+    if not result.engine_uaf_contexts:
+        return
+    for context in result.engine_uaf_contexts:
+        result.analysis_lines.append(
+            f"[*] AUTO: potential_engine_uaf_context => {context}"
+        )
+    for note in result.engine_vulnerability_notes:
+        result.analysis_lines.append(f"[*] AUTO: engine_vulnerability_note => {note}")
+    result.analysis_lines.append(
+        "[*] AUTO: note => PureWaf does not generate engine-level UAF exploits"
+    )
+
+
+def _engine_vulnerability_notes(contexts: List[str]) -> List[str]:
+    notes = []
+    mapping = {
+        "unserialize_untrusted_input": "untrusted unserialize() input detected; use as metadata for object/dataflow analysis only",
+        "serializable_custom_unserialize": "Serializable::unserialize implementation present; metadata-only engine risk",
+        "soap_ref_map_cve_2026_6722": "SoapServer vulnerable patch range heuristic matched; no memory-corruption PoC is generated",
+        "php_uaf_cve_2024_11235_vulnerable_version": "PHP 8 vulnerable patch range heuristic matched; no memory-corruption PoC is generated",
+    }
+    for context in contexts:
+        note = mapping.get(context)
+        if note and note not in notes:
+            notes.append(note)
+    return notes
+
+
+def _detect_engine_uaf_contexts(
+    text: str,
+    assignments: Dict[str, List[str]],
+    php_version_hint: Optional[Tuple[int, int, int]],
+) -> List[str]:
+    contexts: List[str] = []
+
+    def add(context: str):
+        if context not in contexts:
+            contexts.append(context)
+
+    if _has_untrusted_unserialize(text, assignments):
+        add("unserialize_untrusted_input")
+    if _has_serializable_custom_unserialize(text):
+        add("serializable_custom_unserialize")
+    if _has_vulnerable_soap_uaf_context(text, php_version_hint):
+        add("soap_ref_map_cve_2026_6722")
+    if _is_cve_2024_11235_vulnerable_version(php_version_hint):
+        add("php_uaf_cve_2024_11235_vulnerable_version")
+
+    return contexts
+
+
+def _has_untrusted_unserialize(text: str, assignments: Dict[str, List[str]]) -> bool:
+    for _nm, args_text, _start, _end in _iter_named_calls(text, {"unserialize"}):
+        args = _split_top_level(args_text)
+        if not args:
+            continue
+        input_refs = _resolve_input_refs(args[0].strip(), assignments, set())
+        if input_refs:
+            return True
+    return False
+
+
+def _has_serializable_custom_unserialize(text: str) -> bool:
+    for match in re.finditer(r"\bclass\s+[A-Za-z_]\w*[^{}]*\{", text, re.I):
+        header = match.group(0)
+        if not re.search(r"\bimplements\b[^{}]*\\?\bSerializable\b", header, re.I):
+            continue
+        body_start = match.end() - 1
+        body_end = _find_matching(text, body_start, "{", "}")
+        if body_end == -1:
+            continue
+        body = text[body_start + 1 : body_end]
+        if re.search(r"\bfunction\s+unserialize\s*\(", body, re.I):
+            return True
+    return False
+
+
+def _has_vulnerable_soap_uaf_context(
+    text: str,
+    php_version_hint: Optional[Tuple[int, int, int]],
+) -> bool:
+    if not _has_soap_request_handling(text):
+        return False
+    return _is_cve_2026_6722_vulnerable_version(php_version_hint)
+
+
+def _has_soap_request_handling(text: str) -> bool:
+    has_server = re.search(r"\bnew\s+\\?SoapServer\s*\(", text, re.I) is not None
+    has_handle = re.search(r"->\s*handle\s*\(", text, re.I) is not None
+    return has_server and has_handle
+
+
+def _is_cve_2026_6722_vulnerable_version(
+    version: Optional[Tuple[int, int, int]],
+) -> bool:
+    if version is None:
+        return False
+    fixed_by_branch = {
+        (8, 2): (8, 2, 31),
+        (8, 3): (8, 3, 31),
+        (8, 4): (8, 4, 21),
+        (8, 5): (8, 5, 6),
+    }
+    fixed = fixed_by_branch.get((version[0], version[1]))
+    return fixed is not None and version < fixed
+
+
+def _is_cve_2024_11235_vulnerable_version(
+    version: Optional[Tuple[int, int, int]],
+) -> bool:
+    if version is None:
+        return False
+    if version[0:2] == (8, 3):
+        return version < (8, 3, 19)
+    if version[0:2] == (8, 4):
+        return version < (8, 4, 5)
+    return False
+
+
+def _detect_php_version_tuple_hint(text: str) -> Optional[Tuple[int, int, int]]:
+    for _nm, args_text, _start, _end in _iter_named_calls(text, {"version_compare"}):
+        args = _split_top_level(args_text)
+        for arg in args:
+            version = _parse_php_version_literal(arg.strip())
+            if version is not None:
+                return version
+
+    m = re.search(r"PHP_VERSION_ID\s*[<>=!]+\s*(\d{5,6})", text)
+    if m:
+        return _parse_php_version_id(m.group(1))
+    return None
+
+
+def _parse_php_version_literal(token: str) -> Optional[Tuple[int, int, int]]:
+    literal = _parse_php_string_literal(token)
+    if literal is None:
+        return None
+    m = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", literal)
+    if not m:
+        return None
+    return (
+        int(m.group(1)),
+        int(m.group(2)),
+        int(m.group(3) or "0"),
+    )
+
+
+def _parse_php_version_id(raw: str) -> Optional[Tuple[int, int, int]]:
+    try:
+        vid = int(raw)
+    except (TypeError, ValueError):
+        return None
+    major = vid // 10000
+    minor = (vid // 100) % 100
+    patch = vid % 100
+    return major, minor, patch
 
 
 def _detect_php_version_hint(text: str) -> Optional[float]:

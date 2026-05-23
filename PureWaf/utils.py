@@ -3,6 +3,60 @@ import re
 import urllib.parse
 
 
+DEFAULT_PHP_VERSION = (7, 0, 0)
+
+
+def parse_php_version(value, default=DEFAULT_PHP_VERSION):
+    """
+    Parse user-facing PHP versions such as 7, 7.4, "8.3.18" or PHP_VERSION_ID
+    style integers into a comparable (major, minor, patch) tuple.
+    """
+    if value is None:
+        return tuple(default)
+    if isinstance(value, tuple) and len(value) >= 2:
+        parts = list(value[:3])
+        while len(parts) < 3:
+            parts.append(0)
+        try:
+            return tuple(max(int(part), 0) for part in parts[:3])
+        except (TypeError, ValueError):
+            return tuple(default)
+    if isinstance(value, int) and value >= 10000:
+        return value // 10000, (value // 100) % 100, value % 100
+
+    text = str(value).strip()
+    if not text:
+        return tuple(default)
+    match = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?", text)
+    if not match:
+        return tuple(default)
+    return (
+        int(match.group(1)),
+        int(match.group(2) or "0"),
+        int(match.group(3) or "0"),
+    )
+
+
+def format_php_version(version):
+    major, minor, patch = parse_php_version(version)
+    if patch:
+        return f"{major}.{minor}.{patch}"
+    return f"{major}.{minor}"
+
+
+def normalize_php_version_value(value, default=DEFAULT_PHP_VERSION):
+    version = parse_php_version(value, default=default)
+    return format_php_version(version)
+
+
+def php_version_at_least(version, minimum):
+    return parse_php_version(version) >= parse_php_version(minimum)
+
+
+def php_version_before(version, limit):
+    return parse_php_version(version) < parse_php_version(limit)
+
+
 def _strip_trailing_regex_flags(text: str) -> str:
     """Strip trailing regex flags like /i, /is from the end of a waf_words string."""
     m = re.search(r'/[ism]{1,3}$', text)
@@ -106,6 +160,45 @@ def double_url_encode(payload: str):
     双重 URL 编码
     """
     return urllib.parse.quote(url_encode(payload), safe="")
+
+
+def percent_encode_each_byte(payload: str, encoding: str = "utf-8"):
+    """
+    Percent-encode every byte, including alphanumeric bytes.
+    Useful when a later urldecode/rawurldecode transform should reconstruct a
+    path while the pre-transform string must avoid literal blacklist words.
+    """
+    raw = str(payload or "").encode(encoding, "replace")
+    return "".join(f"%{byte:02X}" for byte in raw)
+
+
+def build_iconv_ignore_interleaved_ascii_payload(text: str):
+    """
+    Build a URL-safe byte-interleaved value for iconv/mb_convert_encoding
+    chains that drop invalid high bytes with UTF-8//IGNORE.
+    """
+    noise = [0xE4, 0xB8, 0xAF, 0xE6, 0x9C, 0x87]
+    chars = list(str(text or ""))
+    if not chars:
+        return ""
+
+    counts = [1 for _ in chars]
+    extra = max(0, len(noise) - len(chars))
+    for idx in range(max(0, len(chars) - extra), len(chars)):
+        counts[idx] += 1
+
+    out = []
+    noise_idx = 0
+    for idx, ch in enumerate(chars):
+        for _ in range(counts[idx]):
+            byte = noise[noise_idx % len(noise)]
+            out.append(f"%{byte:02X}")
+            noise_idx += 1
+        if re.fullmatch(r"[A-Za-z0-9._~-]", ch):
+            out.append(ch)
+        else:
+            out.append(urllib.parse.quote(ch, safe=""))
+    return "".join(out)
 
 
 def unicode_escape_encode(payload: str):

