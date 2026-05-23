@@ -711,6 +711,46 @@ file_get_contents($convertedPath);
         self.assertTrue(result.skipped)
         self.assertIn("php CLI not found", result.reason)
 
+    def test_custom_command_prompt_includes_php_version_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = PureWafProjectAgent(cwd=Path(tmp))
+
+        messages = agent.build_custom_command_messages(
+            "<?php system($_GET['x']); ?>",
+            "cat /flag",
+            php_version_lock="8.0",
+        )
+
+        combined = "\n".join(message["content"] for message in messages)
+        self.assertIn("PHP version lock: 8.0", combined)
+        self.assertIn("MUST be valid on PHP 8.0", combined)
+        self.assertIn("create_function/assert-string execution on PHP 8+", combined)
+
+    def test_custom_command_rejects_llm_payload_outside_php_lock(self):
+        response_body = {"choices": [{"message": {"content": json.dumps({
+            "payload": "$__=create_function('', $_POST[x]);$__();",
+            "notes": "legacy factory",
+        })}}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, ".env").write_text(
+                "API_KEY=test-key\nBASE_URL=https://llm.example/v1\nMODEL=my-model\n",
+                encoding="utf-8",
+            )
+            agent = PureWafProjectAgent(cwd=Path(tmp))
+            with patch(
+                "PureWaf.agent.request.urlopen",
+                return_value=_FakeResponse(json.dumps(response_body).encode("utf-8")),
+            ):
+                result = agent.generate_custom_command_bypass(
+                    "<?php eval($_POST['x']); ?>",
+                    "id",
+                    php_version_lock="8.0",
+                )
+
+        self.assertEqual(result["payload"], "")
+        self.assertIn("not compatible with PHP 8.0", result["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

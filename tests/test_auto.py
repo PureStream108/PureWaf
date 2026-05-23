@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import unittest
 from unittest.mock import patch
@@ -225,7 +226,7 @@ echo file_get_contents($convertedPath);
         self.assertIn("iconv", result.preprocessors)
 
     def test_analyze_file_read_family_variants(self):
-        for func in ("readfile", "highlight_file", "show_source"):
+        for func in ("readfile", "highlight_file", "show_source", "file", "fopen"):
             with self.subTest(func=func):
                 source = f"""<?php
 $path = $_GET['f'];
@@ -239,6 +240,79 @@ if (strpos($path, 'flag') !== false) {{ die('blocked'); }}
                 self.assertEqual(result.sink_kind, "file_read_path")
                 self.assertEqual(result.sink_function, func)
                 self.assertIn("flag", result.waf_words.split("|"))
+
+    def test_analyze_splfileobject_file_read_sink(self):
+        source = """<?php
+$path = $_GET['f'];
+if (strpos($path, 'flag') !== false) { die('blocked'); }
+$file = new SplFileObject($path);
+echo $file->fgets();
+"""
+
+        result = analyze_php_auto(source)
+
+        self.assertEqual(result.error, "")
+        self.assertEqual(result.sink_kind, "file_read_path")
+        self.assertEqual(result.sink_function, "splfileobject")
+        self.assertEqual(result.payload_context, "file_path")
+
+    def test_analyze_popen_proc_open_and_backtick_sinks(self):
+        cases = {
+            "popen": """<?php
+$cmd = $_GET['cmd'];
+if (strpos($cmd, 'flag') !== false) { die('blocked'); }
+popen($cmd, 'r');
+""",
+            "proc_open": """<?php
+$cmd = $_GET['cmd'];
+if (strpos($cmd, 'flag') !== false) { die('blocked'); }
+proc_open($cmd, [], $pipes);
+""",
+            "backtick": """<?php
+$cmd = $_GET['cmd'];
+if (strpos($cmd, 'flag') !== false) { die('blocked'); }
+echo `$cmd`;
+""",
+        }
+
+        for expected, source in cases.items():
+            with self.subTest(expected=expected):
+                result = analyze_php_auto(source)
+                self.assertEqual(result.error, "")
+                self.assertEqual(result.sink_kind, "command_exec")
+                self.assertEqual(result.sink_function, expected)
+                self.assertEqual(result.payload_context, "shell_command")
+
+    def test_include_sink_uses_file_path_context(self):
+        source = """<?php
+$path = $_GET['page'];
+if (strpos($path, 'flag') !== false) { die('blocked'); }
+include $path;
+"""
+
+        result = analyze_php_auto(source)
+
+        self.assertEqual(result.error, "")
+        self.assertEqual(result.sink_kind, "php_include")
+        self.assertEqual(result.sink_function, "include")
+        self.assertEqual(result.payload_context, "file_path")
+        self.assertEqual(result.input_key, "page")
+
+        options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=7.4,
+            upload=False,
+            payload_context=result.payload_context,
+            auto_context=result.to_context(),
+        )
+        candidates = bypass.generate_candidates(options)
+        self.assertIn("php://filter/read=convert.base64-encode/resource=/flag", candidates)
+        self.assertTrue(any(candidate.startswith("data://text/plain") for candidate in candidates))
 
     def test_analyze_extracts_str_replace_char_filters_for_eval_sink(self):
         source = """<?php
@@ -481,6 +555,38 @@ eval($cmd);
         self.assertIn("system", result.disable_functions)
         self.assertIn("exec", result.disable_functions)
 
+    def test_disable_functions_filter_php_exec_candidates(self):
+        from PureWaf.auto import AutoContext
+
+        ctx = AutoContext(
+            sink_function="eval",
+            disable_functions=["system", "exec", "passthru", "shell_exec"],
+            php_version_hint=8.0,
+        )
+        options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=8.0,
+            upload=False,
+            payload_context="php_code",
+            auto_context=ctx,
+        )
+
+        candidates = bypass.generate_candidates(options)
+        joined = "\n".join(candidates)
+        non_ffi_joined = "\n".join(payload for payload in candidates if "FFI::cdef" not in payload)
+
+        self.assertIsNone(re.search(r"(?<!->)\bsystem\s*\(", non_ffi_joined))
+        self.assertIsNone(re.search(r"['\"]system['\"]\s*\(", non_ffi_joined))
+        self.assertIsNone(re.search(r"(?<!->)\bexec\s*\(", non_ffi_joined))
+        self.assertIsNone(re.search(r"(?<!->)\bpassthru\s*\(", non_ffi_joined))
+        self.assertFalse(any("`" in payload for payload in candidates))
+        self.assertTrue(any("popen" in payload or "proc_open" in payload for payload in candidates))
+
     def test_php_version_hint_extracted(self):
         source = """<?php
 if (version_compare(PHP_VERSION, '7.4', '<')) { die('too old'); }
@@ -493,6 +599,104 @@ eval($cmd);
 
         self.assertEqual(result.error, "")
         self.assertAlmostEqual(result.php_version_hint, 7.4, places=2)
+
+    def test_untrusted_unserialize_warns_without_uaf_payloads(self):
+        source = """<?php
+$user = @unserialize($_COOKIE['user']);
+echo file_get_contents($_GET['f']);
+"""
+
+        result = analyze_php_auto(source)
+
+        self.assertEqual(result.error, "")
+        self.assertIn("unserialize_untrusted_input", result.engine_uaf_contexts)
+        self.assertIn(
+            "[*] AUTO: potential_engine_uaf_context => unserialize_untrusted_input",
+            result.analysis_lines,
+        )
+        self.assertIn(
+            "[*] AUTO: note => PureWaf does not generate engine-level UAF exploits",
+            result.analysis_lines,
+        )
+
+        options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=8.3,
+            upload=False,
+            payload_context=result.payload_context,
+            auto_context=result.to_context(),
+        )
+        candidates = bypass.generate_candidates(options)
+        joined = "\n".join(candidates).lower()
+
+        self.assertNotIn("timeafterfree", joined)
+        self.assertNotIn("zend_mm", joined)
+        self.assertNotIn("fake_zval", joined)
+        self.assertFalse(any(payload.startswith("O:") for payload in candidates))
+
+    def test_serializable_custom_unserialize_warns_as_metadata_only(self):
+        source = """<?php
+class Profile implements Serializable {
+    public function serialize() { return ""; }
+    public function unserialize($data) { $this->data = $data; }
+}
+$cmd = $_GET['cmd'];
+if (strpos($cmd, 'flag') !== false) { die('blocked'); }
+system($cmd);
+"""
+
+        result = analyze_php_auto(source)
+
+        self.assertEqual(result.error, "")
+        self.assertEqual(result.sink_kind, "command_exec")
+        self.assertIn("serializable_custom_unserialize", result.engine_uaf_contexts)
+        self.assertIn(
+            "[*] AUTO: potential_engine_uaf_context => serializable_custom_unserialize",
+            result.analysis_lines,
+        )
+
+    def test_soap_uaf_warning_uses_vulnerable_php_patch_range(self):
+        source = """<?php
+if (PHP_VERSION_ID === 80318) { $hint = true; }
+$server = new SoapServer(null, ['uri' => 'urn:test']);
+$server->handle();
+$cmd = $_GET['cmd'];
+if (strpos($cmd, 'flag') !== false) { die('blocked'); }
+system($cmd);
+"""
+
+        result = analyze_php_auto(source)
+
+        self.assertEqual(result.error, "")
+        self.assertIn("soap_ref_map_cve_2026_6722", result.engine_uaf_contexts)
+        self.assertIn(
+            "php_uaf_cve_2024_11235_vulnerable_version",
+            result.engine_uaf_contexts,
+        )
+
+    def test_soap_uaf_warning_suppressed_for_patched_php_patch_range(self):
+        source = """<?php
+if (PHP_VERSION_ID === 80331) { $hint = true; }
+$server = new SoapServer(null, ['uri' => 'urn:test']);
+$server->handle();
+$cmd = $_GET['cmd'];
+if (strpos($cmd, 'flag') !== false) { die('blocked'); }
+system($cmd);
+"""
+
+        result = analyze_php_auto(source)
+
+        self.assertEqual(result.error, "")
+        self.assertNotIn("soap_ref_map_cve_2026_6722", result.engine_uaf_contexts)
+        self.assertNotIn(
+            "php_uaf_cve_2024_11235_vulnerable_version",
+            result.engine_uaf_contexts,
+        )
 
     def test_precise_eval_uses_known_input_key(self):
         source = """<?php
@@ -622,8 +826,11 @@ system("file " . $a);
             "php://filter/read=convert.base64-encode/resource=/flag",
             file_path_candidates,
         )
+        self.assertNotIn("/flag%00", file_path_candidates)
+        self.assertNotIn("/flag%2500", file_path_candidates)
         self.assertNotIn("nl /f???", file_path_candidates)
         self.assertFalse(any(payload.startswith("cat ") for payload in file_path_candidates))
+        self.assertFalse(any(payload.lower().startswith("cat%20") for payload in file_path_candidates))
 
         options_filter = bypass.BypassOptions(
             flagfile="/flag",
@@ -647,6 +854,73 @@ system("file " . $a);
             "php://filter/convert.iconv.utf-8.utf-16le/resource=/flag",
             candidates_filter,
         )
+
+    def test_file_read_preprocessor_payloads_include_encoding_transforms(self):
+        from PureWaf.auto import AutoContext
+        from PureWaf import utils
+
+        ctx = AutoContext(
+            sink_function="file_get_contents",
+            input_refs=["$_GET['f']"],
+            input_key="f",
+            preprocessors=["iconv", "mb_convert_encoding", "urldecode", "rawurldecode"],
+        )
+        options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=7.0,
+            upload=False,
+            payload_context="file_path",
+            auto_context=ctx,
+        )
+
+        candidates = bypass.generate_candidates(options)
+
+        self.assertEqual(len(candidates), len(set(candidates)))
+        self.assertIn(
+            utils.build_iconv_ignore_interleaved_ascii_payload("flag"),
+            candidates,
+        )
+        self.assertIn(
+            utils.build_iconv_ignore_interleaved_ascii_payload("/flag"),
+            candidates,
+        )
+        self.assertIn("%66%6C%61%67", candidates)
+        self.assertIn("%2F%66%6C%61%67", candidates)
+        self.assertIn("%66%6C%61%67%00", candidates)
+        self.assertIn("%2566%256C%2561%2567", candidates)
+        self.assertFalse(any(payload.lower().startswith("cat%20") for payload in candidates))
+
+    def test_file_read_mb_convert_encoding_triggers_iconv_style_candidates(self):
+        from PureWaf.auto import AutoContext
+        from PureWaf import utils
+
+        ctx = AutoContext(
+            sink_function="file_get_contents",
+            preprocessors=["mb_convert_encoding"],
+        )
+        options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=False,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=7.0,
+            upload=False,
+            payload_context="file_path",
+            auto_context=ctx,
+        )
+
+        candidates = bypass.generate_candidates(options)
+
+        payload = utils.build_iconv_ignore_interleaved_ascii_payload("flag")
+        self.assertIn(payload, candidates)
+        self.assertIn("iconv_ignore_interleave", bypass.infer_payload_techniques(payload))
 
     def test_auto_only_php7_emitted_only_when_version_ge_7(self):
         from PureWaf.auto import AutoContext
@@ -687,6 +961,38 @@ system("file " . $a);
         )
         out_v5 = "\n".join(bypass.generate_candidates(options_v5))
         self.assertNotIn("'phpinfo'()", out_v5)
+
+    def test_php_version_lock_overrides_source_hint_before_strategy_probe(self):
+        source = """<?php
+define('PHP_VERSION_ID', 70400);
+$cmd = $_POST['cmd'] ?? '';
+if (preg_match('/cat|flag/i', $cmd)) { die('blocked'); }
+eval($cmd);
+"""
+
+        result = resolve_auto_parameters(source, php_version_lock="8.0")
+
+        self.assertEqual(result.error, "")
+        self.assertEqual(result.php_version_tuple_hint, (8, 0, 0))
+        self.assertAlmostEqual(result.php_version_hint, 8.0)
+        self.assertIn("[*] AUTO: php_version_lock => 8.0", result.analysis_lines)
+
+        options = bypass.BypassOptions(
+            flagfile="/flag",
+            read_env=False,
+            reflect_shell=True,
+            ip="127.0.0.1",
+            port=8080,
+            phpinfo=False,
+            php_version=7.4,
+            upload=False,
+            payload_context=result.payload_context,
+            auto_context=result.to_context(),
+        )
+        payloads = "\n".join(bypass.generate_candidates(options))
+
+        self.assertNotIn("create_function", payloads)
+        self.assertNotIn("assert($_POST[x]);", payloads)
 
 
 if __name__ == "__main__":

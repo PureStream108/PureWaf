@@ -69,7 +69,7 @@ class TestNewTechniques(unittest.TestCase):
         self.assertTrue(found_eval, "Webshell eval/assert payload not found")
         self.assertTrue(any("call_user_func_array" in p for p in payloads), "call_user_func_array payload not found")
         self.assertTrue(any("array_map(" in p for p in payloads), "array_map payload not found")
-        self.assertTrue(any("preg_replace('/.*/e'" in p for p in payloads), "preg_replace /e payload not found")
+        self.assertFalse(any("preg_replace('/.*/e'" in p for p in payloads), "preg_replace /e should not be emitted for PHP7")
         self.assertTrue(any("create_function" in p for p in payloads), "create_function payload not found")
 
     def test_new_commands(self):

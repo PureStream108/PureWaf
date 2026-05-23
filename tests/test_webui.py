@@ -66,6 +66,11 @@ class WebUiTests(unittest.TestCase):
         self.assertIn('id="auto_prompt"', body)
         self.assertIn('id="auto_zip"', body)
         self.assertIn('id="upload_project"', body)
+        self.assertIn('id="custom_cmd_box"', body)
+        self.assertIn('id="auto_phpv_lock_box"', body)
+        self.assertIn('id="auto_phpv_lock"', body)
+        self.assertIn("锁定环境的php版本，不填默认不限", body)
+        self.assertLess(body.index('id="custom_cmd_box"'), body.index('id="auto_phpv_lock_box"'))
         self.assertIn('id="agent_toggle"', body)
         self.assertIn("AGENT OFF", body)
         self.assertIn("未开始agent功能", body)
@@ -280,6 +285,17 @@ class WebUiTests(unittest.TestCase):
         self.assertTrue(config.auto)
         self.assertTrue(config.agent)
 
+    @unittest.skipIf(_build_runtime_config is None, "Flask webui module not available")
+    def test_build_runtime_config_auto_mode_keeps_optional_php_lock(self):
+        config = _build_runtime_config(
+            {"mode": "auto", "auto_phpv_lock": "8.3.18"},
+            PureWafConfig(webui=True),
+        )
+
+        self.assertTrue(config.auto)
+        self.assertEqual(config.phpv, 7.0)
+        self.assertEqual(config.auto_phpv_lock, "8.3.18")
+
     @unittest.skipIf(create_app is None, "Flask webui module not available")
     def test_webui_agent_upload_zip_returns_upload_id(self):
         app = create_app(PureWafConfig(webui=True, auto=True, agent=False))
@@ -405,6 +421,53 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(called_config.payload_context, "php_code")
         self.assertEqual(called_config.waf_regex, "/[A-Za-z0-9_$]/")
         self.assertEqual(called_config.limit_length, 30)
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_webui_auto_mode_php_lock_overrides_analysis_version_for_generation(self):
+        app = create_app(PureWafConfig(webui=True))
+        client = app.test_client()
+        fake_result = PureWafExecutionResult(
+            shortest_root="root-ok",
+            shortest_flag="flag-ok",
+            root_passed_payloads=["root-ok"],
+            flag_passed_payloads=["flag-ok"],
+            tips_text="",
+            log_text="[+] Final Payload: flag-ok",
+        )
+        fake_analysis = AutoAnalysisResult(
+            sink_kind="command_exec",
+            payload_context="php_code",
+            waf_regex="/flag/i",
+            php_version_hint=5.6,
+            analysis_lines=["[*] AUTO: detected sink => command_exec"],
+        )
+
+        with (
+            patch("PureWaf.webui.resolve_auto_parameters", return_value=fake_analysis) as resolve_mock,
+            patch("PureWaf.webui._execute_purewaf", return_value=fake_result) as execute_mock,
+        ):
+            run_response = client.post(
+                "/api/run",
+                json={
+                    "mode": "auto",
+                    "auto_prompt": "<?php eval($_GET['x']); ?>",
+                    "auto_phpv_lock": "8.0",
+                },
+            )
+            self.assertEqual(run_response.status_code, 200)
+            job_id = run_response.get_json()["job_id"]
+            body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
+
+        resolve_mock.assert_called_once_with(
+            "<?php eval($_GET['x']); ?>",
+            use_llm=True,
+            php_version_lock="8.0",
+        )
+        called_config = execute_mock.call_args.args[0]
+        self.assertEqual(called_config.phpv, "8.0")
+        self.assertEqual(called_config.auto_phpv_lock, "8.0")
+        self.assertEqual(called_config.auto_context.php_version_tuple_hint, (8, 0, 0))
+        self.assertIn('"kind": "result"', body)
 
     @unittest.skipIf(create_app is None, "Flask webui module not available")
     def test_webui_agent_auto_uses_uploaded_project_bundle(self):
@@ -593,6 +656,51 @@ class WebUiTests(unittest.TestCase):
         self.assertTrue(all(item["kind"] != "result" for item in payloads))
 
     @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_custom_command_passes_php_lock_to_llm_generator(self):
+        app = create_app(PureWafConfig(webui=True))
+        client = app.test_client()
+
+        with patch(
+            "PureWaf.webui.PureWafProjectAgent.generate_custom_command_bypass",
+            return_value={"payload": "cat${IFS}/flag", "notes": "space bypass", "error": ""},
+        ) as generate_mock:
+            run_response = client.post(
+                "/api/custom_command",
+                json={
+                    "command": "cat /flag",
+                    "auto_prompt": "<?php system($_GET['x']); ?>",
+                    "auto_phpv_lock": "8.3.18",
+                },
+            )
+            self.assertEqual(run_response.status_code, 200)
+            job_id = run_response.get_json()["job_id"]
+            body = client.get(f"/api/events/{job_id}").get_data(as_text=True)
+
+        generate_mock.assert_called_once()
+        self.assertEqual(generate_mock.call_args.kwargs["php_version_lock"], "8.3.18")
+        payloads = self._extract_sse_payloads(body)
+        result = next(item["result"] for item in payloads if item["kind"] == "result")
+        self.assertEqual(result["payload_compatibility"], "PHP 8.3.18 target")
+        self.assertIn("[*] PHP Compatibility: PHP 8.3.18 target", result["result_text"])
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
+    def test_custom_command_rejects_invalid_php_lock(self):
+        app = create_app(PureWafConfig(webui=True))
+        client = app.test_client()
+
+        response = client.post(
+            "/api/custom_command",
+            json={
+                "command": "id",
+                "auto_prompt": "<?php system($_GET['x']); ?>",
+                "auto_phpv_lock": "8.x",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("invalid php version lock", response.get_data(as_text=True))
+
+    @unittest.skipIf(create_app is None, "Flask webui module not available")
     def test_webui_rejects_invalid_mode(self):
         app = create_app(PureWafConfig(webui=True))
         client = app.test_client()
@@ -629,6 +737,50 @@ class WebUiTests(unittest.TestCase):
         self.assertEqual(result.flag_passed_payloads, ["eval(next(getallheaders()));"])
         self.assertIn("TIPS: User-Agent: 1=system('id');", result.tips_text)
         self.assertIn("[+] Final Payload: eval(next(getallheaders()));", result.log_text)
+        self.assertIn("[+] Send:", result.log_text)
+        self.assertIn("[*] PHP Compatibility:", result.log_text)
+        self.assertIn("[*] Requirements:", result.log_text)
+        self.assertIn("[*] Sink:", result.log_text)
+        self.assertTrue(result.final_send_position)
+        self.assertTrue(result.final_php_compatibility)
+        self.assertTrue(result.final_payload_requirements)
+        self.assertTrue(result.final_sink)
+
+    @unittest.skipIf(_build_result_text is None, "Flask webui module not available")
+    def test_build_result_text_includes_exploitation_explanation(self):
+        result = PureWafExecutionResult(
+            shortest_root="N/A",
+            shortest_flag="payload",
+            root_passed_payloads=[],
+            flag_passed_payloads=["payload"],
+            tips_text=(
+                "[*] AGENT: payload review => fallback_required\n"
+                "[+] Final Payload Value: payload\n"
+                "[+] Final Request: /index.php?x=payload\n"
+                "[+] Final Cookie: user=test\n"
+                "[+] Final Payload: /index.php?x=payload"
+            ),
+            log_text="[+] Final Payload: payload",
+            final_payload_value="payload",
+            final_request_path="/index.php?x=payload",
+            final_request_cookies={"user": "test"},
+            final_send_position="GET /index.php with GET parameter x=payload",
+            final_php_compatibility="PHP 8.3 target",
+            final_payload_requirements="shell_exec enabled",
+            final_sink="command_exec system context=shell_command",
+        )
+
+        text = _build_result_text(result)
+
+        self.assertIn("[+] Send: GET /index.php with GET parameter x=payload", text)
+        self.assertIn("[*] PHP Compatibility: PHP 8.3 target", text)
+        self.assertIn("[*] Requirements: shell_exec enabled", text)
+        self.assertIn("[*] Sink: command_exec system context=shell_command", text)
+        self.assertIn("[*] AGENT: payload review => fallback_required", text)
+        self.assertEqual(text.count("[+] Final Payload Value: payload"), 1)
+        self.assertEqual(text.count("[+] Final Request: /index.php?x=payload"), 1)
+        self.assertEqual(text.count("[+] Final Cookie: user=test"), 1)
+        self.assertEqual(text.count("[+] Final Payload: /index.php?x=payload"), 1)
 
     def test_execute_purewaf_emits_stage_events_for_encoded_fallback(self):
         config = PureWafConfig()
