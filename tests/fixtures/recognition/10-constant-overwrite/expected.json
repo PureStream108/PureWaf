@@ -1,0 +1,9 @@
+{
+  "sink": {
+    "kind": "command_exec",
+    "function": "system"
+  },
+  "filters": [],
+  "polarity": "true",
+  "expect_sink": false
+}

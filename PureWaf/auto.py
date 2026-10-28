@@ -27,13 +27,22 @@ _INCLUDE_SINKS = {
 _CALLBACK_SINKS = {
     "array_filter",
     "array_map",
+    "array_walk",
+    "array_walk_recursive",
     "call_user_func",
     "call_user_func_array",
+    "forward_static_call",
+    "forward_static_call_array",
+    "ob_start",
+    "preg_replace_callback",
+    "register_shutdown_function",
+    "set_error_handler",
     "uasort",
     "usort",
 }
 _FACTORY_SINKS = {
     "create_function",
+    "mb_ereg_replace",
     "preg_replace",
 }
 _FILE_READ_SINKS = {
@@ -50,32 +59,51 @@ _WRITE_SINKS = {
     "fwrite",
     "move_uploaded_file",
 }
-_WORD_FILTER_CALLS = {"str_contains", "stripos", "strpos", "strstr", "stristr", "strchr", "strrchr"}
-_REGEX_FILTER_CALLS = {"preg_match", "preg_match_all"}
+_WORD_FILTER_CALLS = {
+    "str_contains",
+    "str_ends_with",
+    "str_starts_with",
+    "stripos",
+    "strpos",
+    "strstr",
+    "stristr",
+    "strchr",
+    "strrchr",
+}
+_REGEX_FILTER_CALLS = {"mb_ereg", "mb_ereg_match", "mb_eregi", "preg_match", "preg_match_all"}
 _IN_ARRAY_CALLS = {"in_array", "array_search"}
 _USER_INPUT_RE = re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|FILES|SERVER)(?:\s*\[[^\]]+\])?")
 _VAR_RE = re.compile(r"\$[A-Za-z_]\w*")
 _LEN_FILTER_RE_TEMPLATE = r"(?:strlen|mb_strlen)\s*\(\s*{target}\s*\)\s*(>=|>|<=|<)\s*(\d+)"
 _REPLACE_FILTER_CALLS = {"str_replace", "str_ireplace"}
 _PREPROCESSOR_CALLS = {
-    "strtolower",
-    "strtoupper",
-    "trim",
-    "ltrim",
-    "rtrim",
-    "urldecode",
-    "rawurldecode",
     "base64_decode",
     "iconv",
+    "ltrim",
     "mb_convert_encoding",
+    "mb_strtolower",
+    "mb_strtoupper",
+    "rawurldecode",
+    "rtrim",
+    "strrev",
+    "strtolower",
+    "strtoupper",
+    "substr",
+    "trim",
+    "urldecode",
 }
 _SANITIZER_CALLS = {
-    "escapeshellcmd",
-    "escapeshellarg",
     "addslashes",
-    "stripslashes",
-    "htmlspecialchars",
+    "ctype_alnum",
+    "ctype_alpha",
+    "ctype_digit",
+    "escapeshellarg",
+    "escapeshellcmd",
+    "filter_var",
     "htmlentities",
+    "htmlspecialchars",
+    "intval",
+    "stripslashes",
 }
 _SANITIZER_CHAR_CONSTRAINTS = {
     "addslashes": "'\"\\",
@@ -110,6 +138,11 @@ class AutoContext:
     input_source: str = ""
     strategy_hints: List[str] = field(default_factory=list)
     agent_transform_chain: Optional[Dict[str, object]] = None
+    array_input: bool = False
+    variable_overwrite: bool = False
+    source_mismatch: bool = False
+    include_suffix: str = ""
+    path_conditions: List[Dict[str, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -148,6 +181,11 @@ class AutoAnalysisResult:
     input_source: str = ""
     strategy_hints: List[str] = field(default_factory=list)
     agent_transform_chain: Optional[Dict[str, object]] = None
+    array_input: bool = False
+    variable_overwrite: bool = False
+    source_mismatch: bool = False
+    include_suffix: str = ""
+    path_conditions: List[Dict[str, object]] = field(default_factory=list)
 
     def to_context(self) -> AutoContext:
         return AutoContext(
@@ -175,6 +213,11 @@ class AutoAnalysisResult:
             input_source=self.input_source,
             strategy_hints=list(self.strategy_hints),
             agent_transform_chain=dict(self.agent_transform_chain) if isinstance(self.agent_transform_chain, dict) else None,
+            array_input=self.array_input,
+            variable_overwrite=self.variable_overwrite,
+            source_mismatch=self.source_mismatch,
+            include_suffix=self.include_suffix,
+            path_conditions=[dict(item) for item in self.path_conditions],
         )
 
 
@@ -195,6 +238,8 @@ class _SinkInfo:
     fixed_command_prefix: str = ""
     fixed_command_tail: str = ""
     input_slots: List[str] = field(default_factory=list)
+    array_input: bool = False
+    include_suffix: str = ""
 
 
 @dataclass
@@ -301,6 +346,8 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, pre
     result.payload_context = sink.payload_context
     result.fixed_command_prefix = sink.fixed_command_prefix or ""
     result.fixed_command_tail = sink.fixed_command_tail or ""
+    result.array_input = bool(sink.array_input)
+    result.include_suffix = sink.include_suffix or ""
     result.analysis_lines.append(f"[*] AUTO: detected sink => {sink.kind}")
     if sink.function_name:
         result.analysis_lines.append(f"[*] AUTO: sink_function => {sink.function_name}")
@@ -312,6 +359,20 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, pre
         )
 
     input_refs = _resolve_input_refs(sink.target_expr, assignments, set())
+
+    if not input_refs and sink.target_var:
+        extract_sources = _detect_extract_sources(global_text)
+        if extract_sources:
+            var_name = sink.target_var.lstrip("$")
+            if var_name:
+                input_refs = {f"$_{extract_sources[0]}['{var_name}']"}
+                result.variable_overwrite = True
+                result.analysis_lines.append(
+                    "[*] AUTO: variable overwrite via extract($_"
+                    + extract_sources[0]
+                    + ") => "
+                    + sink.target_var
+                )
 
     # Multi-input with fixed command prefix => split-slot mode.
     if sink.input_slots and sink.fixed_command_prefix:
@@ -379,6 +440,12 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, pre
         for ch in san_acc["extra_chars"]:
             filters.add_char(ch)
 
+    if sink.array_input:
+        result.analysis_lines.append(
+            "[!] AUTO: array input makes string filters return false; ignoring them"
+        )
+        filters = _FilterAccumulator()
+
     if filters.errors:
         result.error = filters.errors[0]
         return result
@@ -401,8 +468,35 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, pre
         and not result.preprocessors
         and sink.kind not in {"file_read_path", "php_include"}
     ):
-        result.error = "no supported sink/filter pattern detected; use FILTER mode instead"
-        return result
+        cross_source = _cross_source_bypass(global_text, target_filter_expr)
+        if sink.array_input:
+            result.analysis_lines.append(
+                "[!] AUTO: array input keeps string filters from matching; "
+                "generating unconstrained payloads"
+            )
+        elif cross_source and input_refs:
+            result.input_source = cross_source
+            result.source_mismatch = True
+            result.analysis_lines.append(
+                "[!] AUTO: the filter reads a different superglobal than the sink; "
+                f"send the payload via {cross_source} to bypass it"
+            )
+        elif input_refs and not _source_has_filter_constructs(normalized):
+            result.analysis_lines.append(
+                "[!] AUTO: sink is user-controlled but no WAF filter was detected"
+            )
+            result.analysis_lines.append(
+                "[!] AUTO: generating unconstrained payloads; verify against the target"
+            )
+        elif input_refs:
+            result.error = (
+                "a filter-like call exists but could not be mapped to the sink input "
+                "(unsupported wrapper or dynamic filter); use FILTER mode instead"
+            )
+            return result
+        else:
+            result.error = "no supported sink/filter pattern detected; use FILTER mode instead"
+            return result
 
     _assign_result_filters(result, filters, allow_regex_merge=True)
     _merge_llm_waf_into_result(result)
@@ -410,6 +504,57 @@ def analyze_php_auto(source: str, use_llm: bool = False, agent_session=None, pre
     _apply_agent_transform_chain_metadata(result)
 
     return result
+
+
+_EXTRACT_SOURCE_RE = re.compile(
+    r"\bextract\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)\b", re.I
+)
+_SUPERGLOBAL_REF_RE = re.compile(
+    r"\$_(GET|POST|REQUEST|COOKIE)\s*\[\s*'([^']+)'\s*\]", re.I
+)
+
+
+def _detect_extract_sources(text: str) -> List[str]:
+    seen: List[str] = []
+    for match in _EXTRACT_SOURCE_RE.finditer(text or ""):
+        source = match.group(1).upper()
+        if source not in seen:
+            seen.append(source)
+    return seen
+
+
+def _cross_source_bypass(text: str, target_expr: str) -> str:
+    match = _SUPERGLOBAL_REF_RE.search(target_expr or "")
+    if not match:
+        return ""
+    sink_source = match.group(1).upper()
+    key = match.group(2)
+    if sink_source != "REQUEST":
+        return ""
+    for filtered in ("GET", "POST", "COOKIE"):
+        acc = _collect_filters_for_variable(text, f"$_{filtered}['{key}']")
+        if not (acc.has_filters() or acc.errors):
+            continue
+        for alternative in ("POST", "GET", "COOKIE"):
+            if alternative == filtered:
+                continue
+            other = _collect_filters_for_variable(text, f"$_{alternative}['{key}']")
+            if not (other.has_filters() or other.errors):
+                return alternative
+    return ""
+
+
+def _source_has_filter_constructs(text: str) -> bool:
+    names = (
+        set(_REGEX_FILTER_CALLS)
+        | set(_WORD_FILTER_CALLS)
+        | set(_IN_ARRAY_CALLS)
+        | set(_REPLACE_FILTER_CALLS)
+        | {"strlen", "mb_strlen"}
+    )
+    for _name, _args, _start, _end in _iter_named_calls(text, names):
+        return True
+    return False
 
 
 def _merge_llm_waf_into_result(result: AutoAnalysisResult):
@@ -484,11 +629,7 @@ def _merge_regex_literals_or(regexes: List[str]) -> str:
 
 
 def _split_regex_body_flags(literal: str) -> Tuple[Optional[str], str]:
-    stripped = literal.strip()
-    if stripped.startswith("/") and stripped.count("/") >= 2:
-        last = stripped.rfind("/")
-        return stripped[1:last], stripped[last + 1 :]
-    return None, ""
+    return utils.split_regex_literal(literal)
 
 
 def _collect_auto_context_metadata(
@@ -685,14 +826,167 @@ def _apply_php_version_lock(result: AutoAnalysisResult, php_version_lock: str):
     )
 
 
+def _analyze_with_recognition(
+    source: str,
+    engine: str,
+    use_llm: bool = False,
+    agent_session=None,
+    precomputed_llm_analysis=None,
+) -> AutoAnalysisResult:
+    from . import recognition
+
+    heuristic = analyze_php_auto(
+        source,
+        use_llm=use_llm,
+        agent_session=agent_session,
+        precomputed_llm_analysis=precomputed_llm_analysis,
+    )
+    analysis = recognition.recognize(source, engine, use_llm=use_llm)
+    if not analysis.findings:
+        heuristic.analysis_lines.insert(
+            0,
+            f"[!] AUTO: engine={engine} produced no finding; fell back to heuristic",
+        )
+        return heuristic
+
+    finding = max(
+        analysis.findings,
+        key=lambda item: (
+            item.confidence,
+            item.sink.kind == "command_exec",
+        ),
+    )
+    result = AutoAnalysisResult()
+    result.sink_kind = finding.sink.kind or heuristic.sink_kind
+    result.sink_function = finding.sink.function or heuristic.sink_function
+    result.payload_context = finding.sink.payload_context or heuristic.payload_context
+    result.analysis_lines = [
+        f"[*] AUTO: engine={engine}",
+        f"[*] AUTO: sast sink => {result.sink_kind}:{result.sink_function}",
+    ]
+    if finding.path_conditions:
+        for condition in finding.path_conditions:
+            guard = condition.guard.params if condition.guard is not None else {}
+            result.analysis_lines.append(
+                f"[*] AUTO: path condition => {condition.polarity} {guard}"
+                + (
+                    f" ({condition.filter_polarity})"
+                    if condition.filter_polarity
+                    else ""
+                )
+            )
+
+    for attribute in (
+        "fixed_command_prefix",
+        "fixed_command_tail",
+        "input_slots",
+        "include_suffix",
+        "open_basedir",
+        "disable_functions",
+        "php_version_hint",
+        "php_version_tuple_hint",
+        "engine_uaf_contexts",
+        "engine_vulnerability_notes",
+        "sanitizers",
+        "preprocessors",
+        "variable_overwrite",
+        "source_mismatch",
+    ):
+        setattr(result, attribute, getattr(heuristic, attribute))
+    result.array_input = bool(heuristic.array_input) or finding.sink.function in {
+        "call_user_func_array",
+        "forward_static_call_array",
+    }
+    result.path_conditions = [
+        {
+            "polarity": condition.polarity,
+            "filter_polarity": condition.filter_polarity,
+            "kind": condition.guard.kind if condition.guard is not None else "",
+            "params": dict(condition.guard.params) if condition.guard is not None else {},
+        }
+        for condition in finding.path_conditions
+    ]
+
+    result.input_refs = [
+        f"${source_ref.superglobal}['{source_ref.key}']"
+        for source_ref in finding.sources
+    ]
+    if finding.sources:
+        result.input_source = finding.sources[0].superglobal
+        result.input_key = finding.sources[0].key
+    else:
+        result.input_source = heuristic.input_source
+        result.input_key = heuristic.input_key
+
+    accumulator = _FilterAccumulator()
+    for rule in finding.filters:
+        if rule.kind == "regex":
+            pattern = str(rule.params.get("pattern") or "").strip()
+            if pattern:
+                accumulator.add_regex(pattern)
+        elif rule.kind == "in_array":
+            for value in rule.params.get("values", []) or []:
+                text = str(value or "").strip()
+                if text:
+                    accumulator.add_char(text) if len(text) == 1 else accumulator.add_word(text)
+        else:
+            text = str(rule.params.get("needle") or "").strip()
+            if text:
+                accumulator.add_char(text) if len(text) == 1 else accumulator.add_word(text)
+    if result.array_input:
+        accumulator = _FilterAccumulator()
+        result.analysis_lines.append(
+            "[!] AUTO: array input makes string filters return false; ignoring them"
+        )
+    if accumulator.has_filters():
+        _assign_result_filters(result, accumulator, allow_regex_merge=True)
+    else:
+        if heuristic.sink_kind == result.sink_kind:
+            result.waf_words = heuristic.waf_words
+            result.waf_chars = heuristic.waf_chars
+            result.waf_regex = heuristic.waf_regex
+            result.limit_length = heuristic.limit_length
+        result.analysis_lines.append(
+            "[!] AUTO: sast found no filter on this path; payloads are unconstrained"
+        )
+
+    if analysis.conflicts:
+        for conflict in analysis.conflicts:
+            result.analysis_lines.append(
+                f"[!] AUTO: engine conflict => {conflict.get('type')}"
+            )
+    result.analysis_lines.extend(finding.notes)
+    return result
+
+
 def resolve_auto_parameters(
     source: str,
     use_llm: bool = False,
     agent_session=None,
     precomputed_llm_analysis=None,
     php_version_lock: str = "",
+    engine: str = "",
 ) -> AutoAnalysisResult:
-    result = analyze_php_auto(source, use_llm=use_llm, agent_session=agent_session, precomputed_llm_analysis=precomputed_llm_analysis)
+    from . import recognition
+
+    selected_engine = str(engine or "").strip().lower()
+    if selected_engine not in recognition.ENGINES:
+        selected_engine = recognition.engine_from_env()
+    if selected_engine in {"sast", "both"}:
+        result = _analyze_with_recognition(
+            source,
+            selected_engine,
+            use_llm=use_llm,
+            agent_session=agent_session,
+            precomputed_llm_analysis=precomputed_llm_analysis,
+        )
+    else:
+        result = analyze_php_auto(
+            source,
+            use_llm=use_llm,
+            agent_session=agent_session,
+            precomputed_llm_analysis=precomputed_llm_analysis,
+        )
     if result.error:
         return result
 
@@ -759,6 +1053,7 @@ def _probe_strategy(
         upload=upload,
         payload_context=payload_context,
         auto_context=auto_context,
+        waf_regex=waf_regex,
     )
     waf_words_list = utils.parse_waf_words(waf_words)
     waf_chars_set = utils.parse_waf_chars(waf_chars)
@@ -851,6 +1146,10 @@ def _strip_php_comments(text: str) -> str:
             idx += 2
             while idx < length and text[idx] != "\n":
                 idx += 1
+            continue
+        if ch == "#" and nxt == "[":
+            chars.append(ch)
+            idx += 1
             continue
         if ch == "#":
             idx += 1
@@ -1122,6 +1421,14 @@ def _detect_sink(
     if not sinks:
         return None
 
+    reachable = [
+        sink
+        for sink in sinks
+        if _resolve_input_refs(sink.target_expr, assignments, set())
+    ]
+    if reachable:
+        sinks = reachable
+
     unique = {(sink.kind, sink.payload_context, sink.target_expr) for sink in sinks}
     if len(unique) == 1:
         return sinks[0]
@@ -1165,7 +1472,15 @@ def _detect_include_sinks(
 
     def add(name: str, target_expr: str):
         target = _unwrap_outer_parentheses(target_expr.strip())
-        key = (name.lower(), target)
+        suffix = ""
+        parts = _split_top_level(target, ".")
+        if len(parts) >= 2:
+            literal = _parse_php_string_literal(parts[-1].strip())
+            if literal:
+                candidate = ".".join(parts[:-1]).strip()
+                if candidate and _expression_looks_input_related(candidate):
+                    target, suffix = candidate, literal
+        key = (name.lower(), target, suffix)
         if key in seen or not target or not _expression_looks_input_related(target):
             return
         seen.add(key)
@@ -1176,6 +1491,7 @@ def _detect_include_sinks(
                 target_expr=target,
                 target_var=_extract_simple_var(target),
                 function_name=name.lower(),
+                include_suffix=suffix,
             )
         )
 
@@ -1236,26 +1552,52 @@ def _detect_callback_sinks(
         target_expr = None
         lowered = name.lower()
 
-        if lowered == "call_user_func" and len(args) >= 2:
-            target_expr = args[1].strip()
-        elif lowered == "call_user_func_array" and len(args) >= 2:
-            target_expr = _unwrap_array_arg(args[1], assignments, array_sources)
+        array_input = False
+        callable_name = ""
+        if lowered in {"call_user_func", "forward_static_call"} and len(args) >= 1:
+            target_expr = args[0].strip()
+        elif lowered in {"call_user_func_array", "forward_static_call_array"} and len(args) >= 2:
+            callable_name = (_parse_php_string_literal(args[0].strip()) or "").strip().lower()
+            unwrapped = _unwrap_array_arg(args[1], assignments, array_sources)
+            if unwrapped:
+                target_expr = unwrapped
+            elif _expression_looks_input_related(args[1].strip()):
+                target_expr = args[1].strip()
+                array_input = True
+            else:
+                target_expr = args[0].strip()
         elif lowered == "array_map" and len(args) >= 2:
             target_expr = _unwrap_array_arg(args[1], assignments, array_sources)
-        elif lowered == "array_filter" and len(args) >= 1:
-            target_expr = _unwrap_array_arg(args[0], assignments, array_sources)
-        elif lowered in {"usort", "uasort"} and len(args) >= 1:
+        elif lowered in {"array_filter", "usort", "uasort"} and len(args) >= 1:
             target_expr = _unwrap_array_arg(args[0], assignments, array_sources) or args[0].strip()
+        elif lowered in {"array_walk", "array_walk_recursive"} and len(args) >= 2:
+            target_expr = args[1].strip()
+        elif lowered in {"ob_start", "register_shutdown_function", "set_error_handler"} and len(args) >= 1:
+            target_expr = args[0].strip()
+        elif lowered == "preg_replace_callback" and len(args) >= 2:
+            target_expr = args[1].strip()
 
         if not target_expr or not _expression_looks_input_related(target_expr):
             continue
+        context = "php_code"
+        if callable_name in {
+            "system",
+            "exec",
+            "shell_exec",
+            "passthru",
+            "popen",
+            "proc_open",
+            "pcntl_exec",
+        }:
+            context = "shell_command"
         sinks.append(
             _SinkInfo(
                 kind="command_exec",
-                payload_context="php_code",
+                payload_context=context,
                 target_expr=target_expr,
                 target_var=_extract_simple_var(target_expr),
                 function_name=name.lower(),
+                array_input=array_input,
             )
         )
 
@@ -1269,6 +1611,10 @@ def _detect_callback_sinks(
         elif lowered == "preg_replace" and len(args) >= 2:
             regex_text = _extract_regex_literal(args[0])
             if regex_text and regex_text.rstrip("/").endswith("e"):
+                target_expr = args[1].strip()
+        elif lowered == "mb_ereg_replace" and len(args) >= 3:
+            options = _parse_php_string_literal(args[3].strip()) if len(args) >= 4 else ""
+            if options and "e" in options:
                 target_expr = args[1].strip()
 
         if not target_expr or not _expression_looks_input_related(target_expr):
@@ -1418,6 +1764,12 @@ def _resolve_input_refs(expr: str, assignments: Dict[str, List[str]], seen: Set[
 
 def _resolve_filter_target_vars(expr: str, assignments: Dict[str, List[str]]) -> List[str]:
     ordered: List[str] = []
+    stripped = (expr or "").strip()
+
+    if _USER_INPUT_RE.fullmatch(stripped):
+        return [stripped]
+
+    direct_refs = {re.sub(r"\s+", "", match) for match in _USER_INPUT_RE.findall(stripped)}
 
     def add_var(var: str, seen: Set[str]):
         if not re.fullmatch(r"\$[A-Za-z_]\w*", var):
@@ -1432,8 +1784,11 @@ def _resolve_filter_target_vars(expr: str, assignments: Dict[str, List[str]]) ->
 
     for var in _VAR_RE.findall(expr or ""):
         add_var(var, set())
-    if not ordered and re.fullmatch(r"\$[A-Za-z_]\w*", (expr or "").strip()):
-        ordered.append(expr.strip())
+    if not ordered and re.fullmatch(r"\$[A-Za-z_]\w*", stripped):
+        ordered.append(stripped)
+    for ref in sorted(direct_refs | _resolve_input_refs(stripped, assignments, set())):
+        if ref not in ordered:
+            ordered.append(ref)
     return ordered
 
 
@@ -1704,7 +2059,7 @@ def _foreach_body_filters_target(body: str, target_var: str, item_var: str) -> b
 
 
 def _expr_matches_target(expr: str, target_var: str) -> bool:
-    return expr.strip() == target_var
+    return re.sub(r"\s+", "", expr or "") == re.sub(r"\s+", "", target_var or "")
 
 
 def _parse_fixed_command_concat(

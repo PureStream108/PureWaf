@@ -11,7 +11,7 @@ import time
 import uuid
 import webbrowser
 import zipfile
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from pathlib import PurePosixPath
 
@@ -30,6 +30,7 @@ from .agent import AgentStepLimitExceeded
 from .agent import PureWafAgentSession
 from .agent import PureWafProjectAgent
 from .auto import resolve_auto_parameters
+from . import php_oracle
 from . import utils as _utils
 from .PureWaf import PureWafConfig
 from .PureWaf import _append_agent_review_to_result
@@ -44,6 +45,8 @@ from .PureWaf import version
 
 STREAM_LINE_BATCH_SIZE = 160
 MAX_ZIP_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
+MAX_ACTIVE_JOBS = 8
 
 
 PAGE_TEMPLATE = """
@@ -215,6 +218,8 @@ PAGE_TEMPLATE = """
               <label for="auto_phpv_lock">PHP Version</label>
               <input id="auto_phpv_lock" type="text" placeholder="例如: 5.6, 7.4, 8.3.18">
               <div class="field-help">锁定环境的php版本，不填默认不限</div>
+              <label class="check"><input id="php_verify" type="checkbox">php_verify（本机 PHP / Docker 复验）</label>
+              <div class="field-help">用真实 PHP 执行题目源码并回读 flag，而不是只做正则过滤</div>
             </div>
           </section>
         </div>
@@ -464,6 +469,7 @@ PAGE_TEMPLATE = """
       $("total_payload").checked = !!cfg.total_payload;
       $("phpv").value = cfg.phpv ?? 7.0;
       $("auto_phpv_lock").value = cfg.auto_phpv_lock || "";
+      if($("php_verify")) $("php_verify").checked = !!cfg.php_verify;
       uploadedProjectId = "";
       if($("auto_zip")) $("auto_zip").value = "";
       syncAgentUpload();
@@ -533,6 +539,7 @@ PAGE_TEMPLATE = """
           auto_prompt: $("auto_prompt").value,
           upload_id: uploadedProjectId,
           auto_phpv_lock: $("auto_phpv_lock").value.trim(),
+          php_verify: $("php_verify").checked,
           agent: agentEnabled
         };
       }
@@ -786,6 +793,11 @@ class _JobStore:
             self.jobs[job_id] = job
         return job_id, job
 
+    def count_active(self):
+        with self.lock:
+            self._cleanup_expired_locked()
+            return sum(1 for job in self.jobs.values() if not job.get("done"))
+
     def get(self, job_id):
         with self.lock:
             self._cleanup_expired_locked()
@@ -794,6 +806,18 @@ class _JobStore:
     def pop(self, job_id):
         with self.lock:
             return self.jobs.pop(job_id, None)
+
+
+def _resolve_auto_engine(config) -> str:
+    from . import recognition
+    from .sast import available
+
+    engine = str(getattr(config, "recognition_engine", "") or "").strip().lower()
+    if engine not in recognition.ENGINES:
+        engine = recognition.engine_from_env("")
+    if engine not in recognition.ENGINES:
+        engine = "both" if available() else "heuristic"
+    return engine
 
 
 def _zip_entry_is_symlink(info: zipfile.ZipInfo) -> bool:
@@ -986,6 +1010,8 @@ def _build_auto_runtime_config(payload, base_config: PureWafConfig):
         webui=True,
         agent=_coerce_bool(payload.get("agent", base_config.agent)),
         auto_phpv_lock=auto_phpv_lock,
+        php_verify=_coerce_bool(payload.get("php_verify", base_config.php_verify)),
+        php_path=base_config.php_path,
     )
 
 
@@ -1160,6 +1186,8 @@ def _build_auto_execution_config(base_config: PureWafConfig, analysis):
         agent=base_config.agent,
         auto_context=_analysis_context_with_php_version(base_config, analysis),
         auto_phpv_lock=base_config.auto_phpv_lock,
+        php_verify=base_config.php_verify,
+        php_path=base_config.php_path,
     )
 
 
@@ -1220,6 +1248,7 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                 }
                 if config.auto_phpv_lock:
                     resolve_kwargs["php_version_lock"] = config.auto_phpv_lock
+                resolve_kwargs["engine"] = _resolve_auto_engine(config)
                 analysis = resolve_auto_parameters(bundle.source, **resolve_kwargs)
             else:
                 if agent_session:
@@ -1230,16 +1259,21 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                     resolve_kwargs = {"use_llm": True, "agent_session": agent_session}
                     if config.auto_phpv_lock:
                         resolve_kwargs["php_version_lock"] = config.auto_phpv_lock
+                    resolve_kwargs["engine"] = _resolve_auto_engine(config)
                     analysis = resolve_auto_parameters(auto_prompt, **resolve_kwargs)
                 else:
+                    engine = _resolve_auto_engine(config)
                     if config.auto_phpv_lock:
                         analysis = resolve_auto_parameters(
                             auto_prompt,
                             use_llm=True,
                             php_version_lock=config.auto_phpv_lock,
+                            engine=engine,
                         )
                     else:
-                        analysis = resolve_auto_parameters(auto_prompt, use_llm=True)
+                        analysis = resolve_auto_parameters(
+                            auto_prompt, use_llm=True, engine=engine
+                        )
             if agent_session:
                 agent_session.remember(
                     "sink_analysis",
@@ -1345,6 +1379,28 @@ def _run_job(job, config: PureWafConfig, auto_prompt="", upload_store=None, uplo
                     {"sink_kind": analysis.sink_kind},
                 )
             execution_config = _build_auto_execution_config(config, analysis)
+            if config.php_verify:
+                if config.agent and upload_id:
+                    project_files = {
+                        file.path: file.content for file in bundle.files
+                    }
+                    entry = php_oracle.select_entry_file(project_files)
+                    execution_config = replace(
+                        execution_config,
+                        php_project_files=project_files,
+                        php_entry=entry,
+                    )
+                    publish(
+                        {
+                            "kind": "lines",
+                            "lines": [
+                                f"[*] PHP Verify: project files={len(project_files)} "
+                                f"entry={entry}"
+                            ],
+                        }
+                    )
+                else:
+                    execution_config = replace(execution_config, php_source=auto_prompt)
 
         result = _execute_purewaf(
             execution_config,
@@ -1521,6 +1577,7 @@ def _run_custom_command_job(job, command, auto_prompt="", upload_store=None, upl
 
 def create_app(initial_config: PureWafConfig):
     app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
     job_store = _JobStore()
     upload_store = _UploadStore()
 
@@ -1566,6 +1623,8 @@ def create_app(initial_config: PureWafConfig):
             return Response(str(exc), status=400)
         auto_prompt = str(payload.get("auto_prompt") or "")
         upload_id = str(payload.get("upload_id") or "")
+        if job_store.count_active() >= MAX_ACTIVE_JOBS:
+            return Response("too many active jobs, wait for one to finish", status=429)
         job_id, job = job_store.create()
         threading.Thread(
             target=_run_job,
@@ -1631,6 +1690,8 @@ def create_app(initial_config: PureWafConfig):
         except ValueError as exc:
             return Response(str(exc), status=400)
 
+        if job_store.count_active() >= MAX_ACTIVE_JOBS:
+            return Response("too many active jobs, wait for one to finish", status=429)
         job_id, job = job_store.create()
         threading.Thread(
             target=_run_custom_command_job,

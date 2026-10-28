@@ -1,0 +1,13 @@
+{
+  "sink": {
+    "kind": "command_exec",
+    "function": "call_user_func_array"
+  },
+  "filters": [
+    {
+      "kind": "regex",
+      "pattern": "/[a-z]/i"
+    }
+  ],
+  "polarity": "true"
+}

@@ -15,9 +15,10 @@ from typing import Dict, List
 
 from . import bypass
 from . import bypass_data
+from . import recognition
 from . import utils
 
-version = "2.1.2"
+version = "2.2.0"
 
 SPECIAL_UPLOAD_POC_PAYLOAD = bypass_data.SPECIAL_UPLOAD_POC_TRIGGER_PAYLOADS[1]
 SPECIAL_UPLOAD_POC_EGS = bypass_data.SPECIAL_UPLOAD_POC_EGS
@@ -50,7 +51,13 @@ class PureWafConfig:
     agent: bool = False
     auto_context: object = None
     auto_phpv_lock: str = ""
-
+    php_verify: bool = False
+    php_path: str = ""
+    php_source: str = ""
+    php_project_files: object = None
+    php_entry: str = ""
+    recognition_engine: str = ""
+    generator: str = ""
 
 @dataclass
 class PureWafExecutionResult:
@@ -71,6 +78,8 @@ class PureWafExecutionResult:
     final_payload_requirements: str = ""
     final_payload_reason: str = ""
     final_sink: str = ""
+    php_verified: bool = False
+    php_verification: Dict[str, object] = field(default_factory=dict)
 
 
 def banner(version_text):
@@ -141,7 +150,6 @@ def _configure_logger(log_level: str):
     show_progress = True
     if level_name == "QUIET":
         logger.setLevel(logging.CRITICAL)
-        sys.stdout = open(os.devnull, "w")
         show_progress = False
     else:
         logger.setLevel(getattr(logging, level_name))
@@ -271,6 +279,41 @@ def _choose_shortest_payload(passed_payloads, upload: bool, prefer_order=False):
     if upload:
         return _choose_upload_payload(passed_payloads, prefer_order=prefer_order)
     return min(passed_payloads, key=len)
+
+
+_PREFIX_BREAKOUT_STARTS = (";", "|", "&", "$(", "`", "\n")
+
+
+def _prioritize_prefix_breakouts(payloads):
+    first = []
+    rest = []
+    for payload in payloads:
+        text = str(payload or "")
+        if text.startswith(_PREFIX_BREAKOUT_STARTS):
+            first.append(payload)
+        else:
+            rest.append(payload)
+    return first + rest
+
+
+def _diversify_payloads(payloads, limit: int = 32):
+    groups = {}
+    order = []
+    for payload in payloads:
+        try:
+            techniques = tuple(sorted(bypass.infer_payload_techniques(payload)))
+        except Exception:
+            techniques = ()
+        key = techniques or ("plain",)
+        if key in groups:
+            continue
+        groups[key] = payload
+        order.append(key)
+        if len(order) >= limit:
+            break
+    picked = [groups[key] for key in order]
+    picked_set = set(picked)
+    return picked + [payload for payload in payloads if payload not in picked_set]
 
 
 def _choose_final_payload(shortest_flag: str, shortest_root: str = "N/A"):
@@ -520,7 +563,8 @@ def _process_payload_scope(
     show_progress: bool,
     event_callback=None,
 ):
-    logger.info(f"[*] Generating payloads for {scope_label}...")
+    engine = config.recognition_engine or recognition.engine_from_env()
+    logger.info(f"[*] Generating payloads for {scope_label} (engine={engine})...")
 
     base_payloads = bypass.generate_candidates(options)
     if not base_payloads:
@@ -535,6 +579,7 @@ def _process_payload_scope(
         waf_regex_obj,
         payload_context=config.payload_context,
     )
+    allow_utf8_break = utils.regex_has_utf8_flag(config.waf_regex)
     _emit_candidate_events(event_callback, scope_key, "targeted", scope_label, targeted_payloads)
     passed_payloads = bypass.filter_payloads(
         targeted_payloads,
@@ -546,12 +591,29 @@ def _process_payload_scope(
         verbose=config.total_payload,
         progress_callback=_build_filter_progress_callback(event_callback, scope_key, "targeted"),
         trace_callback=_build_filter_trace_callback(event_callback, scope_key, "targeted"),
+        allow_utf8_break=allow_utf8_break,
     )
-    shortest_payload = _choose_shortest_payload(
-        passed_payloads,
-        config.upload,
-        prefer_order=False,
-    )
+    if config.auto_context is not None and getattr(
+        config.auto_context, "fixed_command_prefix", ""
+    ):
+        passed_payloads = _prioritize_prefix_breakouts(passed_payloads)
+        breakouts = [
+            payload
+            for payload in passed_payloads
+            if str(payload or "").startswith(_PREFIX_BREAKOUT_STARTS)
+        ]
+        shortest_payload = (
+            min(breakouts, key=len)
+            if breakouts
+            else _choose_shortest_payload(passed_payloads, config.upload, prefer_order=False)
+        )
+    else:
+        shortest_payload = _choose_shortest_payload(
+            passed_payloads,
+            config.upload,
+            prefer_order=False,
+        )
+    passed_payloads = _diversify_payloads(passed_payloads)
     final_passed_payloads = passed_payloads
 
     if shortest_payload == "N/A":
@@ -576,6 +638,7 @@ def _process_payload_scope(
             verbose=config.total_payload,
             progress_callback=_build_filter_progress_callback(event_callback, scope_key, "fallback"),
             trace_callback=_build_filter_trace_callback(event_callback, scope_key, "fallback"),
+            allow_utf8_break=allow_utf8_break,
         )
         shortest_payload = _choose_shortest_payload(
             fallback_passed_payloads,
@@ -612,7 +675,10 @@ def _execute_purewaf(
 
     waf_words_list = utils.parse_waf_words(config.waf_words)
     waf_chars_set = utils.parse_waf_chars(config.waf_chars)
-    waf_regex_obj = utils.parse_waf_regex(config.waf_regex)
+    waf_regex_obj, waf_regex_error = utils.parse_waf_regex_with_error(config.waf_regex)
+    if waf_regex_error:
+        logger.warning(f"[!] {waf_regex_error}")
+        logger.warning("[!] The regex filter is ignored, so generated payloads are NOT verified against it.")
     strategies = utils.get_encoding_strategies()
 
     options_root = bypass.BypassOptions(
@@ -626,6 +692,8 @@ def _execute_purewaf(
         upload=config.upload,
         payload_context=config.payload_context,
         auto_context=config.auto_context,
+        waf_regex=config.waf_regex,
+        generator=config.generator or os.environ.get("PUREWAF_GENERATOR", "") or "hybrid",
     )
 
     options_flag = bypass.BypassOptions(
@@ -639,6 +707,8 @@ def _execute_purewaf(
         upload=config.upload,
         payload_context=config.payload_context,
         auto_context=config.auto_context,
+        waf_regex=config.waf_regex,
+        generator=config.generator or os.environ.get("PUREWAF_GENERATOR", "") or "hybrid",
     )
 
     shortest_root, root_passed_payloads = _process_payload_scope(
@@ -674,6 +744,23 @@ def _execute_purewaf(
     logger.info("")
     logger.info("-" * 40)
     final_payload = _choose_final_payload(shortest_flag, shortest_root)
+    verification = None
+    if config.php_verify and (config.php_source or config.php_project_files):
+        verification = _verify_with_php(
+            config,
+            final_payload,
+            flag_passed_payloads,
+            root_passed_payloads,
+            logger,
+        )
+        if verification is not None and verification.passed:
+            if verification.payload in flag_passed_payloads or verification.payload == shortest_flag:
+                shortest_flag = verification.payload
+            elif verification.payload in root_passed_payloads or verification.payload == shortest_root:
+                shortest_root = verification.payload
+            final_payload = _choose_final_payload(shortest_flag, shortest_root)
+    elif config.php_verify:
+        logger.warning("[!] PHP Verify: skipped because no single-file source was supplied")
     explanation = _build_result_explanation(final_payload, config, phpv)
     logger.info(f"[+] Final Payload: {final_payload}")
     logger.info(f"[+] Send: {explanation['send']}")
@@ -699,6 +786,179 @@ def _execute_purewaf(
         final_payload_requirements=explanation["requirements"],
         final_payload_reason=explanation["reason"],
         final_sink=explanation["sink"],
+        php_verified=bool(verification is not None and verification.passed),
+        php_verification=verification.as_dict() if verification is not None else {},
+    )
+
+
+def _verify_with_php(config: PureWafConfig, final_payload, flag_payloads, root_payloads, logger):
+    from . import php_oracle
+
+    environment = php_oracle.environment_report(config.php_path or None)
+    native_available = bool(environment.get("available"))
+    docker_available = php_oracle.docker_available()
+    if not native_available and not docker_available:
+        logger.warning(
+            "[!] PHP Verify: no php CLI and no docker runtime; set PUREWAF_PHP, install php, "
+            "or pull php:8.3-cli to enable cross-validation"
+        )
+        return None
+
+    candidates = []
+    for payload in [final_payload] + list(flag_payloads)[:6] + list(root_payloads)[:6]:
+        text = str(payload or "").strip()
+        if text and text != "N/A" and text not in candidates:
+            candidates.append(text)
+        if len(candidates) >= 8:
+            break
+
+    ctx = config.auto_context
+    input_source = _infer_input_source(ctx)
+    input_key = str(getattr(ctx, "input_key", "") or "") if ctx is not None else ""
+    if ctx is not None and getattr(ctx, "array_input", False) and input_key:
+        input_key = input_key if input_key.endswith("[]") else input_key + "[]"
+
+    runtimes = []
+    if native_available:
+        runtimes.append("native")
+    if docker_available:
+        runtimes.append("docker")
+
+    verification = None
+    for runtime in runtimes:
+        sandbox_flag = None
+        payload_flag_path = None
+        temp_dir = None
+        if runtime == "native":
+            import tempfile
+
+            temp_dir = tempfile.mkdtemp(
+                prefix="purewaf-verify-", dir=php_oracle.sandbox_parent()
+            )
+            sandbox_flag = str(Path(temp_dir) / "flag")
+            logger.info(
+                f"[*] PHP Verify: php {environment.get('php_version')} @ {environment.get('php_path')}"
+            )
+        else:
+            payload_flag_path = "/work/flag"
+            logger.info(f"[*] PHP Verify: docker runtime ({php_oracle.DOCKER_IMAGE})")
+        project_files = getattr(config, "php_project_files", None)
+        entry = str(getattr(config, "php_entry", "") or "source.php")
+        if project_files:
+            logger.info(
+                f"[*] PHP Verify: project files={len(project_files)} entry={entry}"
+            )
+        try:
+            verification = php_oracle.verify_payloads(
+                config.php_source,
+                candidates,
+                input_source=input_source,
+                input_key=input_key,
+                php_bin=(config.php_path or None) if runtime == "native" else None,
+                flagfile=config.flagfile,
+                max_payloads=8,
+                max_placements=4,
+                sandbox_flag=sandbox_flag,
+                runtime=runtime,
+                payload_flag_path=payload_flag_path,
+                project_files=project_files,
+                entry=entry,
+            )
+        finally:
+            if temp_dir:
+                import shutil
+
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        if verification.passed:
+            logger.info(
+                f"[+] PHP Verify: passed via {verification.placement}: {verification.payload}"
+            )
+            return verification
+        if (
+            ctx is not None
+            and str(getattr(config, "payload_context", "") or "any")
+            in {"shell_command", "any"}
+            and str(config.generator or "hybrid").lower() in {"planner", "hybrid"}
+        ):
+            feedback = _verify_with_planner_feedback(
+                config,
+                runtime,
+                sandbox_flag,
+                payload_flag_path,
+                project_files,
+                entry,
+                input_source,
+                input_key,
+                logger,
+            )
+            if feedback is not None and feedback.passed:
+                logger.info(
+                    f"[+] PHP Verify: planner feedback found {feedback.payload}"
+                )
+                return feedback
+        logger.warning(
+            f"[!] PHP Verify: {runtime} produced no passing candidate "
+            f"({len(verification.attempts)} runs, {verification.reason})"
+        )
+    return verification
+
+
+def _verify_with_planner_feedback(
+    config,
+    runtime,
+    sandbox_flag,
+    payload_flag_path,
+    project_files,
+    entry,
+    input_source,
+    input_key,
+    logger,
+):
+    from . import php_oracle, planner
+
+    flagfile = config.flagfile or "/flag"
+    command = f"cat {flagfile}"
+    target_flag = payload_flag_path or sandbox_flag
+
+    def batch_verifier(payloads):
+        passed = set()
+        for payload in payloads:
+            variants = [payload]
+            if target_flag and flagfile and flagfile in payload:
+                rewritten = payload.replace(flagfile, target_flag)
+                if rewritten not in variants:
+                    variants.insert(0, rewritten)
+            for variant in variants:
+                for _label, request in php_oracle.build_placements(
+                    input_source, input_key, variant, max_placements=4
+                ):
+                    result = php_oracle.run_source(
+                        config.php_source or "",
+                        request=request,
+                        php_bin=(config.php_path or None) if runtime == "native" else None,
+                        flagfile=flagfile,
+                        flag_path=sandbox_flag,
+                        runtime=runtime,
+                        project_files=project_files,
+                        entry=entry,
+                    )
+                    if result.passed:
+                        passed.add(payload)
+                        break
+                if payload in passed:
+                    break
+        return passed
+
+    best = planner.feedback_search(command, batch_verifier, rounds=2, top_k=4)
+    if not best:
+        return None
+    return php_oracle.PhpVerification(
+        payload=best,
+        placement="planner-feedback",
+        passed=True,
+        php_path=php_oracle.find_php_binary() or "",
+        php_version=php_oracle.php_version() if runtime == "native" else "",
+        reason="planner feedback loop found a passing payload",
     )
 
 
@@ -878,6 +1138,7 @@ def _execute_agent_auto_from_project(
     from .agent import PureWafAgentSession
     from .agent import PureWafProjectAgent
     from .auto import resolve_auto_parameters
+    from . import php_oracle
 
     session = PureWafAgentSession(cwd=Path.cwd())
     try:
@@ -891,7 +1152,11 @@ def _execute_agent_auto_from_project(
             return _format_agent_llm_failure(bundle.selection_error)
 
         session.start_phase("stage_1_sink_analysis", {"source_bytes": len(bundle.source)})
-        resolve_kwargs = {"use_llm": True, "agent_session": session}
+        resolve_kwargs = {
+            "use_llm": True,
+            "agent_session": session,
+            "engine": config.recognition_engine or recognition.engine_from_env(),
+        }
         if getattr(config, "auto_phpv_lock", ""):
             resolve_kwargs["php_version_lock"] = config.auto_phpv_lock
         analysis = resolve_auto_parameters(bundle.source, **resolve_kwargs)
@@ -947,6 +1212,24 @@ def _execute_agent_auto_from_project(
 
         session.start_phase("stage_2_purewaf_generation", {"sink_kind": analysis.sink_kind})
         execution_config = _build_agent_auto_execution_config(config, analysis)
+        if config.php_verify:
+            project_files = {file.path: file.content for file in bundle.files}
+            if len(project_files) == 1:
+                execution_config = replace(
+                    execution_config,
+                    php_source=next(iter(project_files.values())),
+                )
+            elif project_files:
+                entry = php_oracle.select_entry_file(project_files)
+                execution_config = replace(
+                    execution_config,
+                    php_project_files=project_files,
+                    php_entry=entry,
+                )
+                if output_logger:
+                    output_logger.info(
+                        f"[*] PHP Verify: project files={len(project_files)} entry={entry}"
+                    )
         result = _execute_purewaf(
             execution_config,
             output_logger=output_logger,
@@ -1065,6 +1348,8 @@ def purewaf(
     auto=False,
     webui=False,
     agent=False,
+    php_verify=False,
+    php_path="",
 ):
     if auto and not (webui or agent):
         raise RuntimeError("auto=True can only be used together with webui=True or agent=True.")
@@ -1088,6 +1373,8 @@ def purewaf(
         auto=auto,
         webui=webui,
         agent=agent,
+        php_verify=php_verify,
+        php_path=php_path,
     )
 
     if config.webui:
@@ -1111,4 +1398,4 @@ def purewaf(
         show_progress=show_progress,
         sleep_before_run=True,
     )
-    return result.shortest_flag
+    return _choose_final_payload(result.shortest_flag, result.shortest_root)

@@ -140,6 +140,19 @@ celerybeat.pid
 .env
 .envrc
 .venv
+
+# PureWaf agent AUTO artifacts (LLM config, project input, run state)
+pure/
+purewaf_agent_state.json
+
+# Portable PHP runtime downloaded by `python -m PureWaf.php_oracle --install-portable`
+.purewaf-php/
+
+# Workspace-local PHP execution sandboxes (PUREWAF_SANDBOX_ROOT)
+.purewaf-sandbox/
+
+# Local benchmark corpus and runner (not shipped)
+benchmarks/
 env/
 venv/
 ENV/

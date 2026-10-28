@@ -710,6 +710,7 @@ eval($cmd);
         self.assertEqual(result.input_key, "spell")
 
         ctx = result.to_context()
+        ctx.sink_kind = "file_write_upload"
         ctx.sink_function = "eval"
         options = bypass.BypassOptions(
             flagfile="/flag",

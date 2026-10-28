@@ -1,0 +1,8 @@
+{
+  "sink": {
+    "kind": "command_exec",
+    "function": "eval"
+  },
+  "filters": [],
+  "polarity": "true"
+}

@@ -2,7 +2,6 @@ import base64
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
@@ -13,6 +12,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib import error
 from urllib import request
+
+from . import php_oracle
 
 
 AGENT_STATE_FILENAME = "purewaf_agent_state.json"
@@ -38,6 +39,8 @@ PROJECT_SKIP_DIRS = {".git", "__MACOSX", "node_modules", "vendor"}
 MAX_PROJECT_FILES = 80
 MAX_PROJECT_FILE_BYTES = 1024 * 1024
 MAX_PROJECT_SOURCE_BYTES = 2 * 1024 * 1024
+MAX_LLM_REVIEW_SOURCE_BYTES = 120_000
+MAX_LLM_SELECTION_CHARS = 60_000
 MAX_AGENT_HISTORY = 24
 MAX_AGENT_MEMORY_VALUE = 500
 MAX_AGENT_SUMMARY_VALUE = 320
@@ -51,6 +54,13 @@ class AgentStepLimitExceeded(RuntimeError):
 
 def _now_epoch() -> float:
     return round(time.time(), 3)
+
+
+def _bounded_prompt_source(source: str, limit: int) -> str:
+    text = str(source or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n/* PUREWAF_PROMPT_TRUNCATED: source exceeded prompt budget */"
 
 
 def _compact_text(value, limit: int = MAX_AGENT_SUMMARY_VALUE) -> str:
@@ -601,7 +611,7 @@ class PureWafLlmSinkAgent:
         for path in candidates:
             try:
                 if path.exists():
-                    return path.read_text(encoding="utf-8", errors="replace")[:4000]
+                    return path.read_text(encoding="utf-8", errors="replace")[:8000]
             except Exception:
                 continue
 
@@ -1037,12 +1047,20 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
         files: Sequence[ProjectSourceFile],
     ) -> List[Dict[str, str]]:
         file_blocks = []
+        budget = MAX_LLM_SELECTION_CHARS
         for file in files:
             excerpt = file.content[:1600]
-            file_blocks.append(
+            block = (
                 f"PATH: {file.path}\nSIZE: {file.size}\nTRUNCATED: {file.truncated}\n"
                 f"EXCERPT:\n{excerpt}"
             )
+            if budget - len(block) < 0 and file_blocks:
+                file_blocks.append(
+                    "/* PUREWAF_SELECTION_TRUNCATED: file inventory exceeded prompt budget */"
+                )
+                break
+            file_blocks.append(block)
+            budget -= len(block)
         return [
             {
                 "role": "system",
@@ -1363,7 +1381,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 "role": "user",
                 "content": (
                     "PHP project source bundle:\n\n"
-                    f"{source[:MAX_PROJECT_SOURCE_BYTES]}\n\n"
+                    f"{_bounded_prompt_source(source, MAX_LLM_REVIEW_SOURCE_BYTES)}\n\n"
                     "PureWaf output summary:\n"
                     f"{json.dumps(payload_summary, ensure_ascii=False)}"
                 ),
@@ -1803,7 +1821,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             self._record_validation_results(dataflow_results)
             return dataflow_results
 
-        php_bin = shutil.which("php")
+        php_bin = php_oracle.find_php_binary()
         if not php_bin:
             results = [
                 PayloadValidationResult(
@@ -1819,7 +1837,9 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             return results
 
         results: List[PayloadValidationResult] = []
-        with tempfile.TemporaryDirectory(prefix="purewaf-agent-") as tmp:
+        with tempfile.TemporaryDirectory(
+            prefix="purewaf-agent-", dir=php_oracle.sandbox_parent()
+        ) as tmp:
             sandbox = Path(tmp)
             flag_path = sandbox / "flag"
             flag_marker = "PUREWAF_AGENT_FLAG_OK"
@@ -2107,7 +2127,7 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
 
     @staticmethod
     def _php_iconv_variants(data: bytes, encodings: Sequence[str]) -> List[str]:
-        php_bin = shutil.which("php")
+        php_bin = php_oracle.find_php_binary()
         if not php_bin:
             return []
         encoded = base64.b64encode(data).decode("ascii")
@@ -2200,28 +2220,32 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
             )
 
         sandbox_payload = self._sandbox_flag_payload(payload, flagfile, sandbox_flag)
+        if validation_mode == "php_code":
+            candidate = sandbox / "candidate.php"
+            body = sandbox_payload
+            if not re.match(r"^\s*<\?(php|=)?", body, re.I):
+                body = "<?php\n" + body
+            candidate.write_text(body, encoding="utf-8")
         script = self._build_validation_script(validation_mode, sandbox_payload)
         script_path = sandbox / f"validate-{uuid.uuid4().hex}.php"
         script_path.write_text(script, encoding="utf-8")
 
         try:
-            proc = subprocess.run(
-                [php_bin, str(script_path)],
-                cwd=str(sandbox),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
-                timeout=VALIDATION_TIMEOUT_SECONDS,
+            ini_path = php_oracle._write_runtime_ini(
+                php_bin, sandbox, [str(sandbox)], profile="trusted"
             )
-            output = proc.stdout.decode("utf-8", "replace")
-        except subprocess.TimeoutExpired:
-            return PayloadValidationResult(
-                payload=payload,
-                sink_kind=sink_kind,
-                payload_context=payload_context,
-                attempted=True,
-                reason=f"validation timed out after {VALIDATION_TIMEOUT_SECONDS}s",
+            home = sandbox / "home"
+            home.mkdir(parents=True, exist_ok=True)
+            child_env = php_oracle._sandbox_env(home)
+            out, _err, _code, timed_out, _truncated = php_oracle._run_command(
+                [php_bin, "-c", str(ini_path), str(script_path)],
+                str(sandbox),
+                b"",
+                VALIDATION_TIMEOUT_SECONDS,
+                child_env,
+                php_oracle.MAX_OUTPUT_BYTES,
             )
+            output = out.decode("utf-8", "replace")
         except Exception as exc:
             return PayloadValidationResult(
                 payload=payload,
@@ -2229,6 +2253,14 @@ class PureWafProjectAgent(PureWafLlmSinkAgent):
                 payload_context=payload_context,
                 skipped=True,
                 reason=f"validation failed to start: {exc}",
+            )
+        if timed_out:
+            return PayloadValidationResult(
+                payload=payload,
+                sink_kind=sink_kind,
+                payload_context=payload_context,
+                attempted=True,
+                reason=f"validation timed out after {VALIDATION_TIMEOUT_SECONDS}s",
             )
 
         expected_b64 = base64.b64encode(flag_marker.encode("utf-8")).decode("ascii")
@@ -2293,12 +2325,7 @@ if ($ob) { echo $ob; }
 """
         else:
             runner = """
-$payload = base64_decode($payload_b64);
-$candidate = __DIR__ . DIRECTORY_SEPARATOR . 'candidate-' . bin2hex(random_bytes(4)) . '.php';
-if (!preg_match('/^\\s*<\\?(php|=)?/i', $payload)) {
-    $payload = "<?php\\n" . $payload;
-}
-file_put_contents($candidate, $payload);
+$candidate = __DIR__ . DIRECTORY_SEPARATOR . 'candidate.php';
 ob_start();
 try {
     include $candidate;
@@ -2444,7 +2471,7 @@ echo $out;
             {
                 "role": "user",
                 "content": (
-                    f"PHP source:\n{source[:MAX_PROJECT_SOURCE_BYTES]}\n\n"
+                    f"PHP source:\n{_bounded_prompt_source(source, MAX_LLM_REVIEW_SOURCE_BYTES)}\n\n"
                     f"User command to execute: {command}\n\n"
                     f"{php_version_context}\n\n"
                     "Generate a WAF-bypass payload for this command."

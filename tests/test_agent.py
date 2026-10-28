@@ -701,7 +701,7 @@ file_get_contents($convertedPath);
     def test_payload_validation_skips_when_php_cli_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             agent = PureWafProjectAgent(cwd=Path(tmp))
-            with patch("PureWaf.agent.shutil.which", return_value=None):
+            with patch("PureWaf.php_oracle.find_php_binary", return_value=None):
                 result = agent.validate_payloads(
                     ["echo file_get_contents('/flag');"],
                     sink_kind="command_exec",

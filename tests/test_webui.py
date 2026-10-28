@@ -408,7 +408,9 @@ class WebUiTests(unittest.TestCase):
             body = stream_response.get_data(as_text=True)
 
         payloads = self._extract_sse_payloads(body)
-        resolve_mock.assert_called_once_with("<?php system($_GET['x']); ?>", use_llm=True)
+        resolve_mock.assert_called_once_with(
+            "<?php system($_GET['x']); ?>", use_llm=True, engine=ANY
+        )
         self.assertGreaterEqual(len(payloads), 2)
         self.assertEqual(payloads[0]["kind"], "lines")
         self.assertIn("[*] AUTO: analyzing PHP source", payloads[0]["lines"])
@@ -462,6 +464,7 @@ class WebUiTests(unittest.TestCase):
             "<?php eval($_GET['x']); ?>",
             use_llm=True,
             php_version_lock="8.0",
+            engine=ANY,
         )
         called_config = execute_mock.call_args.args[0]
         self.assertEqual(called_config.phpv, "8.0")
@@ -526,7 +529,13 @@ class WebUiTests(unittest.TestCase):
                 self.assertTrue(state_path.exists())
                 state = json.loads(state_path.read_text(encoding="utf-8"))
 
-        resolve_mock.assert_called_once_with(fake_bundle.source, use_llm=True, agent_session=ANY, precomputed_llm_analysis=ANY)
+        resolve_mock.assert_called_once_with(
+            fake_bundle.source,
+            use_llm=True,
+            agent_session=ANY,
+            precomputed_llm_analysis=ANY,
+            engine=ANY,
+        )
         payloads = self._extract_sse_payloads(body)
         first_lines = payloads[0]["lines"]
         self.assertIn("[*] AGENT: selected PHP files => 1", first_lines)

@@ -1,0 +1,13 @@
+{
+  "sink": {
+    "kind": "command_exec",
+    "function": "system"
+  },
+  "filters": [
+    {
+      "kind": "regex",
+      "pattern": "/flag/i"
+    }
+  ],
+  "polarity": "false"
+}

@@ -1,0 +1,8 @@
+{
+  "sink": {
+    "kind": "php_include",
+    "function": "include"
+  },
+  "filters": [],
+  "polarity": "true"
+}

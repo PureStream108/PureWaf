@@ -1,0 +1,13 @@
+{
+  "sink": {
+    "kind": "php_include",
+    "function": "include"
+  },
+  "filters": [
+    {
+      "kind": "regex",
+      "pattern": "/flag|file|php|data|zip|phar|(proc|dev|bin|usr|var).{15,}/i"
+    }
+  ],
+  "polarity": "true"
+}
